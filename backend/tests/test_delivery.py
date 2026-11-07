@@ -1,7 +1,9 @@
 """W4-B 交付测试:一键起服务 / 一键评测 / 回滚演练 / README 数字可复算。
 
 约定(见 00_通用约定 §6):
-- 所有临时文件都落在 pytest 的 ``tmp_path``(收尾由 ``--basetemp=.tmp/pytest`` 清理);
+- 所有临时文件都落在 conftest 的 ``tmp_dir``(ROOT/.tmp/w1a_*,teardown 清理);
+  不用 pytest ``tmp_path``:pytest 以 0o700 创建 basetemp,在 DSH 沙盒 ACL 下创建后
+  不可再访问(详见 backend/tests/test_services.py 同名说明);
 - 子进程不建管道(Windows 沙箱会拒 CreatePipe),stdout/stderr 一律重定向到文件;
 - 起服务用 ``cmd /c serve.bat`` + 新进程组,停止用 CTRL_BREAK_EVENT 发整个进程组;
 - 不读/不使用项目 .env 里的真实 API key(测试环境显式隔离)。
@@ -11,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -61,6 +64,16 @@ def _run_to_file(
             cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, env=full_env, timeout=timeout
         )
     return proc.returncode, log_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _bat_cmd(bat: Path, *args: str) -> list[str]:
+    """构造 ``cmd /c call "路径" 参数...``。
+
+    项目路径含中文与空格(``售后 Copilot``):直接 ``cmd /c "a b\\x.bat" 参数``
+    会被 cmd 在空格处拆词(报 "D:\\...\\售后 不是内部或外部命令");
+    用 ``call "路径"`` 形式让引号保留在正确位置。
+    """
+    return ["cmd", "/c", "call", str(bat), *args]
 
 
 def _free_port() -> int:
@@ -139,7 +152,7 @@ def _extract_block(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not IS_WINDOWS, reason="serve.bat 仅在 Windows 验证")
-def test_serve_bat_health_and_seed(tmp_path, tmp_dir):
+def test_serve_bat_health_and_seed(tmp_dir):
     serve_bat = ROOT / "serve.bat"
     assert serve_bat.is_file(), "缺少 serve.bat"
 
@@ -154,7 +167,7 @@ def test_serve_bat_health_and_seed(tmp_path, tmp_dir):
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
     with log_path.open("wb") as log:
         proc = subprocess.Popen(
-            ["cmd", "/c", str(serve_bat)],
+            _bat_cmd(serve_bat),
             cwd=ROOT,
             env={**os.environ, **env, "TMP": str(ROOT / ".tmp"), "TEMP": str(ROOT / ".tmp")},
             stdout=log,
@@ -186,8 +199,8 @@ def test_serve_bat_health_and_seed(tmp_path, tmp_dir):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="环境无 bash")
-def test_shell_scripts_syntax(tmp_path):
-    log_path = tmp_path / "bash_n.log"
+def test_shell_scripts_syntax(tmp_dir):
+    log_path = tmp_dir / "bash_n.log"
     for name in ("serve.sh", "run_eval.sh"):
         script = ROOT / name
         assert script.is_file(), f"缺少 {name}"
@@ -205,16 +218,14 @@ def test_shell_scripts_syntax(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not IS_WINDOWS, reason="run_eval.bat 仅在 Windows 验证")
-def test_run_eval_bat_smoke(tmp_path):
+def test_run_eval_bat_smoke(tmp_dir):
     run_eval_bat = ROOT / "run_eval.bat"
     assert run_eval_bat.is_file(), "缺少 run_eval.bat"
-    out_dir = tmp_path / "reports"
-    work_dir = tmp_path / "eval_work"
-    log_path = tmp_path / "run_eval.log"
-    cmd = [
-        "cmd",
-        "/c",
-        str(run_eval_bat),
+    out_dir = tmp_dir / "reports"
+    work_dir = tmp_dir / "eval_work"
+    log_path = tmp_dir / "run_eval.log"
+    cmd = _bat_cmd(
+        run_eval_bat,
         "--smoke",
         "--repeat",
         "1",
@@ -224,7 +235,7 @@ def test_run_eval_bat_smoke(tmp_path):
         str(out_dir),
         "--work-dir",
         str(work_dir),
-    ]
+    )
     code, output = _run_to_file(cmd, log_path, timeout=300)
     assert code == 0, "run_eval.bat --smoke 失败:\n" + output[-3000:]
 
@@ -242,7 +253,7 @@ def test_run_eval_bat_smoke(tmp_path):
 # 4) 回滚演练:升级 -> 回滚(带备份) -> 再升级
 # ---------------------------------------------------------------------------
 
-def test_rollback_drill(tmp_path, tmp_dir):
+def test_rollback_drill(tmp_dir):
     rollback = _load_rollback()
     db_path = tmp_dir / "rollback.db"
     db_url = f"sqlite:///{db_path.as_posix()}"
@@ -270,10 +281,10 @@ def test_rollback_drill(tmp_path, tmp_dir):
 # 5) README 数字与 gen_readme_numbers.py 输出逐字一致
 # ---------------------------------------------------------------------------
 
-def test_readme_numbers_match_script(tmp_path):
+def test_readme_numbers_match_script(tmp_dir):
     gen = ROOT / "backend" / "scripts" / "gen_readme_numbers.py"
     assert gen.is_file(), "缺少 gen_readme_numbers.py"
-    log_path = tmp_path / "gen_numbers.log"
+    log_path = tmp_dir / "gen_numbers.log"
     env = {"PYTHONPATH": str(ROOT / "backend")}
     code, output = _run_to_file(
         [str(VENV_PYTHON), str(gen)], log_path, timeout=180, env=env
@@ -331,8 +342,18 @@ def test_entrypoints_do_not_read_secrets():
         ROOT / "backend" / "scripts" / "gen_readme_numbers.py",
         ROOT / "backend" / "scripts" / "rollback.py",
     ]
-    forbidden = [".env", "load_dotenv", "dotenv", "DEEPSEEK", "OPENAI", "ANTHROPIC", "API_KEY"]
+    # 用词边界匹配 .env:普通 ``os.environ.get(...)`` 前缀也含 ".env" 字样,
+    # 那是读进程环境变量,不是读项目 .env 文件,不能算命中。
+    forbidden = {
+        ".env 文件": r"\.env\b",
+        "load_dotenv": r"load_dotenv",
+        "dotenv": r"dotenv",
+        "DEEPSEEK": r"DEEPSEEK",
+        "OPENAI": r"OPENAI",
+        "ANTHROPIC": r"ANTHROPIC",
+        "API_KEY": r"API_KEY",
+    }
     for path in files:
         text = path.read_text(encoding="utf-8", errors="replace")
-        hits = [token for token in forbidden if token in text]
+        hits = [label for label, pattern in forbidden.items() if re.search(pattern, text)]
         assert not hits, f"{path.name} 引用了敏感配置:{hits}"

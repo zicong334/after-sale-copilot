@@ -7,7 +7,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-export PYTHONPATH="$ROOT/backend${PYTHONPATH:+:$PYTHONPATH}"
+# .venv 是 Windows Python:PYTHONPATH 分隔符必须用 ';' 而非 POSIX 的 ':'
+# (2026-11-07 主会话维护性修复,同 serve.sh)
+export PYTHONPATH="$ROOT/backend${PYTHONPATH:+;$PYTHONPATH}"
 export TMP="${TMP:-$ROOT/.tmp}"
 export TEMP="${TEMP:-$ROOT/.tmp}"
 mkdir -p "$TMP"
