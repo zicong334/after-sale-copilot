@@ -25,11 +25,11 @@ TOOL_NAME = "shop__get_order"
 
 
 class Input(BaseModel):
-    """shop__get_order 入参:order_id 必须匹配 ``^ORD-[0-9A-Z-]+$``。"""
+    """shop__get_order 入参:order_id 兼容真实格式 ``ORD-*`` 与 ``seed-order-*``。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    order_id: str = Field(pattern=r"^ORD-[0-9A-Z-]+$")
+    order_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{2,63}$")
 
 
 INPUT_SCHEMA: dict[str, Any] = clean_schema(Input)

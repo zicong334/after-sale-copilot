@@ -5,7 +5,14 @@
 """
 from __future__ import annotations
 
+import shutil
+import sqlite3
+import uuid
+from pathlib import Path
+
 import pytest
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -203,3 +210,57 @@ def test_seed_idempotent(engine):
     assert first["order"] == 30
     assert first["merchant"] == 1
     assert first["ticket"] == 8
+
+
+# ---------------------------------------------------------------------------
+# 缺陷修复包回归(F2 / F3)
+# ---------------------------------------------------------------------------
+
+def test_refund_active_unique_race_state_conflict(session):
+    """F2:同订单第二张活跃单撞 uq_refund_active 部分唯一索引 → 409 且 param 存在。
+
+    修复前 ``StateConflictError(..., param=...)`` 会 TypeError(500);修复后
+    param 纳入错误响应体,不是 500/TypeError。
+    """
+    _merchant(session)
+    _order(session, oid="o-1", status="delivered", total=10000)
+    # 先落一张活跃单(申请态),再用不同幂等键建第二张 → commit 撞 uq_refund_active
+    refund_svc.create_refund_request(session, "m-1", "o-1", 5000, "质量问题", "ik-active")
+    with pytest.raises(StateConflictError) as ei:
+        refund_svc.create_refund_request(session, "m-1", "o-1", 4000, "质量问题", "ik-other")
+
+    err = ei.value
+    assert err.status_code == 409
+    assert err.code == "STATE_CONFLICT"
+    assert err.param == "uq_refund_active"
+    # 竞态分支只报错,不落第二张单
+    assert session.scalar(select(func.count()).select_from(RefundRequest)) == 1
+
+
+def test_alembic_upgrade_head_fresh_db_three_migrations():
+    """F3:全新空库 alembic upgrade head,0001→0002→0003 依次成功且 ticket 有 summary 列。
+
+    用 alembic 命令 API 在进程内跑 ``upgrade head``(等价 CLI 命令);临时库显式建在
+    ROOT/.tmp 下并在 teardown 清理(不用 tmp_path:pytest 以 0o700 创建 basetemp,
+    在 DSH 沙盒 ACL 下创建后不可再访问)。
+    """
+    root = Path(__file__).resolve().parents[2]
+    work = root / ".tmp" / f"alembic_{uuid.uuid4().hex}"
+    work.mkdir(parents=True)
+    try:
+        db_path = work / "fresh.db"
+        cfg = Config()  # 不用 alembic.ini:避免 fileConfig 在测试进程内改日志配置
+        cfg.set_main_option("script_location", str(root / "backend" / "alembic"))
+        cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path.as_posix()}")
+        command.upgrade(cfg, "head")
+
+        con = sqlite3.connect(db_path)
+        try:
+            versions = [r[0] for r in con.execute("SELECT version_num FROM alembic_version")]
+            columns = [r[1] for r in con.execute("PRAGMA table_info(ticket)")]
+        finally:
+            con.close()
+        assert versions == ["0003_ticket_summary"]
+        assert "summary" in columns
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

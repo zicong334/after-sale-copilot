@@ -41,6 +41,7 @@ class Ticket(Base):
     )
     claimed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     handoff_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_msg_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )

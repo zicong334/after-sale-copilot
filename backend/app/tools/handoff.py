@@ -1,9 +1,7 @@
 """handoff__create_ticket 工具:创建人工转接工单(write,requires_confirm=True)。
 
-任务书要求工单带 ``handoff_reason + summary``;但 W1-A 冻结的 ``Ticket`` 模型只有
-``handoff_reason`` 一个 Text 列、**没有 summary 列**(模型缺口,照 tickets.py close
-的先例汇报、不自行改模型)。故 summary 折进 ``handoff_reason``(换行分隔),两个信息
-都保留;execute 返回时分别回传 reason/summary。
+任务书要求工单带 ``handoff_reason + summary``:``Ticket`` 已补独立 ``summary`` 列
+(缺陷修复包 F3,迁移 0003_ticket_summary),``handoff_reason`` 只存转接原因。
 
 - ``handler``(invoke 走这里):resolve(若带 order_id,须存在且属于 ctx.customer_id)+
   返回确认卡四要素;不落业务数据。
@@ -34,7 +32,7 @@ class Input(BaseModel):
 
     reason: str = Field(min_length=1)
     summary: str = Field(min_length=1)
-    order_id: str | None = Field(default=None, pattern=r"^ORD-[0-9A-Z-]+$")
+    order_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{2,63}$")
 
 
 INPUT_SCHEMA: dict[str, Any] = clean_schema(Input)
@@ -109,7 +107,7 @@ def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 
 def execute(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """真实创建工单(W3 invoke_confirmed / 测试用)。summary 折进 handoff_reason。"""
+    """真实创建工单(W3 invoke_confirmed / 测试用)。reason 与 summary 分列落库。"""
     _resolve_order(args, ctx)
     reason = args["reason"]
     summary = args["summary"]
@@ -120,7 +118,8 @@ def execute(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         customer_id=ctx.customer_id,
         order_id=order_id,
         status="queued",
-        handoff_reason=f"{reason}\n摘要:{summary}",
+        handoff_reason=reason,
+        summary=summary,
     )
     ctx.session.add(ticket)
     ctx.session.commit()

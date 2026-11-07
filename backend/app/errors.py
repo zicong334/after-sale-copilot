@@ -40,15 +40,24 @@ class AppError(Exception):
 
 
 class StateConflictError(AppError):
-    """状态机守卫失败(非法迁移 / 并发冲突 / 关单后写)。409。"""
+    """状态机守卫失败(非法迁移 / 并发冲突 / 关单后写)。409。
 
-    def __init__(self, message: str, current_status: str | None = None) -> None:
+    ``param`` 可显式指定冲突参数名(如 ``uq_refund_active``);未指定时回退到
+    ``current_status``(状态机守卫失败时带上当前真实状态)。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        current_status: str | None = None,
+        param: Any = None,
+    ) -> None:
         super().__init__(
             code="STATE_CONFLICT",
             message=message,
             status_code=409,
             retryable=False,
-            param=current_status,
+            param=current_status if param is None else param,
         )
 
 

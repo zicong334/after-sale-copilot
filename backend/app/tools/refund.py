@@ -9,9 +9,9 @@
 同幂等键重复调用只产生一张退款单(execute 里先查同键活跃单,命中即幂等返回);
 同订单不同幂等键(不同原因/金额)才是"重复创建"业务拒绝。
 
-注:execute 主动做活跃单检查、绕开 W2-A 冻结的 ``create_refund_request``
-IntegrityError 竞态分支(该分支 ``StateConflictError(..., param=...)`` 传了不存在的
-``param`` 关键字会 TypeError,见回执"未尽事项",不改服务层)。
+注:execute 主动做活跃单检查,以便同幂等键命中时走"幂等返回已有单"而非服务层
+的竞态分支;服务层 ``StateConflictError(..., param=...)`` 的签名已由缺陷修复包
+F2 补齐(见 ``app/errors.py``),两者语义不冲突。
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ ACTION_LABEL = "refund_request"
 class Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    order_id: str = Field(pattern=r"^ORD-[0-9A-Z-]+$")
+    order_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{2,63}$")
     amount_cents: int = Field(gt=0)
     reason: Literal["质量问题", "错发漏发", "七天无理由", "物流破损"]
 

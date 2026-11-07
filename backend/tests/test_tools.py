@@ -32,6 +32,7 @@ from app.tools import (  # noqa: F401 —— 触发工具注册 + 事件表注�
 from app.tools.events import ConfirmRequest, ToolEvent
 from app.tools.handoff import execute as handoff_execute
 from app.tools.refund import compute_refund_key, execute as refund_execute
+from scripts.seed import seed
 
 # ---------------------------------------------------------------------------
 # 构造 helper
@@ -66,10 +67,15 @@ def _order(
     return o
 
 
-def _ctx(session, customer_id: str = "cust-1", trace_id: str | None = None) -> ToolContext:
+def _ctx(
+    session,
+    customer_id: str = "cust-1",
+    trace_id: str | None = None,
+    merchant_id: str = "m-1",
+) -> ToolContext:
     return ToolContext(
         session=session,
-        merchant_id="m-1",
+        merchant_id=merchant_id,
         customer_id=customer_id,
         trace_id=trace_id or uuid.uuid4().hex,
     )
@@ -102,12 +108,14 @@ def test_input_schema_additional_properties_false():
 
 
 def test_order_id_pattern():
+    """F1:order_id pattern 兼容 ORD-* 与真实 seed-order-* 两种格式。"""
+    expected = r"^[A-Za-z0-9][A-Za-z0-9-]{2,63}$"
     for name in ("shop__get_order", "refund__create"):
         props = get_spec(name).input_schema["properties"]["order_id"]
-        assert props["pattern"] == r"^ORD-[0-9A-Z-]+$"
+        assert props["pattern"] == expected
     # handoff 的 order_id 可空,但 pattern 仍须一致(在 anyOf 的 string 分支)
     hprops = get_spec("handoff__create_ticket").input_schema["properties"]["order_id"]
-    assert hprops["anyOf"][0]["pattern"] == r"^ORD-[0-9A-Z-]+$"
+    assert hprops["anyOf"][0]["pattern"] == expected
     assert {"type": "null"} in hprops["anyOf"]
 
 
@@ -157,7 +165,7 @@ def test_shop_get_order_forbidden_no_leak(session):
 
 def test_shop_get_order_schema_error(session):
     _merchant(session)
-    res = invoke("shop__get_order", {"order_id": "bad-id"}, _ctx(session))
+    res = invoke("shop__get_order", {"order_id": "bad id"}, _ctx(session))
     assert res.ok is False
     assert res.error.code == CODE_SCHEMA_ERROR
     # 回喂四要素齐全
@@ -172,6 +180,32 @@ def test_shop_get_order_schema_missing_field(session):
     res = invoke("shop__get_order", {}, _ctx(session))
     assert res.ok is False
     assert res.error.code == CODE_SCHEMA_ERROR
+
+
+def test_shop_get_order_seed_order_real_customer(session):
+    """F1:真实 seed 单号(seed-order-019,小写)通过 schema,归属客户可查到订单。"""
+    seed(session)
+    res = invoke(
+        "shop__get_order",
+        {"order_id": "seed-order-019"},
+        _ctx(session, merchant_id="seed-merchant-1", customer_id="seed-cust-009"),
+    )
+    assert res.ok is True
+    assert res.data["order_id"] == "seed-order-019"
+    assert res.data["status"] == "delivered"
+
+
+def test_shop_get_order_seed_order_non_owner_not_schema_error(session):
+    """F1:非归属客户 → NOT_FOUND_OR_FORBIDDEN(证明进入 resolve 层,不是 schema 层拒绝)。"""
+    seed(session)
+    res = invoke(
+        "shop__get_order",
+        {"order_id": "seed-order-019"},
+        _ctx(session, merchant_id="seed-merchant-1", customer_id="seed-cust-001"),
+    )
+    assert res.ok is False
+    assert res.error.code == CODE_NOT_FOUND_OR_FORBIDDEN
+    assert res.error.code != CODE_SCHEMA_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +438,9 @@ def test_handoff_execute_creates_ticket(session):
     assert ticket is not None
     assert ticket.merchant_id == "m-1"
     assert ticket.customer_id == "cust-1"
-    # summary 折进 handoff_reason(模型无 summary 列)
-    assert "需要人工介入" in ticket.handoff_reason
-    assert "用户多次尝试退货均失败" in ticket.handoff_reason
+    # F3:reason 与 summary 分列落库(summary 不再折进 handoff_reason)
+    assert ticket.handoff_reason == "需要人工介入"
+    assert ticket.summary == "用户多次尝试退货均失败"
 
 
 def test_handoff_order_not_found(session):
@@ -470,7 +504,7 @@ def test_tool_events_trace_id_span(session):
 def test_tool_events_schema_error_recorded(session):
     _merchant(session)
     trace_id = "trace-schema-1"
-    res = invoke("shop__get_order", {"order_id": "bad-id"}, _ctx(session, trace_id=trace_id))
+    res = invoke("shop__get_order", {"order_id": "bad id"}, _ctx(session, trace_id=trace_id))
     assert res.error.code == CODE_SCHEMA_ERROR
     ev = session.scalar(select(ToolEvent).where(ToolEvent.trace_id == trace_id))
     assert ev is not None
