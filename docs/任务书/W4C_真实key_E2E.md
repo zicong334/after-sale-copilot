@@ -1,6 +1,12 @@
-# 任务书 W4-C:真实模型 E2E(阻塞项:等用户提供 API key)
+# 任务书 W4-C:真实模型 E2E(已解锁:key 于 2026-11-07 由用户放入 ROOT/.env,不进 git)
 
-> 先读 `docs/任务书/00_通用约定.md`。前置:W4-B 已验收 + 用户已提供 LLM API key(DeepSeek 或 OpenAI 兼容)。key 只进 `ROOT/.env`(已 gitignore),绝不进代码/日志/回执/评测报告。
+> 先读 `docs/任务书/00_通用约定.md`。前置:W4-B 已验收。key 只存在于 `ROOT/.env`,绝不进代码/日志/回执/评测报告/演示输出。
+
+**已实测的环境事实(主会话 2026-11-07 连通性验证,HTTP 200)**:
+- `LLM_BASE_URL=https://api.deepseek.com/v1`,`LLM_MODEL=deepseek-flash`(用户约束"只能用 DeepSeek-V4.1-Flash";API 实测该产品名无效,正确 model ID = deepseek-flash)
+- **reasoning 模型**:响应 message 含 `reasoning_content`,正文在 `content`;max_tokens 预算不足时 `content` 为空串(实测 8 token 预算即为空)——real_client 必须给足预算(建议 ≥1024)并把"空正文"显式当失败处理,不得静默成功
+- usage 返回 prompt_tokens/completion_tokens(含 reasoning_tokens 明细),成本计算用真实 usage;deepseek-flash 单价无法确证时,报告 meta 里 token 数必须真实、单价标 TBD
+- 裁判与被判模型同源(只有这一把 key)→ 按本任务书要求在验收报告里声明偏差风险
 
 ## 目标
 
