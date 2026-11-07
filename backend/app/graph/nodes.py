@@ -6,11 +6,11 @@
 节点                 是否需要  职责
                       LLM / IO
 ==================  ==========  ==================================================
-``perceive``          纯函数     归一化进线文本(不调 LLM、不落库、不写 trace)
+``perceive``          纯读      归一化进线文本 + 注入一次买家长期记忆(只读,不写库)
 ``classify``          LLM        意图 + 槽位(高置信快捷路径 → FakeLLM),写 1 条分类事件
 ``retrieve``          IO         检索政策条款(policy__search,无命中确定性改写再查)
 ``act``               IO         经工具层执行业务读写;自环;写操作前走确认门 interrupt
-``compose``           LLM        只组装回复文案(不查库、不调工具、不写事件)
+``compose``           LLM        组装回复文案;任务终态才抽取偏好写记忆(MOCK,见 store)
 ``handoff``           IO         转人工:建工单确认卡 + 会话置 handed_off + 确认门
 ==================  ==========  ==================================================
 
@@ -54,6 +54,8 @@ from app.llm import (
     build_facts_message,
 )
 from app.llm.base import RISK_HINTS
+from app.memory.injection import load_injection
+from app.memory.store import extract_and_write
 from app.models import ChatMessage, ChatSession, KnowledgeItem
 from app.perception import normalize
 from app.tools import ToolContext, get_confirm, invoke
@@ -479,12 +481,18 @@ def make_nodes(
         session.flush()
         return {"ok": True, "data": dict(data), "error": {}}
 
-    # ---- ① perceive:纯函数,无 LLM / 无 IO ------------------------------
+    # ---- ① perceive:纯读(无 LLM / 不写库),任务开始注入一次记忆 ----------
 
     def perceive(state: GraphState) -> dict[str, Any]:
-        """只做归一化:不调 LLM、不落库、不写 trace(可单测)。"""
+        """归一化 + 任务开始时注入一次长期记忆;不调 LLM、不写库、不写 trace。"""
         percept = normalize(text_of(state))
-        return {"percept": percept.model_dump()}
+        # 任务开始只读一次记忆(固定顺序,空记忆显式"无历史偏好");隔离项查不到
+        memory = load_injection(
+            session,
+            merchant_id=merchant_id,
+            user_id=session_row.customer_id,
+        )
+        return {"percept": percept.model_dump(), "memory": memory}
 
     # ---- ② classify:只调 LLM + 写一条分类事件 ---------------------------
 
@@ -806,17 +814,29 @@ def make_nodes(
 
         return {}
 
-    # ---- ⑤ compose:只调 LLM 组装文案(不查库 / 不调工具 / 不写事件) -----
+    # ---- ⑤ compose:组装文案 + 终态抽取记忆(不调工具 / 不写事件) ---------
 
     def compose(state: GraphState) -> dict[str, Any]:
         verdict = dict(state.get("verdict") or {})
         confirm = state.get("confirm")
         if confirm and confirm.get("decided"):
-            return {"confirm": confirm, "draft": _final_reply(confirm)}
-        draft = _reply_for(verdict, state)
-        if confirm and not confirm.get("replied"):
-            return {"draft": draft, "confirm": {**confirm, "replied": True}}
-        return {"draft": draft}
+            out = {"confirm": confirm, "draft": _final_reply(confirm)}
+        else:
+            draft = _reply_for(verdict, state)
+            if confirm and not confirm.get("replied"):
+                out = {"draft": draft, "confirm": {**confirm, "replied": True}}
+            else:
+                out = {"draft": draft}
+        # 任务结束(图终态)才抽取偏好写记忆;act 自环/待确认挂起轮一律不写
+        if not (confirm and not confirm.get("decided")):
+            extract_and_write(
+                session,
+                merchant_id=merchant_id,
+                user_id=session_row.customer_id,
+                text=text_of(state),
+                llm=llm,
+            )
+        return out
 
     def _reply_for(verdict: dict[str, Any], state: GraphState) -> str:
         """按判定事实包选择模板(FakeLLM 的 facts["kind"] 契约与 W2-C 完全一致)。"""

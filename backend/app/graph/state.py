@@ -9,6 +9,7 @@
 字段语义:
 
 - ``percept``:感知层归一化结果(``Percept.model_dump()``,纯字典);
+- ``memory``:任务开始时注入一次的买家长期偏好包(``{text,count,scopes}``,纯字典);
 - ``context``:会话槽位(接口层传入的确定性字段:order_id / days_since_delivery …);
 - ``intent``:意图判定与槽位 {name, confidence, reason, path, order_id};
 - ``retrieved``:检索/判定用到的条款(含 clause_id,compose 据此出 ``[n]`` 引用);
@@ -45,6 +46,7 @@ class GraphState(TypedDict, total=False):
     """六节点图的共享状态(每个字段都必须可 JSON 序列化)。"""
 
     percept: dict[str, Any]
+    memory: dict[str, Any]
     context: dict[str, Any]
     intent: dict[str, Any]
     retrieved: list[dict[str, Any]]
@@ -68,6 +70,7 @@ def initial_state(
     """构造本轮进线的干净初始状态(每个字段都显式重置)。"""
     return {
         "percept": {"text": text},
+        "memory": {},
         "context": dict(context or {}),
         "intent": {},
         "retrieved": [],

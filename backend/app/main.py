@@ -22,6 +22,7 @@ from app.api import refunds as refunds_api
 from app.api import tickets as tickets_api
 from app.db import engine
 from app.errors import register_error_handlers
+from app.memory.decay import router as memory_maintenance_router
 from app.models import Base
 
 
@@ -48,3 +49,4 @@ app.include_router(orders_api.router)
 app.include_router(tickets_api.router)
 app.include_router(refunds_api.router)
 app.include_router(chat_api.router)
+app.include_router(memory_maintenance_router)
