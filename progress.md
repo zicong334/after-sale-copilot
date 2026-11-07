@@ -9,5 +9,7 @@
 - 2026-11-07 W1 阶段门 | 主会话亲测通过,准入 W2;维护性修复:conftest tmp_dir 移入 .tmp/(残留源头) | 复跑 83 passed | 无
 - 2026-11-07 W2-A | 政策知识库:18 条语料(12RP+6LP)+条款分块+BM25(threshold=20.0 定标)+load 幂等(dsh V4-Pro,零事故) | 97 passed;实测 top1 全对、no_hit 拦截正常 | 无
 - 2026-11-07 W2-B | 工具层五件套:三折(402 余额→SERVER 500→用户切 flash 续跑成功);5工具九字段+三件套+三层校验+确认卡+trace;env.py 修复追认 | 127 passed;全新库双迁移成功 | 缺陷修复包 F1/F2/F3 待派
-- 2026-11-07 W2-B-FIX | flash+§7 首跑:F1 pattern 放宽(3处)+seed 双路回归、F2 StateConflictError.param、F3 ticket.summary+迁移0003+handoff 分列 | 131 passed;三迁移一次成功;越权/归属实测取证 | W2 门待 W2-C
+- 2026-11-07 W2-B-FIX | flash+§7 首跑:F1 pattern 放宽(3处)+seed 双路回归、F2 StateConflictError.param、F3 ticket.summary+迁移0003+handoff 分列 | 131 passed;三迁移一次成功;越权/归属实测取证 | 无
+- 2026-11-07 W2-C | 感知层+会话薄路由+FakeLLM 三场景(dsh flash,§7 全程遵守,调试期错误各修 1 次过) | 153 passed;check_w1_cases 9/10→治理修复后 10/10 | 无
+- 2026-11-07 W2 阶段门 | 主会话亲测通过;数据治理#1:CS-POLICY-004 expected_tools 修正(W1-C 缺陷),版本 cs-eval-w1-20261107a | demo 三场景/引用带条款号/守卫测试实存 | 准入 W3
 - 

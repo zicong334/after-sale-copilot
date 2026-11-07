@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api import chat as chat_api
 from app.api import orders as orders_api
 from app.api import refunds as refunds_api
 from app.api import tickets as tickets_api
@@ -46,3 +47,4 @@ def health() -> dict:
 app.include_router(orders_api.router)
 app.include_router(tickets_api.router)
 app.include_router(refunds_api.router)
+app.include_router(chat_api.router)

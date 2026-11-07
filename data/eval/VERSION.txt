@@ -1,2 +1,2 @@
-eval_set_version=cs-eval-w1-20261107
+eval_set_version=cs-eval-w1-20261107a
 rubric_version=cs-v1

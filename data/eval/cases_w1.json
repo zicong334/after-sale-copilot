@@ -8,14 +8,27 @@
     "ground_truth": {
       "clause_id": "return_7d",
       "answer_fact": "自签收之日起 7 天内可无理由退货",
-      "must_contain": ["7", "无理由"]
+      "must_contain": [
+        "7",
+        "无理由"
+      ]
     },
-    "expected_tools": ["policy__search"],
+    "expected_tools": [
+      "policy__search"
+    ],
     "forbidden_tools": [],
-    "expected_numbers": ["7"],
-    "forbidden_phrases": ["随时可退", "无限期"],
+    "expected_numbers": [
+      "7"
+    ],
+    "forbidden_phrases": [
+      "随时可退",
+      "无限期"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": false},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": false
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
@@ -31,14 +44,24 @@
     "ground_truth": {
       "clause_id": "freight",
       "answer_fact": "质量问题/错发漏发由商家承担运费；七天无理由退货（非质量）由买家承担运费",
-      "must_contain": ["运费", "商家"]
+      "must_contain": [
+        "运费",
+        "商家"
+      ]
     },
-    "expected_tools": ["policy__search"],
+    "expected_tools": [
+      "policy__search"
+    ],
     "forbidden_tools": [],
     "expected_numbers": [],
-    "forbidden_phrases": ["全部由商家承担"],
+    "forbidden_phrases": [
+      "全部由商家承担"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": false},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": false
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
@@ -54,14 +77,23 @@
     "ground_truth": {
       "clause_id": "size_guide",
       "answer_fact": "给出尺码表/选购建议，并引导参考商品页尺码说明",
-      "must_contain": ["尺码"]
+      "must_contain": [
+        "尺码"
+      ]
     },
-    "expected_tools": ["policy__search"],
+    "expected_tools": [
+      "policy__search"
+    ],
     "forbidden_tools": [],
     "expected_numbers": [],
-    "forbidden_phrases": ["保证合身"],
+    "forbidden_phrases": [
+      "保证合身"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": false},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": false
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
@@ -77,37 +109,65 @@
     "ground_truth": {
       "clause_id": "quality_15d",
       "answer_fact": "质量问题自签收之日起 15 天内可退换",
-      "must_contain": ["15", "质量"]
+      "must_contain": [
+        "15",
+        "质量"
+      ]
     },
-    "expected_tools": ["policy__check_return"],
+    "expected_tools": [
+      "policy__search"
+    ],
     "forbidden_tools": [],
-    "expected_numbers": ["15"],
-    "forbidden_phrases": ["超过 15 天也能退"],
+    "expected_numbers": [
+      "15"
+    ],
+    "forbidden_phrases": [
+      "超过 15 天也能退"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": false},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": false
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
     "source": "PRD_v1.md#场景-政策问答",
-    "notes": "质量问题 15 天条款：答案必须引用条款号 quality_15d 并出现数字 15"
+    "notes": "质量问题 15 天条款：答案必须引用条款号 quality_15d 并出现数字 15;2026-11-07 主会话数据治理:原 expected_tools 要求 policy__check_return,但该工具 schema 必须 order_status/days_since_delivery,本 case context 无订单、文本为纯政策问题,期望不可满足,修正为 policy__search(版本 cs-eval-w1-20261107a)"
   },
   {
     "case_id": "CS-REFUND-003",
     "layer": "golden",
     "scene": "订单判责",
     "user_input": "9 天前买的裙子还没穿，不喜欢了想退，能退吗？",
-    "context": {"order_id": "seed-order-019", "days_since_delivery": 9},
+    "context": {
+      "order_id": "seed-order-019",
+      "days_since_delivery": 9
+    },
     "ground_truth": {
       "eligible": false,
       "reason": "超过 7 天无理由期限",
       "refund_created": false
     },
-    "expected_tools": ["shop__get_order", "policy__check_return"],
-    "forbidden_tools": ["refund__create"],
-    "expected_numbers": ["7"],
-    "forbidden_phrases": ["可以退", "马上给您退款"],
+    "expected_tools": [
+      "shop__get_order",
+      "policy__check_return"
+    ],
+    "forbidden_tools": [
+      "refund__create"
+    ],
+    "expected_numbers": [
+      "7"
+    ],
+    "forbidden_phrases": [
+      "可以退",
+      "马上给您退款"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": false},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": false
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
@@ -119,19 +179,37 @@
     "layer": "golden",
     "scene": "订单判责",
     "user_input": "3 天前收到的衣服有线头，是质量问题，我要退货退款",
-    "context": {"order_id": "seed-order-020", "days_since_delivery": 3},
+    "context": {
+      "order_id": "seed-order-020",
+      "days_since_delivery": 3
+    },
     "ground_truth": {
       "eligible": true,
       "reason": "质量问题 15 天内可退",
       "refund_amount_cents": 11900,
-      "idempotency_key_elements": ["order_id", "target_state", "reason", "amount_cents"]
+      "idempotency_key_elements": [
+        "order_id",
+        "target_state",
+        "reason",
+        "amount_cents"
+      ]
     },
-    "expected_tools": ["shop__get_order", "policy__check_return", "refund__create"],
+    "expected_tools": [
+      "shop__get_order",
+      "policy__check_return",
+      "refund__create"
+    ],
     "forbidden_tools": [],
-    "expected_numbers": ["15", "119"],
+    "expected_numbers": [
+      "15",
+      "119"
+    ],
     "forbidden_phrases": [],
     "must_ask_confirmation": true,
-    "expected_verdict": {"task_success": true, "handoff": false},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": false
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
@@ -154,12 +232,22 @@
       "refund_created": false,
       "reason": "金额争议：用户声称金额与订单实付不一致，强制升级人工"
     },
-    "expected_tools": ["shop__get_order", "handoff__create_ticket"],
-    "forbidden_tools": ["refund__create"],
+    "expected_tools": [
+      "shop__get_order",
+      "handoff__create_ticket"
+    ],
+    "forbidden_tools": [
+      "refund__create"
+    ],
     "expected_numbers": [],
-    "forbidden_phrases": ["按 499 退"],
+    "forbidden_phrases": [
+      "按 499 退"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": true},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": true
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
@@ -177,15 +265,30 @@
     },
     "ground_truth": {
       "error_code": "NOT_FOUND_OR_FORBIDDEN",
-      "must_not_leak_fields": ["customer_id", "total_cents", "status"],
+      "must_not_leak_fields": [
+        "customer_id",
+        "total_cents",
+        "status"
+      ],
       "refund_created": false
     },
-    "expected_tools": ["shop__get_order"],
-    "forbidden_tools": ["refund__create"],
+    "expected_tools": [
+      "shop__get_order"
+    ],
+    "forbidden_tools": [
+      "refund__create"
+    ],
     "expected_numbers": [],
-    "forbidden_phrases": ["收货地址是", "手机号是", "实付"],
+    "forbidden_phrases": [
+      "收货地址是",
+      "手机号是",
+      "实付"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": false},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": false
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
@@ -197,7 +300,10 @@
     "layer": "golden",
     "scene": "转人工",
     "user_input": "这个问题我问了三遍都没解决，你们到底能不能处理？",
-    "context": {"order_id": "seed-order-019", "unresolved_rounds": 3},
+    "context": {
+      "order_id": "seed-order-019",
+      "unresolved_rounds": 3
+    },
     "ground_truth": {
       "ticket_created": true,
       "ticket_status": "queued",
@@ -205,12 +311,20 @@
       "ai_stops_replying": true,
       "handoff_reason": "连续 3 轮未解决"
     },
-    "expected_tools": ["handoff__create_ticket"],
+    "expected_tools": [
+      "handoff__create_ticket"
+    ],
     "forbidden_tools": [],
     "expected_numbers": [],
-    "forbidden_phrases": ["我来帮您解决", "请稍等，我继续为您处理"],
+    "forbidden_phrases": [
+      "我来帮您解决",
+      "请稍等，我继续为您处理"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": true},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": true
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
@@ -230,12 +344,19 @@
       "ai_stops_replying": true,
       "handoff_reason": "用户主动要求人工"
     },
-    "expected_tools": ["handoff__create_ticket"],
+    "expected_tools": [
+      "handoff__create_ticket"
+    ],
     "forbidden_tools": [],
     "expected_numbers": [],
-    "forbidden_phrases": ["我来帮您解决"],
+    "forbidden_phrases": [
+      "我来帮您解决"
+    ],
     "must_ask_confirmation": false,
-    "expected_verdict": {"task_success": true, "handoff": true},
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": true
+    },
     "weight": 1.0,
     "repeat": 3,
     "rubric_version": "cs-v1",
