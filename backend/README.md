@@ -149,9 +149,10 @@ set PYTHONPATH=%CD%\backend
 1. **Ticket 无 session_id**:`ticket` 表只有 `merchant_id` / `customer_id` / `refund_request_id` 等列,没有 `session_id`;
    转人工摘要按 `merchant_id + customer_id` 关联上下文生成,不按会话精确回溯(PRD 未要求,列为扩展点)。
    证据:`backend/app/models/ticket.py:30-34`。
-2. **usage 为 MOCK 估算**:本轮 `usage.tokens_in/tokens_out/cost_usd` 是按字符数 × MOCK 价目的**估算**
-   (`estimated: true`),**不是真实 API 账单**;真实计量待 W4-C 接真实 key。
-   证据:`backend/app/api/chat.py:78-91`。
+2. **usage 计量(W4-C 后已升级为真实 token)**:`.env` 提供 key 时,`usage.tokens_in/tokens_out/reasoning_tokens`
+   来自 provider 真实响应(`estimated: false`);`cost_usd` 因 deepseek-flash 单价未获官方确认而为 `null`(价目 TBD,
+   token 数可复算,见 `data/eval/reports/w4c-*.json` 的 meta.tokens)。无 key 时回退 FakeLLM,usage 为 MOCK 估算(`estimated: true`)。
+   证据:`backend/app/api/chat.py`、`backend/app/llm/real_client.py`。
 3. **与 PRD §1 条件 1 的偏差(主动汇报)**:PRD 原文要求「每张业务表带 `merchant_id`」;实际 14 张业务表中
    7 张主体表直带该列,5 张纯从属表经主表推导(理由写在模型注释:
    `backend/app/models/catalog.py:55`、`catalog.py:83`、`chat.py:50`、`orders.py:60`、`ticket.py:75`),
@@ -160,6 +161,12 @@ set PYTHONPATH=%CD%\backend
    若验收要求严格照字面「每张表都有列」,需补一条迁移并把从属表的写入路径改为显式传租户,
    属结构性改动,本棒(交付棒)白名单外,列为 W4-C/后续候选。
    证据:`grep -n "merchant_id" backend/app/models/*.py`(上面 5 条注释 + 7 个列定义)。
+4. **真实模型评测两轮结果(W4-C)**:第一轮(修复前)判「未达到」:0.6944/critical 6,报告
+   `data/eval/reports/w4c-20261107T144402Z-e3c303.json` + `docs/验收报告_W4C.md`;确定性护栏修复包(W4-C-FIX,
+   评测集升版 cs-eval-v1-20261108b)后第二轮判「部分达到(偏上)」:整体 133/144=0.9236(≥0.9 冲刺线)、critical=0、
+   agreement 0.9722、硬断言 92.36%(未达 100% 线)、cost 单价 TBD,报告 `data/eval/reports/w4c-20261107T172318Z-7b48c6.json`。
+   残余失败:CS-REFUND-006、CS-MEMORY-001 两条系统性(各 0/3)+ 5 次采样波动散发;无任何资损/越权/隐私失败。
+   完整判定与周一决策选项见 `docs/最终验收报告.md`。
 
 ## 9. 不做清单(照 PRD §3,每项标注将来从哪长出来)
 
