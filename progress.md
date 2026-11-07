@@ -8,4 +8,5 @@
 - 2026-11-07 W1-C | 评测先行:10 条 golden(4/4/2)+rubric v1+validate/load 脚本(dsh V4-Pro) | 83 passed;validate=0;load×2 恒 10 | 无
 - 2026-11-07 W1 阶段门 | 主会话亲测通过,准入 W2;维护性修复:conftest tmp_dir 移入 .tmp/(残留源头) | 复跑 83 passed | 无
 - 2026-11-07 W2-A | 政策知识库:18 条语料(12RP+6LP)+条款分块+BM25(threshold=20.0 定标)+load 幂等(dsh V4-Pro,零事故) | 97 passed;实测 top1 全对、no_hit 拦截正常 | 无
+- 2026-11-07 W2-B | 工具层执行中途失败:DeepSeek 账户余额不足(ACCOUNT_QUOTA 402),部分产物 3/9 文件留盘,基线未破坏 | 97 passed(存量) | 硬阻塞:等用户充值或授权换 provider;重发按规则沿用原参数(v4-pro/high)
 - 
