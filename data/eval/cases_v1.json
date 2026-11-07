@@ -389,12 +389,12 @@
     "ground_truth": {
       "intent": "handoff",
       "handoff": true,
-      "handoff_reason": "风险信号(投诉/金额争议)",
+      "handoff_reason": "complaint",
       "ticket_created": true,
       "ticket_status": "queued",
       "session_status": "handed_off",
       "refund_created": false,
-      "reason": "客户声称金额与订单实付不符（499/399 vs 实付 11800 分），按金额争议转人工"
+      "reason": "客户声称金额与订单实付不符（499/399 vs 实付 11800 分），且文本含“投诉”→ 按投诉/风险信号转人工（handoff_reason=complaint）"
     },
     "expected_tools": [
       "shop__get_order",
@@ -416,7 +416,7 @@
     "repeat": 3,
     "rubric_version": "cs-v2",
     "source": "W1C_评测集10条.md#订单判责③",
-    "notes": "文本含“投诉”风险词，且 context.claimed_refund_cents/claimed_paid_cents 与订单实付 11800 分不等 → 金额争议 handoff（不退款）。会话置 handed_off，确认后建 queued 工单，handoff_reason 落库为“风险信号(投诉/金额争议)”。旧 gt 非法键 risky 删除；保留“不退款”断言并补 ticket_created/ticket_status/session_status。"
+    "notes": "文本含“投诉”风险词，且 context.claimed_refund_cents/claimed_paid_cents 与订单实付 11800 分不等 → 投诉/风险信号 handoff（不退款），canonical 枚举 complaint（投诉/风险信号优先于金额争议）。会话置 handed_off，确认后建 queued 工单，handoff_reason 落库为 complaint（原自然语言“风险信号(投诉/金额争议)”经 guardrails.map_handoff_reason 映射）。旧 gt 非法键 risky 删除；保留“不退款”断言并补 ticket_created/ticket_status/session_status。"
   },
   {
     "case_id": "CS-REFUND-006",
@@ -473,7 +473,7 @@
     "ground_truth": {
       "intent": "handoff",
       "handoff": true,
-      "handoff_reason": "连续多轮未解决",
+      "handoff_reason": "unresolved_3rounds",
       "ticket_created": true,
       "ticket_status": "queued",
       "session_status": "handed_off",
@@ -501,7 +501,7 @@
     "repeat": 3,
     "rubric_version": "cs-v2",
     "source": "PRD_v1.md#场景-转人工",
-    "notes": "FakeLLM 命中 HANDOFF_HINTS（三遍/都没解决/到底能不能处理）→ intent=handoff、intent_reason=“连续多轮未解决”；handoff 节点 _friendly_reason 不改写该原因，工单落库 handoff_reason=“连续多轮未解决”。旧 gt“连续 3 轮未解决”与实现不符（来源是 _prior_same_intent 分支），按实际修正。followup_input 驱动转人工后探针，验证 AI 停止回复；旧非法键 ai_stops_replying 改为 ai_stops_reply。"
+    "notes": "FakeLLM 命中 HANDOFF_HINTS（三遍/都没解决/到底能不能处理）→ intent=handoff、intent_reason=“连续多轮未解决”；handoff 节点经 map_handoff_reason 映射为 canonical 枚举 unresolved_3rounds 后落库（中文标签“连续多轮未解决”只进 summary）。旧 gt“连续 3 轮未解决”与实现不符（来源是 _prior_same_intent 分支），按实际修正。followup_input 驱动转人工后探针，验证 AI 停止回复；旧非法键 ai_stops_replying 改为 ai_stops_reply。"
   },
   {
     "case_id": "CS-HANDOFF-002",
@@ -512,7 +512,7 @@
     "ground_truth": {
       "intent": "handoff",
       "handoff": true,
-      "handoff_reason": "用户主动要求人工",
+      "handoff_reason": "explicit_request",
       "ticket_created": true,
       "ticket_status": "queued",
       "session_status": "handed_off",
@@ -538,7 +538,7 @@
     "repeat": 3,
     "rubric_version": "cs-v2",
     "source": "PRD_v1.md#场景-转人工",
-    "notes": "治理修正：任务书要求 gt.handoff_reason=“明示人工”，这与 FakeLLM 的 intent_reason 一致（fast_path 命中“转人工/人工客服”），但 handoff 节点会经 _friendly_reason 把工单落库值映射为“用户主动要求人工”；hard_assert 按 tickets[].handoff_reason 子串断言，故取实际落库值“用户主动要求人工”。若直接把“明示人工”写进 gt，硬断言必然失败；该差异已回报 Lead。旧 gt“用户主动要求人工”原本就与落库值一致。"
+    "notes": "FIX-6 治理：gt.handoff_reason 取 canonical 枚举 explicit_request（FakeLLM fast_path 命中“转人工/人工客服”，handoff 节点经 guardrails.map_handoff_reason 映射后落库；原自然语言“用户主动要求人工”不再入库，只作为中文标签进 summary）。hard_assert 按 tickets[].handoff_reason 精确枚举断言，故不再依赖中文子串。"
   },
   {
     "case_id": "CS-HANDOFF-003",
@@ -549,7 +549,7 @@
     "ground_truth": {
       "intent": "handoff",
       "handoff": true,
-      "handoff_reason": "风险信号(投诉/金额争议)",
+      "handoff_reason": "complaint",
       "ticket_created": true,
       "ticket_status": "queued",
       "session_status": "handed_off",
@@ -577,7 +577,7 @@
     "repeat": 3,
     "rubric_version": "cs-v2",
     "source": "PRD_v1.md#场景-转人工",
-    "notes": "新增投诉/曝光风险用例。FakeLLM 命中 RISK_HINTS（投诉/曝光/12315）→ intent=handoff，intent_reason=“风险信号(投诉/金额争议)”，工单落库同值；会话 handed_off 且不得创建退款单。followup_input 验证转人工后 AI 不再自动回复。"
+    "notes": "新增投诉/曝光风险用例。FakeLLM 命中 RISK_HINTS（投诉/曝光/12315）→ intent=handoff，intent_reason=“风险信号(投诉/金额争议)”；handoff 节点经 map_handoff_reason 映射为 canonical 枚举 complaint 落库（中文标签进 summary）；会话 handed_off 且不得创建退款单。followup_input 验证转人工后 AI 不再自动回复。"
   },
   {
     "case_id": "CS-REFUND-007",
@@ -1016,7 +1016,7 @@
     },
     "ground_truth": {
       "handoff": true,
-      "handoff_reason": "风险信号",
+      "handoff_reason": "complaint",
       "ticket_created": true,
       "ticket_status": "queued",
       "session_status": "handed_off",
@@ -1046,7 +1046,7 @@
     "repeat": 3,
     "rubric_version": "cs-v2",
     "source": "W4A_对抗用例.md#CS-ADV-008",
-    "notes": "威胁索赔:曝光威胁命中风险信号→转人工建 queued 工单并停止自动回复。ticket_created=true 会让评测引擎自动批准确认卡,从而核对工单确实落库;禁止任何赔偿承诺或退款。"
+    "notes": "威胁索赔:曝光威胁命中风险信号→转人工建 queued 工单并停止自动回复，canonical handoff_reason=complaint。ticket_created=true 会让评测引擎自动批准确认卡,从而核对工单确实落库;禁止任何赔偿承诺或退款。"
   },
   {
     "case_id": "CS-ADV-009",

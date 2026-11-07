@@ -100,14 +100,14 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:263 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:334 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
-- 裁判一致率:144/144 = 1.0000
-- p95 用户等待:1163.0 ms
-- 单条成本(估算):$0.00007423;整轮合计 $0.0106893
-- 基线报告:`data/eval/reports/w4a-20261107T122649Z-6fce78.json`
+- 裁判一致率:141/144 = 0.9792
+- p95 用户等待:1162.0 ms
+- 单条成本(估算):$0.00007293;整轮合计 $0.0105021
+- 基线报告:`data/eval/reports/w4a-20261107T164830Z-7b5b3c.json`
 <!-- gen_readme_numbers:end -->
 
 口径说明:以上是 **FakeLLM + FakeJudge 的 Mock 基线**(`meta.mode="mock"`),**不代表真模型能力**;
@@ -126,6 +126,23 @@ set PYTHONPATH=%CD%\backend
 | `backend/app/graph/nodes.py:101` | 无命中 query rewrite:关键词映射 | 检索改写能力弱于 LLM rewrite |
 | `backend/app/memory/store.py:176` | 任务结束记忆抽取:规则回退(FakeLLM 不支持抽取 schema) | 抽取出的是规则候选,不是模型抽取 |
 | `backend/app/orchestrator/w1_router.py:3` | W2-C 的「MOCK 直调」编排基线 | **已不在主链路**(main/chat 走 `app.graph.runner`),保留为对照 |
+
+### 7.1 确定性护栏清单(W4-C-FIX)
+
+> 原则:每项 FIX 的验收对象是**代码守卫**(确定性、可单测);prompt 约束只是辅助。
+> 守卫常量与纯函数全部集中在 `backend/app/guardrails.py`(单一可审计入口),节点/工具只做接线。
+
+| FIX | 失败簇 | 守卫位置 | 确定性语义 |
+|---|---|---|---|
+| FIX-1 订单核验强制链 | authorization 6 / REFUND-006 | `guardrails.needs_order_verification` + `nodes.act` | 文本/上下文有订单号且意图非政策问答、本轮尚未调 `shop__get_order` → 编排层强制注入一次;无订单号则先追问,不发工具 |
+| FIX-2 退款前置策略门 | forbidden_tool | `tools/refund.py` handler | 同 trace 无 `policy__check_return` 的 eligible 证据(按入参纯函数重算)→ `BUSINESS_REJECT`,零写入 |
+| FIX-3 注入感知 | EDGE-008 / ADV-001 等 | `guardrails.INJECTION_RULES` + `perception.Percept.flags` + `nodes.classify/act` + `memory` 隔离 | 技术型注入(SQL/命令/伪造工具调用)硬拦截零工具;自然语言越权剥离后只处理正当诉求;注入文本不生成可执行记忆 |
+| FIX-4 反编造 | S6 确认前称已转接 | `guardrails.audit_status_claims` + `nodes.compose` | 回复里的状态声称(已转接/已退款/已提交/查不到…)必须在本轮 trace/DB 有证据,否则逐句替换为"我尚未…";转人工确认前统一"将为您转接人工(待确认)" |
+| FIX-5 引用保真 | fact_mismatch 7 | `guardrails.citation_phrases/ensure_citation_fidelity` + `nodes.compose` | 条款关键数字短语(如"满 99 元包邮""8 元基础运费")未逐字出现 → 确定性追加条款原文;政策问答必含"政策"字样 |
+| FIX-6 转人工原因枚举 | handoff_reason 7 | `guardrails.HANDOFF_REASON_ENUM/map_handoff_reason` + `tools/handoff.py` schema | `reason` 只接受七枚举,入库为枚举;summary 保留自然语言;评测期望值同步 `cs-eval-v1-20261108b` |
+| FIX-7 记忆场景意图 | MEMORY-001 | `llm/base.py` 规则 + `nodes.classify` few-shot + `nodes.compose` memory | 尺码/偏好/以后推荐类陈述判 `other`,回复引用记忆注入正文;不误判政策问答、不误调退款工具 |
+
+护栏单测:`backend/tests/test_guardrails.py`(纯函数);图级回归:`backend/tests/test_graph.py` 第 6 节(`fix1/fix3/fix4/fix5/fix7`)。
 
 ## 8. 已知声明(交接必读)
 

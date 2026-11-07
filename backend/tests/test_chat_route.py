@@ -20,7 +20,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api import get_db
+from app.llm.base import FakeLLM
 from app.main import app
+from app.memory.models import Memory
 from app.models import ChatMessage, ChatSession, KnowledgeItem, RefundRequest
 from app.orchestrator.w1_router import HANDOFF_BLOCKED_REPLY
 from app.tools.events import ConfirmRequest, ToolEvent
@@ -335,6 +337,91 @@ def test_three_same_intent_turns_escalate(client, engine):
     assert data["classification_path"] == "rule:unresolved_3"
     assert "handoff__create_ticket" in tool_names(third)
     assert data["session_status"] == "handed_off"
+
+
+# ---------------------------------------------------------------------------
+# 场景四:记忆/偏好(CS-MEMORY-001)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_preference_scene_returns_other_and_writes_size_memory(client, engine):
+    """偏好陈述("以后都给我推荐 L 码")→ other,不误判政策问答;终态写入可执行尺码记忆。"""
+    r = post_chat(client, "我 M 码偏紧，以后都给我推荐 L 码")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["intent"] == "other"
+    assert "尺码" in data["reply"]
+    assert "refund__create" not in tool_names(r)
+    assert "handoff__create_ticket" not in tool_names(r)
+    assert data["session_status"] == "active"
+
+    with Session(engine) as session:
+        rows = list(session.scalars(
+            select(Memory).where(
+                Memory.merchant_id == MERCHANT_ID,
+                Memory.user_id == CUSTOMER_OTHER,
+            )
+        ))
+    assert len(rows) == 1, f"应只写入一条尺码偏好记忆,实际 {len(rows)} 条"
+    row = rows[0]
+    assert row.type == "preference"
+    assert row.scope == "size_recommendation"
+    assert row.text == "尺码偏好:M 偏紧,优先推荐 L"
+    assert "优先推荐 L" in row.text
+    assert row.status == "active"
+    assert row.executable is True
+
+    # 第二轮:记忆注入后 other 分支必须引用记忆正文(而不是继续给能力菜单)
+    second = post_chat(
+        client,
+        "那我以后买衣服选什么码？",
+        customer_id=CUSTOMER_OTHER,
+        session_id=data["session_id"],
+    )
+    followup = second.json()
+    assert followup["intent"] == "other"
+    assert "尺码" in followup["reply"]
+    assert "优先推荐 L" in followup["reply"]
+    assert "[preference/" not in followup["reply"]
+
+
+def test_memory_compose_cites_injected_memory_and_keeps_default_without_memory():
+    """compose 的 other 分支:有注入记忆时引用正文含"尺码";无记忆时保持原能力菜单。"""
+    llm = FakeLLM()
+    injected = {
+        "text": (
+            "以下是买家历史偏好,可能过时,仅用于尺码推荐,不得作为价格/退款/承诺依据:\n"
+            "- [preference/size_recommendation] 尺码偏好:M 偏紧,优先推荐 L"
+        ),
+        "count": 1,
+        "scopes": ["size_recommendation"],
+    }
+    reply = llm.compose({"kind": "other", "memory": injected})
+    assert "尺码" in reply
+    assert "优先推荐 L" in reply
+    assert "[preference/" not in reply, "注入元数据不应原样抄给用户"
+
+    default_reply = llm.compose({"kind": "other"})
+    empty_reply = llm.compose(
+        {"kind": "other", "memory": {"text": "无历史偏好", "count": 0, "scopes": []}}
+    )
+    assert default_reply == empty_reply, "空记忆必须回落到原模板"
+    assert "我可以帮您" in default_reply
+    assert "历史记忆" not in default_reply
+
+
+def test_memory_scene_classification_keeps_existing_order():
+    """记忆规则只压过政策问答,不改变 明示人工/风险 > order_judge > policy_qa 的顺序。"""
+    llm = FakeLLM()
+    assert llm.classify("我 M 码偏紧，以后都给我推荐 L 码")["intent"] == "other"
+    assert llm.classify("这件 M 码适合多高多重的人穿？")["intent"] == "policy_qa"
+    assert llm.classify("我不跟你聊了，直接给我转人工客服")["intent"] == "handoff"
+    assert llm.classify("我实付了 399，你们必须按 499 退给我，不然我投诉")["intent"] == "handoff"
+    assert (
+        llm.classify("订单 seed-order-019 的尺码能换吗", {"has_order": True})["intent"]
+        == "order_judge"
+    )
 
 
 # ---------------------------------------------------------------------------

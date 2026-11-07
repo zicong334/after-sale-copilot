@@ -21,4 +21,5 @@
 - 2026-11-07 W4-B首发 | 21:00 挂死于沙箱 ACL 诊断 powershell(与 W1-A 同类),21:31 cancel;遗留 7 产物 1006 行可承接 | 无(未跑完) | 续作已重发(硬护栏:禁诊断/powershell、basetemp 新目录)
 - 2026-11-07 W4-B | 交付(续作完成):serve/run_eval 一键双脚本+README(数字脚本生成 BYTE-EQUAL)+回滚演练+S1-S4 自检;主会话修复 .sh PYTHONPATH 分隔符 bug | dsh 侧 249 passed;我方 248+1(语法测试系沙箱限制);serve/run_eval 实测通过 | W4-C 就绪
 - 2026-11-08 W4-C | 真实模型 E2E:real_client+真实裁判+48×3 一次跑完(24分钟,804,905 tokens);S6 三场景+回滚;**诚实判"未达到"**(0.6944/critical 6/agreement 0.875);主会话独立复算吻合+抽检 5 条程序通过 | 263 passed(dsh侧);key 0 泄露;密封 14 passed | 修复周期:确定性护栏包 W4-C-FIX 派发,修复后主会话亲自重跑全量一次,仍不达标即停线上交
+- 2026-11-08 W4-C-FIX | 七项确定性护栏(guardrails.py 集中常量):强制核验链/refund策略门/注入感知/反编造/引用保真/reason枚举+治理#2(cs-eval-v1-20261108b)/记忆意图(dsh flash) | 334 passed(dsh);Fake 全量 0.9792 不降;check_w1 10/10 | 主会话执行第二轮真实全量重跑中
 - 

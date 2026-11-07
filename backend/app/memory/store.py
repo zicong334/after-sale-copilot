@@ -21,13 +21,16 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.db import utc_now
+from app.guardrails import detect_injection, strip_injection
 from app.llm import LLMClient, build_facts_message
 from app.memory.models import Memory
 from app.memory.whitelist import (
     DEFAULT_SCOPE,
+    INJECTION_SCOPE,
     MIN_DECAY_SCORE,
     can_write,
     default_ttl_days,
+    is_injection_instruction,
     is_pricing_instruction,
 )
 
@@ -69,10 +72,11 @@ def create_memory(
     now=None,
     executable: bool | None = None,
 ) -> Memory:
-    """写一条记忆(白名单校验 + 定价指令自动隔离 + 默认 TTL + 幂等去重)。
+    """写一条记忆(白名单校验 + 定价/注入指令自动隔离 + 默认 TTL + 幂等去重)。
 
     - 白名单拒绝:类型/来源非法或类型×来源不允许 → ``ValueError``;
     - 定价/折扣/承诺:强制 ``executable=False + status='quarantined'``;
+    - 注入/越权指令(W4-C-FIX / FIX-3):同样强制隔离,绝不产出可执行记忆;
     - ``session_id=None`` 表示长期记忆(跨会话);
     - 同一 (merchant, user) 下相同 type+text 的未删除记忆不重复写(节点重跑幂等)。
     """
@@ -95,7 +99,8 @@ def create_memory(
         return existing
 
     now = now or utc_now()
-    quarantined = is_pricing_instruction(text)
+    # 定价/注入指令一律隔离(即使调用方误传 executable=True 也不会变成可执行记忆)
+    quarantined = is_pricing_instruction(text) or is_injection_instruction(text)
     if executable is False:
         quarantined = True
     if ttl_days is None:
@@ -285,22 +290,80 @@ def _pricing_candidate(text: str) -> dict[str, Any] | None:
     }
 
 
+def _injection_span_text(text: str) -> str:
+    """取注入命中片段的原文(多段以 ``;`` 连接),用于隔离备注留证。"""
+    profile = detect_injection(text)
+    parts = [text[start:end].strip() for start, end in profile["spans"]]
+    joined = ";".join(part for part in parts if part)
+    return joined or str(text or "").strip()
+
+
+def _injection_candidate(text: str) -> dict[str, Any] | None:
+    """规则抽取注入指令并要求隔离(MOCK);同定价指令待遇,``executable=False``。"""
+    if not is_injection_instruction(text):
+        return None
+    snippet = _injection_span_text(text)[:200]
+    return {
+        "type": "episode",
+        "source": "agent_inferred",
+        "text": f"注入指令(已隔离):{snippet}",
+        "scope": INJECTION_SCOPE,
+        "importance": 0.4,
+        "executable": False,
+    }
+
+
+def _quarantine_injected_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """LLM 路径兜底:候选文本本身含注入时改写为隔离备注,绝不产出可执行记忆。"""
+    candidate_text = str(candidate.get("text") or "").strip()
+    if not is_injection_instruction(candidate_text):
+        return candidate
+    return {
+        **candidate,
+        "type": "episode",
+        "source": "agent_inferred",
+        "text": f"注入指令(已隔离):{candidate_text[:200]}",
+        "scope": INJECTION_SCOPE,
+        "importance": 0.4,
+        "executable": False,
+    }
+
+
 def extract_candidates(text: str, llm: LLMClient | None) -> list[dict[str, Any]]:
-    """抽取候选记忆:真实模型优先,失败回退规则(MOCK)。"""
-    if not str(text or "").strip():
+    """抽取候选记忆:真实模型优先,失败回退规则(MOCK)。
+
+    注入隔离(W4-C-FIX / FIX-3):
+    - 命中注入时先在 ``strip_injection`` 剥离后的文本上抽取,只处理正当诉求;
+    - 注入片段本身另写一条 ``executable=False`` 的隔离备注(同定价指令待遇),
+      保证它不会被注入回买家上下文;
+    - FakeLLM(不支持抽取 schema → 回退规则)、真实模型两条路径同样生效。
+    """
+    body = str(text or "").strip()
+    if not body:
         return []
+    profile = detect_injection(body)
+    safe_text = strip_injection(body) if profile["suspect"] else body
+
+    candidates: list[dict[str, Any]] = []
+    from_llm = False
     if llm is not None:
-        candidates = _llm_candidates(text, llm)
-        if candidates is not None:
-            return candidates
-    # MOCK: FakeLLM 只认 intent/reply schema,这里用确定性规则补齐
-    candidates = []
-    size_candidate = _size_candidate(text)
-    if size_candidate is not None:
-        candidates.append(size_candidate)
-    pricing_candidate = _pricing_candidate(text)
-    if pricing_candidate is not None:
-        candidates.append(pricing_candidate)
+        llm_candidates = _llm_candidates(safe_text, llm)
+        if llm_candidates is not None:
+            candidates = [_quarantine_injected_candidate(item) for item in llm_candidates]
+            from_llm = True
+    if not from_llm:
+        # MOCK: FakeLLM 只认 intent/reply schema,这里用确定性规则补齐
+        size_candidate = _size_candidate(safe_text)
+        if size_candidate is not None:
+            candidates.append(size_candidate)
+        pricing_candidate = _pricing_candidate(safe_text)
+        if pricing_candidate is not None:
+            candidates.append(pricing_candidate)
+
+    if profile["suspect"]:
+        injection_candidate = _injection_candidate(body)
+        if injection_candidate is not None:
+            candidates.append(injection_candidate)
     return candidates
 
 

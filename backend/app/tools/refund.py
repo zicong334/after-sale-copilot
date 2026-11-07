@@ -16,6 +16,7 @@ F2 补齐(见 ``app/errors.py``),两者语义不冲突。
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from typing import Any, Literal
 
@@ -25,6 +26,8 @@ from sqlalchemy import select
 from app.errors import AmountExceedsPaidError
 from app.models import Order, RefundRequest
 from app.services.refunds import create_refund_request
+from app.tools.events import ToolEvent
+from app.tools.policy import CHECK_TOOL_NAME, _check_return
 from app.tools.registry import ToolSpec, clean_schema, register
 from app.tools.results import (
     CODE_BUSINESS_REJECT,
@@ -144,9 +147,57 @@ def _active_refund(ctx: ToolContext, order_id: str) -> RefundRequest | None:
     ).scalars().first()
 
 
+def _policy_gate_passed(ctx: ToolContext) -> bool:
+    """FIX-2 前置策略门:同一 trace 内已有 eligible=True 的 policy__check_return。
+
+    ``tool_events`` 只持久化调用入参(payload["args"]),不存读工具返回结果,所以
+    这里用 policy__check_return handler 的同一个纯函数 ``_check_return`` 按入参
+    重算判定——与工具自身结果同源、可复核,且只读不写库。取 step 最大的一条:
+    最近一次核验为准,先 eligible 后 ineligible 时以最新结论拒绝。
+    """
+    if not ctx.trace_id:
+        return False
+    event = ctx.session.execute(
+        select(ToolEvent)
+        .where(
+            ToolEvent.trace_id == ctx.trace_id,
+            ToolEvent.tool_name == CHECK_TOOL_NAME,
+            ToolEvent.ok.is_(True),
+        )
+        .order_by(ToolEvent.step.desc())
+        .limit(1)
+    ).scalars().first()
+    if event is None:
+        return False
+    try:
+        payload = json.loads(event.payload)
+        check_args = payload["args"]
+        verdict = _check_return(
+            str(check_args["order_status"]),
+            str(check_args["reason"]),
+            int(check_args["days_since_delivery"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        logger.warning(
+            "refund__create 策略门:policy__check_return 事件 payload 不可解析,"
+            "trace_id=%s",
+            ctx.trace_id,
+        )
+        return False
+    return bool(verdict.get("eligible"))
+
+
 def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """invoke 路径:resolve + 业务规则 + 确认卡四要素,不落业务数据。"""
+    """invoke 路径:resolve + 策略门 + 业务规则 + 确认卡四要素,不落业务数据。"""
     order = _resolve(args, ctx)
+    # FIX-2:业务规则层前置策略门——无同 trace 的 eligible 核验时不出确认卡。
+    if not _policy_gate_passed(ctx):
+        raise ToolExecutionError(
+            CODE_BUSINESS_REJECT,
+            "需先核验退货资格",
+            retryable=False,
+            param=CHECK_TOOL_NAME,
+        )
     key = compute_refund_key(args["order_id"], args["reason"], args["amount_cents"])
     # 业务规则:任何活跃退款单都不再生成确认卡(幂等重试/不同键重复都在此拦截)
     if _active_refund(ctx, order.id) is not None:

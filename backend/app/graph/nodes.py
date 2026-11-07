@@ -41,6 +41,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import utc_now
+from app import guardrails
 from app.graph.state import GraphState, NODE_STEP_LIMIT
 from app.llm import (
     INTENT_HANDOFF,
@@ -146,11 +147,42 @@ def _shortcut_intent(text: str) -> str | None:
 
 def _resolve_order_id(text: str, context: dict[str, Any]) -> str | None:
     """订单号来源:请求上下文(已解析的会话槽位)优先,其次消息文本中识别。"""
-    explicit = context.get("order_id")
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-    match = _ORDER_ID_RE.search(text)
-    return match.group(0) if match else None
+    return guardrails.extract_order_id(text, context)
+
+
+def _text_guard(text: str, context: dict[str, Any]) -> dict[str, Any]:
+    """FIX-3 确定性守卫画像(纯函数,便于单测)。
+
+    ``hard`` = 技术型注入(SQL/命令/伪造工具调用)或隐私索取,整轮不应执行工具;
+    ``suspect`` 只表示软命中(剥离片段后仍可处理正当诉求)。
+    """
+    profile = guardrails.detect_injection(text)
+    has_order = bool(guardrails.extract_order_id(text, context))
+    privacy = guardrails.is_privacy_probe(text, has_order)
+    return {"profile": profile, "privacy": privacy, "hard": bool(profile["hard"])}
+
+
+def _claim_evidence(state: GraphState, confirm: dict[str, Any] | None) -> dict[str, bool]:
+    """FIX-4:组装"状态声称"所需证据(全部来自本轮 state/trace,不查模型)。"""
+    observations = list(state.get("observations") or [])
+    verdict = dict(state.get("verdict") or {})
+    executed = dict((confirm or {}).get("executed") or {})
+    executed_ok = bool(executed.get("ok"))
+    tool = (confirm or {}).get("tool")
+    handoff_done = bool(executed_ok and tool == TOOL_HANDOFF)
+    refund_done = bool(executed_ok and tool == TOOL_REFUND)
+    lookup_failed = any(
+        str(item.get("name") or "") == "shop__get_order" and not item.get("ok")
+        for item in observations
+    )
+    return {
+        "handoff_done": handoff_done,
+        "refund_done": refund_done,
+        "address_done": False,
+        "lookup_denied": bool(lookup_failed or verdict.get("kind") == "order_not_found"),
+        "no_hit": bool(verdict.get("no_hit")),
+        "write_done": handoff_done or refund_done,
+    }
 
 
 def _extract_reason(text: str) -> str:
@@ -387,7 +419,15 @@ def make_nodes(
     def _render(facts: dict[str, Any]) -> str:
         """让 LLM 产出回复文本(MOCK: FakeLLM 模板);失败时返回安全兜底文案。"""
         messages = [
-            {"role": "system", "content": "你是售后客服,用中文回复,不要编造政策。"},
+            {
+                "role": "system",
+                "content": (
+                    "你是售后客服,用中文回复,不要编造政策。"
+                    "引用政策条款时必须逐字包含条款里的关键数字短语(金额/天数/运费/比例),不得改写或四舍五入;"
+                    "不得声称已完成转账、退款、改地址、建单、转人工等操作,除非本轮事实里明确给出执行结果;"
+                    "尚未确认的动作只能说\"将为您…(待确认)\"。"
+                ),
+            },
             build_facts_message(facts),
         ]
         try:
@@ -499,18 +539,37 @@ def make_nodes(
     def classify(state: GraphState) -> dict[str, Any]:
         """意图 + 槽位:高置信快捷路径优先,其余交给 LLM;历史同意图 3 轮升转人工。"""
         trace_id = str(state.get("trace_id") or "")
-        text = text_of(state)
+        raw_text = text_of(state)
         context = dict(state.get("context") or {})
-        order_id = _resolve_order_id(text, context)
+        order_id = _resolve_order_id(raw_text, context)
+        guard = _text_guard(raw_text, context)
+        profile = guard["profile"]
+        # FIX-3:注入命中只影响"理解",不把注入片段送进模型;软命中剥离后继续处理正当诉求
+        text = guardrails.strip_injection(raw_text) if profile["suspect"] else raw_text
         facts = {
             "text": text,
             "has_order": bool(order_id),
             "unresolved_rounds": int(context.get("unresolved_rounds") or 0),
         }
 
-        shortcut = _shortcut_intent(text)
-        if shortcut is not None:
+        blocked = bool(guard["hard"] or guard["privacy"])
+        shortcut = None if blocked else _shortcut_intent(text)
+        if guard["privacy"]:
             decision: dict[str, Any] = {
+                "intent": INTENT_OTHER,
+                "confidence": 1.0,
+                "reason": "隐私索取拦截",
+            }
+            path = "guard:privacy_block"
+        elif guard["hard"]:
+            decision = {
+                "intent": INTENT_OTHER,
+                "confidence": 1.0,
+                "reason": "注入指令拦截",
+            }
+            path = "guard:injection_block"
+        elif shortcut is not None:
+            decision = {
                 "intent": shortcut,
                 "confidence": 1.0,
                 "reason": "明示人工",
@@ -518,7 +577,14 @@ def make_nodes(
             path = "fast_path"
         else:
             messages = [
-                {"role": "system", "content": "你是售后客服的意图分类器,只输出 JSON。"},
+                {
+                    "role": "system",
+                    "content": (
+                        "你是售后客服的意图分类器,只输出 JSON。"
+                        "示例:用户说“我 M 码偏紧,以后都给我推荐 L 码” → 这是偏好/记忆场景,"
+                        "输出 other,不要归政策问答。"
+                    ),
+                },
                 {"role": "user", "content": text},
                 build_facts_message(facts),
             ]
@@ -532,9 +598,17 @@ def make_nodes(
             }:
                 decision["intent"] = INTENT_OTHER
             path = "llm"
+            # FIX-3:伪造政策的诉求(ADV-010)不交给模型选路,强制走政策检索核对原文
+            if "policy_forgery" in profile["kinds"]:
+                decision = {
+                    "intent": INTENT_POLICY_QA,
+                    "confidence": 0.9,
+                    "reason": "政策争议:核对政策原文",
+                }
+                path = "guard:policy_dispute"
 
         # 连续 3 轮同意图未解决 → 升级转人工(消费历史消息,不靠关键词"三遍")
-        if decision.get("intent") != INTENT_HANDOFF and _prior_same_intent(decision["intent"]) + 1 >= 3:
+        if not blocked and decision.get("intent") != INTENT_HANDOFF and _prior_same_intent(decision["intent"]) + 1 >= 3:
             decision = {
                 "intent": INTENT_HANDOFF,
                 "confidence": 0.95,
@@ -662,6 +736,13 @@ def make_nodes(
                 },
             }
 
+        # ---- FIX-3:硬注入/隐私索取整轮零工具、零写入(EDGE-008/ADV-012/014) ----
+        guard = _text_guard(text_of(state), dict(state.get("context") or {}))
+        if guard["privacy"]:
+            return {"steps": steps, "plan": [], "verdict": {"kind": "privacy_block"}}
+        if guard["hard"]:
+            return {"steps": steps, "plan": [], "verdict": {"kind": "security_block"}}
+
         steps += 1
 
         # ---- 熔断:第 NODE_STEP_LIMIT + 1 圈不再调工具,直接转人工 ----
@@ -693,6 +774,25 @@ def make_nodes(
         # ---- 确认门:interrupt 之前没有任何副作用(恢复时本节点从头重跑) ----
         plan = list(state.get("plan") or [])
         observations = list(state.get("observations") or [])
+        # ---- FIX-1:订单核验强制链(服务端守卫,不依赖模型是否"先查单") ----
+        text = text_of(state)
+        context = dict(state.get("context") or {})
+        intent_name = (state.get("intent") or {}).get("name")
+        if guardrails.needs_order_verification(
+            text=text,
+            context=context,
+            intent_name=intent_name,
+            observations=observations,
+        ):
+            forced_order_id = guardrails.extract_order_id(text, context)
+            if not forced_order_id:
+                # 抽取不到订单号:强制走追问话术,绝不臆测订单
+                return {
+                    "steps": steps,
+                    "plan": [],
+                    "verdict": {"kind": "order_missing_id"},
+                }
+            plan = [{"name": "shop__get_order", "args": {"order_id": forced_order_id}}]
         if not plan:
             plan = _next_plan(state)
         if not plan:
@@ -731,6 +831,18 @@ def make_nodes(
                                                 "order": None, "order_id": None}}
             if not result.ok:
                 return {"plan": [], "retrieved": [], "verdict": {"kind": "order_not_found"}}
+            # FIX-1:非订单意图(如"帮我查订单地址")只核验、不自动进入退款判责链
+            if intent not in (INTENT_ORDER_JUDGE, INTENT_HANDOFF):
+                checked_order = _order_summary(result.data)
+                return {
+                    "plan": [],
+                    "verdict": {
+                        **verdict,
+                        "kind": "order_checked",
+                        "order": checked_order,
+                        "order_id": (checked_order or {}).get("order_id"),
+                    },
+                }
             order = dict(result.data or {})
             total_cents = int(order.get("total_cents") or 0)
             claimed = _claimed_amounts_cents(text, context)
@@ -823,19 +935,49 @@ def make_nodes(
             out = {"confirm": confirm, "draft": _final_reply(confirm)}
         else:
             draft = _reply_for(verdict, state)
+            retrieved = list(state.get("retrieved") or [])
+            # FIX-4:状态声称必须有本轮证据,无证据逐句替换为诚实话术。
+            # 有条款原文的回复不在此处改写(避免把条款里的"已受理"等正文误判为声称),
+            # 其引用保真由 FIX-5 的确定性拼接负责。
+            if not retrieved:
+                draft, _replaced = guardrails.audit_status_claims(
+                    draft, _claim_evidence(state, confirm)
+                )
+            # FIX-5:引用保真——条款里的关键数字短语必须在回复中逐字出现,
+            # 否则确定性追加条款原文(不回炉模型,避免二次漂移)。
+            if retrieved and verdict.get("kind") in (
+                "policy_answer",
+                "order_verdict_eligible",
+                "order_verdict_refused",
+            ):
+                draft, _missing = guardrails.ensure_citation_fidelity(draft, retrieved)
+            if verdict.get("kind") == "policy_answer":
+                draft = guardrails.ensure_policy_word(draft)
+            # FIX-4:转人工确认卡未确认前,统一"将为您转接人工(待确认)"口径。
+            if confirm and not confirm.get("decided") and confirm.get("tool") == TOOL_HANDOFF:
+                reason_label = str(verdict.get("reason") or "用户主动要求人工")
+                order_id = verdict.get("order_id") or (state.get("intent") or {}).get("order_id")
+                suffix = f"(订单 {order_id})" if order_id else ""
+                draft = (
+                    f"将为您转接人工(待确认):转接原因「{reason_label}」{suffix}。"
+                    "请回复“确认”后,我再为您创建人工工单。"
+                )
             if confirm and not confirm.get("replied"):
                 out = {"draft": draft, "confirm": {**confirm, "replied": True}}
             else:
                 out = {"draft": draft}
         # 任务结束(图终态)才抽取偏好写记忆;act 自环/待确认挂起轮一律不写
         if not (confirm and not confirm.get("decided")):
-            extract_and_write(
-                session,
-                merchant_id=merchant_id,
-                user_id=session_row.customer_id,
-                text=text_of(state),
-                llm=llm,
-            )
+            guard = _text_guard(text_of(state), dict(state.get("context") or {}))
+            # FIX-3:注入/隐私拦截轮不写记忆;混合文本只喂剥离后的正当诉求
+            if not (guard["hard"] or guard["privacy"]):
+                extract_and_write(
+                    session,
+                    merchant_id=merchant_id,
+                    user_id=session_row.customer_id,
+                    text=guardrails.strip_injection(text_of(state)),
+                    llm=llm,
+                )
         return out
 
     def _reply_for(verdict: dict[str, Any], state: GraphState) -> str:
@@ -849,10 +991,24 @@ def make_nodes(
             )
         if kind == "retrieval_unavailable":
             return "政策检索服务暂时不可用,请稍后重试或转人工客服。"
+        if kind == "security_block":
+            return (
+                "为保障账户与数据安全,该请求包含无法执行的操作指令,已停止处理。"
+                "如需售后,请直接描述您的订单问题。"
+            )
+        if kind == "privacy_block":
+            return (
+                "抱歉,我无法提供其他客户的隐私信息。"
+                "如需查询您自己的订单,请提供订单号。"
+            )
         if kind == "order_missing_id":
             return _render({"kind": "order_missing_id"})
         if kind == "order_not_found":
-            return _render({"kind": "order_not_found"})
+            # FIX-1:越权/不存在统一口径,由工具返回的错误码驱动,不臆造订单信息。
+            return (
+                "未能在当前会话下找到您提到的订单。请确认订单号是否正确;"
+                "若该订单不属于当前账号,我无法展示其信息。"
+            )
         if kind == "order_verdict_eligible":
             return _render({
                 "kind": "order_verdict_eligible",
@@ -881,7 +1037,14 @@ def make_nodes(
             })
         if kind == "step_limit":
             return "您的问题需要更多步骤处理,已为您转接人工客服继续跟进。"
-        return _render({"kind": "other"})
+        if kind == "order_checked":
+            order = dict(verdict.get("order") or {})
+            return (
+                f"已核验订单 {order.get('order_id')},当前状态:{order.get('status')}。"
+                "如需办理退换货,请说明具体诉求。"
+            )
+        # FIX-7:偏好/记忆场景也把注入的记忆交给回复层,确保引用来源可追溯。
+        return _render({"kind": "other", "memory": state.get("memory") or {}})
 
     def _final_reply(confirm: dict[str, Any]) -> str:
         """确认门之后的终态话术(确定性模板,避免 MOCK LLM 出无关文案)。"""
@@ -957,13 +1120,15 @@ def make_nodes(
         # ---- 首次进入:建工单确认卡(副作用只在工具层,且卡尚未执行) ----
         verdict = dict(state.get("verdict") or {})
         intent = dict(state.get("intent") or {})
-        reason = str(
+        raw_reason = str(
             verdict.get("handoff_reason")
             or verdict.get("reason")
             or intent.get("reason")
             or "明示人工"
         )
-        label = _friendly_reason(reason)
+        # FIX-6:入库/工具参数只接受 canonical 枚举;自然语言只进 summary。
+        reason_enum = guardrails.map_handoff_reason(raw_reason)
+        label = guardrails.handoff_reason_label(reason_enum)
         order = verdict.get("order") or None
         order_id = verdict.get("order_id", intent.get("order_id"))
         summary = _handoff_summary(
@@ -972,7 +1137,7 @@ def make_nodes(
         )
         ticket = invoke(
             TOOL_HANDOFF,
-            {"reason": label, "summary": summary, "order_id": order_id},
+            {"reason": reason_enum, "summary": summary, "order_id": order_id},
             ctx,
         )
         observations = list(state.get("observations") or [])
@@ -997,7 +1162,7 @@ def make_nodes(
             "confirm": built,
             "observations": observations,
             "verdict": {**verdict, "kind": "handoff", "reason": label,
-                        "order_id": order_id, "handoff_reason": reason},
+                        "order_id": order_id, "handoff_reason": reason_enum},
         }
 
     return {

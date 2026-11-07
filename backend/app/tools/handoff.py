@@ -6,14 +6,18 @@
 - ``handler``(invoke 走这里):resolve(若带 order_id,须存在且属于 ctx.customer_id)+
   返回确认卡四要素;不落业务数据。
 - ``execute``(W3 invoke_confirmed / 测试走这里):真实创建 Ticket(queued)。
+
+FIX-6:``reason`` 只接受 canonical 枚举(单一来源 ``guardrails.HANDOFF_REASON_ENUM``),
+``handoff_reason`` 列存枚举值,自然语言摘要只进 ``summary`` 列。
 """
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.guardrails import HANDOFF_REASON_ENUM, handoff_reason_label
 from app.models import Order, Ticket
 from app.tools.registry import ToolSpec, clean_schema, register
 from app.tools.results import (
@@ -26,11 +30,17 @@ logger = logging.getLogger("app.tools.handoff")
 
 TOOL_NAME = "handoff__create_ticket"
 
+# FIX-6:枚举单一来源仍是 guardrails.HANDOFF_REASON_ENUM;运行时用它展开成
+# Literal[...] 让 pydantic 生成 enum schema 并拒绝非法值(有测试守护两者一致)。
+HandoffReason = Literal[tuple(HANDOFF_REASON_ENUM)]  # type: ignore[valid-type]
+
 
 class Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reason: str = Field(min_length=1)
+    reason: HandoffReason = Field(
+        description="转接原因,取 canonical 枚举值(见 schema enum);自然语言摘要放 summary",
+    )
     summary: str = Field(min_length=1)
     order_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{2,63}$")
 
@@ -56,6 +66,7 @@ SPEC = ToolSpec(
         "创建人工客服工单,把当前会话转交给人工坐席跟进。"
         "用于问题复杂、超出自动化工具能处理的范围(如投诉、纠纷、需要人工核实)时;"
         "不要用它记录普通咨询(应先用 policy__search 检索政策解答)。"
+        "reason 只接受 canonical 枚举值(见 input_schema 的 enum);对话摘要写 summary。"
     ),
     input_schema=INPUT_SCHEMA,
     output_schema=OUTPUT_SCHEMA,
@@ -93,7 +104,7 @@ def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     order_id = args.get("order_id")
     return {
         "card": {
-            "what": f"创建人工客服工单(转接原因:{reason})",
+            "what": f"创建人工客服工单(转接原因:{handoff_reason_label(reason)})",
             "impact": "生成排队工单(queued),由人工坐席领取后跟进;会话转交人工",
             "irreversibility": "工单一旦创建即进入人工队列,无法自动撤回",
             "alternatives": "若问题可用现有政策工具解答,可先尝试 policy__search 自助解决",
@@ -107,7 +118,10 @@ def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 
 def execute(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """真实创建工单(W3 invoke_confirmed / 测试用)。reason 与 summary 分列落库。"""
+    """真实创建工单(W3 invoke_confirmed / 测试用)。
+
+    FIX-6 落库约定:``handoff_reason`` 列只存 canonical 枚举,``summary`` 列存自然语言。
+    """
     _resolve_order(args, ctx)
     reason = args["reason"]
     summary = args["summary"]

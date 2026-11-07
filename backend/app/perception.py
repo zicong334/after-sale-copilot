@@ -4,7 +4,10 @@
 1. 文本清洗:去零宽/不可见控制字符、去首尾空白;空文本直接拒绝;
 2. 超长截断:超过 4000 字截断,并显式标记 ``truncated`` / ``original_length``(不静默丢数据);
 3. 附件只接受 http(s) URL:拒收 base64 / data URI(避免把图片二进制塞进链路),
-   只保留 URL 交给后续步骤(图片理解留给 W4 之外的专门环节)。
+   只保留 URL 交给后续步骤(图片理解留给 W4 之外的专门环节);
+4. 注入感知(W4-C-FIX / FIX-3):在清洗后的文本上跑确定性特征清单,命中时把
+   ``injection_suspect`` 等标记写进 ``Percept.flags``;索要他人隐私时写
+   ``privacy_block``。``text`` 本身仍是原文(注入片段剥离由图上调用点负责)。
 
 边界:本模块是**纯函数,无 IO**——不落库、不写 trace、不调工具/LLM。
 这正是 PRD §5 六节点图的第一节点 ``perceive``:可单测、可复用、可被 W3 的图直接调用。
@@ -15,6 +18,13 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.guardrails import (
+    PRIVACY_BLOCK_FLAG,
+    extract_order_id,
+    injection_flags,
+    is_privacy_probe,
+)
 
 #: 单条消息文本上限(字符)。超出截断并标记,不静默丢弃。
 MAX_TEXT_LENGTH = 4000
@@ -49,6 +59,13 @@ class Percept(BaseModel):
     channel: str = DEFAULT_CHANNEL
     truncated: bool = False
     original_length: int | None = None
+    flags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "确定性护栏标记(命中才出现,供图规则判定):"
+            "injection_suspect / injection_kind:<kind> / injection_block / privacy_block"
+        ),
+    )
 
 
 def normalize(
@@ -78,7 +95,17 @@ def normalize(
         channel=_normalize_tag(channel, DEFAULT_CHANNEL, field="channel"),
         truncated=truncated,
         original_length=original_length if truncated else None,
+        flags=_compute_flags(cleaned),
     )
+
+
+def _compute_flags(text: str) -> list[str]:
+    """确定性护栏标记:在清洗 + 截断后的文本上算,保证与 ``Percept.text`` 一致。"""
+    flags = injection_flags(text)
+    # 有订单号槽位时不按隐私探针拦截(越权订单由工具证据链负责,见 guardrails)
+    if is_privacy_probe(text, extract_order_id(text) is not None):
+        flags.append(PRIVACY_BLOCK_FLAG)
+    return flags
 
 
 def normalize_attachments(raw: Any) -> list[str]:

@@ -98,6 +98,12 @@ POLICY_TOPIC_HINTS: tuple[str, ...] = (
     "政策", "几天", "多久", "多少天", "期限", "运费", "尺码", "多高", "多重",
     "无理由", "质量问题", "到账", "包邮", "发货", "偏远", "改地址", "拒收",
 )
+#: 记忆/偏好场景线索:买家在陈述长期偏好或要求"以后都推荐",不是即时政策问答。
+#: 必须放在 POLICY_TOPIC_HINTS 判定之前("尺码"同时在政策词表里),但仍排在
+#: 明示人工/风险信号/订单判责之后,保证既有分类顺序不被改变。
+MEMORY_SCENE_HINTS: tuple[str, ...] = (
+    "尺码", "偏好", "以后都给我", "以后都推荐", "以后推荐", "以后都选", "记住我",
+)
 
 #: 回复模板里的"其它"能力说明
 _OTHER_REPLY = (
@@ -151,6 +157,8 @@ class FakeLLM(LLMClient):
             return {"intent": INTENT_HANDOFF, "confidence": 0.95, "reason": "连续 3 轮未解决"}
         if has_order and _hit(lowered, ORDER_TOPIC_HINTS):
             return {"intent": INTENT_ORDER_JUDGE, "confidence": 0.9, "reason": "命中订单话题且会话有订单"}
+        if _hit(lowered, MEMORY_SCENE_HINTS):
+            return {"intent": INTENT_OTHER, "confidence": 0.9, "reason": "记忆/偏好场景(由记忆注入处理)"}
         if _hit(lowered, POLICY_TOPIC_HINTS):
             return {"intent": INTENT_POLICY_QA, "confidence": 0.9, "reason": "命中政策话题"}
         if _hit(lowered, ORDER_TOPIC_HINTS):
@@ -224,6 +232,14 @@ class FakeLLM(LLMClient):
                 "工单已进入人工队列,坐席会尽快跟进;在人工接手前,我先不再自动回复。"
             )
 
+        # other 分支:任务开始注入了历史偏好时,回复要引用记忆内容(如尺码偏好),
+        # 没有记忆(count=0 / text 为空)则保持原能力菜单模板,避免空口承诺。
+        memory = facts.get("memory")
+        if isinstance(memory, dict) and int(memory.get("count") or 0) > 0:
+            memory_text = str(memory.get("text") or "").strip()
+            if memory_text:
+                return _memory_reply(memory_text)
+
         return _OTHER_REPLY
 
 
@@ -239,6 +255,26 @@ def _hit(text: str, hints: tuple[str, ...]) -> bool:
 def _sentence(text: str) -> str:
     """去掉条款原文末尾的句读,避免模板拼接后出现"。。"。"""
     return str(text).strip().rstrip("。;；. ")
+
+
+def _memory_reply(memory_text: str) -> str:
+    """other 分支引用记忆注入包:只取 "- [type/scope] 正文" 的正文,不把元数据抄给用户。"""
+    points: list[str] = []
+    for raw in memory_text.splitlines():
+        line = raw.strip()
+        if not line.startswith("- "):
+            continue
+        detail = line[2:].strip()
+        if detail.startswith("[") and "]" in detail:
+            detail = detail.split("]", 1)[1].strip()
+        if detail:
+            points.append(detail)
+    digest = "；".join(points) if points else _sentence(memory_text)
+    return (
+        f"已记下您的偏好。根据历史记忆:{digest}。"
+        "后续我会参考这些偏好;涉及价格/退款/承诺仍以店铺政策和订单为准。"
+        "如需修改或补充,请直接告诉我。"
+    )
 
 
 def _last_user_content(messages: list[Message]) -> str:

@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from sqlalchemy import func, select
 
+from app.guardrails import HANDOFF_REASON_ENUM, map_handoff_reason
 from app.models import KnowledgeItem, Merchant, Order, RefundRequest, Ticket
 from app.tools import (  # noqa: F401 —— 触发工具注册 + 事件表注册
     CODE_BUSINESS_REJECT,
@@ -294,14 +296,27 @@ def test_policy_search_hit(session):
 # refund__create
 # ---------------------------------------------------------------------------
 
+def _eligible_policy_check(ctx) -> None:
+    """在同 trace 内落一条 eligible=True 的 policy__check_return 事件(FIX-2 前置)。"""
+    res = invoke(
+        "policy__check_return",
+        {"order_status": "delivered", "reason": "质量问题", "days_since_delivery": 3},
+        ctx,
+    )
+    assert res.ok is True
+    assert res.data["eligible"] is True
+
+
 def test_refund_pending_confirm_four_elements(session):
     """写工具 invoke 不执行,返回 pending_confirm 卡片含四要素 + confirm_token。"""
     _merchant(session)
     _order(session, oid="ORD-0001", status="delivered", total=10000)
+    ctx = _ctx(session)
+    _eligible_policy_check(ctx)  # FIX-2:先有同 trace 的 eligible 核验
     res = invoke(
         "refund__create",
         {"order_id": "ORD-0001", "amount_cents": 5000, "reason": "质量问题"},
-        _ctx(session),
+        ctx,
     )
     assert res.ok is True
     card = res.data["pending_confirm"]
@@ -316,6 +331,82 @@ def test_refund_pending_confirm_four_elements(session):
     assert row.status == "pending"
     # invoke 未真正执行:退款单仍为 0
     assert session.scalar(select(func.count()).select_from(RefundRequest)) == 0
+
+
+def test_refund_requires_policy_gate(session):
+    """FIX-2:无同 trace 的 policy__check_return 前置 → BUSINESS_REJECT 且零写。"""
+    _merchant(session)
+    _order(session, oid="ORD-0001", status="delivered", total=10000)
+    res = invoke(
+        "refund__create",
+        {"order_id": "ORD-0001", "amount_cents": 5000, "reason": "质量问题"},
+        _ctx(session),
+    )
+    assert res.ok is False
+    assert res.error.code == CODE_BUSINESS_REJECT
+    assert res.error.retryable is False
+    assert res.error.message == "需先核验退货资格"
+    # 零写:既不出确认卡,也不建退款单
+    assert session.scalar(select(func.count()).select_from(ConfirmRequest)) == 0
+    assert session.scalar(select(func.count()).select_from(RefundRequest)) == 0
+
+
+def test_refund_policy_gate_rejects_ineligible_check(session):
+    """有前置但核验结果 eligible=False → 仍拒绝(不建单)。"""
+    _merchant(session)
+    _order(session, oid="ORD-0001", status="delivered", total=10000)
+    ctx = _ctx(session)
+    check = invoke(
+        "policy__check_return",
+        {"order_status": "delivered", "reason": "七天无理由", "days_since_delivery": 10},
+        ctx,
+    )
+    assert check.ok is True
+    assert check.data["eligible"] is False
+    res = invoke(
+        "refund__create",
+        {"order_id": "ORD-0001", "amount_cents": 5000, "reason": "七天无理由"},
+        ctx,
+    )
+    assert res.ok is False
+    assert res.error.code == CODE_BUSINESS_REJECT
+    assert session.scalar(select(func.count()).select_from(RefundRequest)) == 0
+
+
+def test_refund_policy_gate_ignores_failed_check(session):
+    """ok=False 的 policy__check_return 不算前置(入参 schema 错)。"""
+    _merchant(session)
+    _order(session, oid="ORD-0001", status="delivered", total=10000)
+    ctx = _ctx(session)
+    bad = invoke(
+        "policy__check_return",
+        {"order_status": "delivered", "reason": "不存在的退款原因", "days_since_delivery": 3},
+        ctx,
+    )
+    assert bad.ok is False
+    assert bad.error.code == CODE_SCHEMA_ERROR
+    res = invoke(
+        "refund__create",
+        {"order_id": "ORD-0001", "amount_cents": 5000, "reason": "质量问题"},
+        ctx,
+    )
+    assert res.ok is False
+    assert res.error.code == CODE_BUSINESS_REJECT
+    assert session.scalar(select(func.count()).select_from(RefundRequest)) == 0
+
+
+def test_refund_policy_gate_bound_to_trace(session):
+    """核验事件必须与退款调用同一 trace_id。"""
+    _merchant(session)
+    _order(session, oid="ORD-0001", status="delivered", total=10000)
+    _eligible_policy_check(_ctx(session, trace_id="trace-check"))
+    res = invoke(
+        "refund__create",
+        {"order_id": "ORD-0001", "amount_cents": 5000, "reason": "质量问题"},
+        _ctx(session, trace_id="trace-refund"),
+    )
+    assert res.ok is False
+    assert res.error.code == CODE_BUSINESS_REJECT
 
 
 def test_refund_execute_idempotent_same_key(session):
@@ -387,6 +478,7 @@ def test_refund_duplicate_different_key(session):
     _merchant(session)
     _order(session, oid="ORD-0001", status="delivered", total=10000)
     ctx = _ctx(session)
+    _eligible_policy_check(ctx)  # 先过 FIX-2 策略门,才能走到活跃退款单业务拒绝
     refund_execute({"order_id": "ORD-0001", "amount_cents": 5000, "reason": "质量问题"}, ctx)
     res = invoke(
         "refund__create",
@@ -417,7 +509,7 @@ def test_handoff_pending_confirm(session):
     _merchant(session)
     res = invoke(
         "handoff__create_ticket",
-        {"reason": "需要人工介入", "summary": "用户多次尝试退货均失败"},
+        {"reason": "explicit_request", "summary": "用户多次尝试退货均失败"},
         _ctx(session),
     )
     assert res.ok is True
@@ -430,7 +522,7 @@ def test_handoff_pending_confirm(session):
 def test_handoff_execute_creates_ticket(session):
     _merchant(session)
     r = handoff_execute(
-        {"reason": "需要人工介入", "summary": "用户多次尝试退货均失败", "order_id": None},
+        {"reason": "unresolved_3rounds", "summary": "用户多次尝试退货均失败", "order_id": None},
         _ctx(session),
     )
     assert r["status"] == "queued"
@@ -438,8 +530,8 @@ def test_handoff_execute_creates_ticket(session):
     assert ticket is not None
     assert ticket.merchant_id == "m-1"
     assert ticket.customer_id == "cust-1"
-    # F3:reason 与 summary 分列落库(summary 不再折进 handoff_reason)
-    assert ticket.handoff_reason == "需要人工介入"
+    # F3 + FIX-6:handoff_reason 列存 canonical 枚举,summary 列存自然语言(分列落库)
+    assert ticket.handoff_reason == "unresolved_3rounds"
     assert ticket.summary == "用户多次尝试退货均失败"
 
 
@@ -447,7 +539,7 @@ def test_handoff_order_not_found(session):
     _merchant(session)
     res = invoke(
         "handoff__create_ticket",
-        {"reason": "转人工", "summary": "复杂问题", "order_id": "ORD-NOPE"},
+        {"reason": "explicit_request", "summary": "复杂问题", "order_id": "ORD-NOPE"},
         _ctx(session),
     )
     assert res.ok is False
@@ -463,6 +555,58 @@ def test_handoff_schema_error(session):
     )
     assert res.ok is False
     assert res.error.code == CODE_SCHEMA_ERROR
+
+
+def test_handoff_invalid_reason_enum_rejected(session):
+    """FIX-6:旧自然语言 reason → schema 层拒绝,不落工单。"""
+    _merchant(session)
+    res = invoke(
+        "handoff__create_ticket",
+        {"reason": "需要人工介入", "summary": "摘要"},
+        _ctx(session),
+    )
+    assert res.ok is False
+    assert res.error.code == CODE_SCHEMA_ERROR
+    assert res.error.param == "reason"
+    assert session.scalar(select(func.count()).select_from(Ticket)) == 0
+
+
+@pytest.mark.parametrize("reason", HANDOFF_REASON_ENUM)
+def test_handoff_all_enum_reasons_accepted(session, reason):
+    """七枚举值 invoke + execute 全通;handoff_reason 存枚举,summary 存自然语言。"""
+    _merchant(session)
+    ctx = _ctx(session)
+    summary = "用户反馈问题,需人工跟进"
+    res = invoke("handoff__create_ticket", {"reason": reason, "summary": summary}, ctx)
+    assert res.ok is True
+    assert res.data["pending_confirm"]["what"]
+    r = handoff_execute({"reason": reason, "summary": summary}, ctx)
+    ticket = session.get(Ticket, r["ticket_id"])
+    assert ticket.handoff_reason == reason
+    assert ticket.summary == summary
+
+
+def test_handoff_input_schema_enum_matches_guardrails():
+    """工具 schema 的 reason enum 与 guardrails.HANDOFF_REASON_ENUM 单一来源一致。"""
+    schema = get_spec("handoff__create_ticket").input_schema
+    enum = schema["properties"]["reason"]["enum"]
+    assert tuple(enum) == HANDOFF_REASON_ENUM
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("step_limit", "step_limit"),
+        ("连续 3 轮未解决", "unresolved_3rounds"),
+        ("连续多轮未解决", "unresolved_3rounds"),
+        ("明示人工", "explicit_request"),
+        ("金额争议:客户声称金额与订单实付不符", "amount_dispute"),
+        ("风险信号(投诉/金额争议)", "complaint"),
+    ],
+)
+def test_trigger_reason_maps_to_canonical_enum(raw, expected):
+    """图内/FakeLLM 触发点原串 → canonical 枚举(守护映射顺序:FIX-6)。"""
+    assert map_handoff_reason(raw) == expected
 
 
 # ---------------------------------------------------------------------------
