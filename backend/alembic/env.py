@@ -43,15 +43,19 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """在线模式:真实连库执行迁移;SQLite 显式开外键。"""
+    """在线模式:真实连库执行迁移。"""
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+    # 注意:这里不再用 connection.exec_driver_sql("PRAGMA foreign_keys=ON")。
+    # 该调用在 SQLAlchemy 2.x 下会触发 autobegin 事务,破坏 alembic 的
+    # context.begin_transaction() 提交时序,导致 alembic_version 不落库、
+    # 后续迁移的建表丢失(实测:upgrade head 后表缺失)。应用侧外键已由
+    # app/db.py 的 create_db_engine 通过 connect 事件正确开启,迁移建表阶段
+    # 无需外键约束。
     with connectable.connect() as connection:
-        if connection.dialect.name == "sqlite":
-            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
             context.run_migrations()

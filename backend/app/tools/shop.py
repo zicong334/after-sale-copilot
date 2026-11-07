@@ -9,7 +9,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from app.models import Order
+from app.tools.registry import ToolSpec, clean_schema, register
 from app.tools.results import (
     CODE_NOT_FOUND_OR_FORBIDDEN,
     ToolContext,
@@ -20,17 +23,16 @@ logger = logging.getLogger("app.tools.shop")
 
 TOOL_NAME = "shop__get_order"
 
-INPUT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "order_id": {
-            "type": "string",
-            "pattern": "^ORD-[0-9A-Z-]+$",
-        },
-    },
-    "required": ["order_id"],
-    "additionalProperties": False,
-}
+
+class Input(BaseModel):
+    """shop__get_order 入参:order_id 必须匹配 ``^ORD-[0-9A-Z-]+$``。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    order_id: str = Field(pattern=r"^ORD-[0-9A-Z-]+$")
+
+
+INPUT_SCHEMA: dict[str, Any] = clean_schema(Input)
 
 OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -42,7 +44,23 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "created_at": {"type": "string"},
     },
     "required": ["order_id", "status", "total_cents", "currency", "created_at"],
+    "additionalProperties": False,
 }
+
+SPEC = ToolSpec(
+    name=TOOL_NAME,
+    description=(
+        "查询当前客户名下的一笔订单详情(订单号、状态、实付金额、币种、下单时间)。"
+        "仅用于读取订单信息,不做任何修改;不要用它查询退款进度或发起退款。"
+    ),
+    input_schema=INPUT_SCHEMA,
+    output_schema=OUTPUT_SCHEMA,
+    side_effect="read",
+    timeout_s=5.0,
+    retry={"max_attempts": 1, "backoff_s": 0.0},
+    idempotency_key=None,
+    requires_confirm=False,
+)
 
 
 def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -75,3 +93,6 @@ def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         "currency": order.currency,
         "created_at": order.created_at.isoformat(),
     }
+
+
+register(SPEC, Input, handler)
