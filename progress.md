@@ -18,4 +18,5 @@
 - 2026-11-07 W3-C | 确认卡闭环+转人工全链路+前端 SSE 壳+TOCTOU 定点修复(dsh flash 一次跑通) | 222 passed;10/10;五路由 200;确认卡四要素+verified 取证 | usage 为 MOCK 估算待 W4-C
 - 2026-11-07 W3 阶段门 | 主会话亲测通过,准入 W4 | 四承诺全有测试证据 | 队列:W4-A→W4-B→W4-C→最终验收
 - 2026-11-07 W4-A | 评测完备:48 条(19/14/10/5)+硬断言引擎+FakeJudge(防注入)+报告 6 指标+run_eval 一键(dsh flash) | 242 passed;FakeLLM 基线 0.9792 照实报;smoke 15/15 | CS-EDGE-005 成簇=W4-C 真模型基线缺口
+- 2026-11-07 W4-B首发 | 21:00 挂死于沙箱 ACL 诊断 powershell(与 W1-A 同类),21:31 cancel;遗留 7 产物 1006 行可承接 | 无(未跑完) | 续作已重发(硬护栏:禁诊断/powershell、basetemp 新目录)
 - 
