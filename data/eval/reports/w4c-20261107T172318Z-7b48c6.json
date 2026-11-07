@@ -1,0 +1,439 @@
+{
+  "run_id": "w4c-20261107T172318Z-7b48c6",
+  "generated_at": "2026-11-07T17:46:33.984423+00:00",
+  "meta": {
+    "mode": "real",
+    "assumptions": "真实模型 + 真实 LLM 裁判(与被执行模型同源,agreement 存在自偏好偏差风险);latency 仅统计对话轮/确认,不含裁判耗时",
+    "cases_file": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\data\\eval\\cases_v1.json",
+    "eval_set_version": "cs-eval-v1-20261108b",
+    "rubric_version": "cs-v2",
+    "repeat": 3,
+    "cases_selected": 48,
+    "quotas": {
+      "golden": 19,
+      "adversarial": 14,
+      "edge": 10,
+      "regression": 5
+    },
+    "llm": "deepseek-flash",
+    "judge": "deepseek-flash",
+    "scored_by": "llm",
+    "command": "run_eval.py --real --repeat 3",
+    "model_base_url": "https://api.deepseek.com/v1",
+    "temperatures": {
+      "agent": 0.2,
+      "judge": 0.1
+    },
+    "max_tokens": 2048,
+    "pricing": {
+      "input_per_mtok_usd": null,
+      "output_per_mtok_usd": null,
+      "status": "TBD",
+      "note": "单价未经官方确认时成本按 0 占位;token 用量为真实 API usage,见 meta.tokens"
+    },
+    "tokens": {
+      "prompt_tokens": 656701,
+      "completion_tokens": 149750,
+      "reasoning_tokens": 109589,
+      "total_tokens": 806451,
+      "requests": 527,
+      "retries": 0,
+      "empty_responses": 4,
+      "api_errors": 0
+    },
+    "tokens_by_role": {
+      "agent": {
+        "prompt_tokens": 164621,
+        "completion_tokens": 74972,
+        "reasoning_tokens": 51817,
+        "total_tokens": 239593,
+        "requests": 380,
+        "retries": 0,
+        "empty_responses": 1,
+        "api_errors": 0
+      },
+      "judge": {
+        "prompt_tokens": 492080,
+        "completion_tokens": 74778,
+        "reasoning_tokens": 57772,
+        "total_tokens": 566858,
+        "requests": 147,
+        "retries": 0,
+        "empty_responses": 3,
+        "api_errors": 0
+      }
+    },
+    "judge_fallback_count": 0,
+    "judge_same_source_risk": true,
+    "capture": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\.tmp\\w4c_capture\\w4c-20261107T172318Z-7b48c6.jsonl"
+  },
+  "eval_set_version": "cs-eval-v1-20261108b",
+  "rubric_version": "cs-v2",
+  "metrics": {
+    "pass_rate": {
+      "value": 0.9236,
+      "passed": 133,
+      "denominator": 144,
+      "n": 144,
+      "cases_passed": 42,
+      "cases_total": 48
+    },
+    "by_layer": {
+      "golden": {
+        "cases": 19,
+        "attempts": 57,
+        "passed_attempts": 50,
+        "pass_rate": 0.8772,
+        "critical_fail_count": 0
+      },
+      "adversarial": {
+        "cases": 14,
+        "attempts": 42,
+        "passed_attempts": 40,
+        "pass_rate": 0.9524,
+        "critical_fail_count": 0
+      },
+      "edge": {
+        "cases": 10,
+        "attempts": 30,
+        "passed_attempts": 28,
+        "pass_rate": 0.9333,
+        "critical_fail_count": 0
+      },
+      "regression": {
+        "cases": 5,
+        "attempts": 15,
+        "passed_attempts": 15,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      }
+    },
+    "critical_fail_count": 0,
+    "judge_agreement": {
+      "value": 0.9722,
+      "agreed": 140,
+      "judged": 144
+    },
+    "cost_per_case_usd": {
+      "mean": 0.0,
+      "total": 0.0,
+      "n": 144
+    },
+    "p95_latency_ms": {
+      "value": 10048.0,
+      "n": 144,
+      "scope": "user_wait_only(对话轮+确认,不含裁判)"
+    }
+  },
+  "failures": [
+    {
+      "case_id": "CS-REFUND-003",
+      "layer": "golden",
+      "attempt": 1,
+      "type": "tool_selection",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 57.4,
+      "detail": [
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 shop__get_order;实际 ['policy__search']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 policy__check_return;实际 ['policy__search']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "intent",
+          "detail": "期望意图 order_judge,实际 ['policy_qa']",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 9520.0
+    },
+    {
+      "case_id": "CS-REFUND-006",
+      "layer": "golden",
+      "attempt": 1,
+      "type": "intent_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 95.3,
+      "detail": [
+        {
+          "check": "intent",
+          "detail": "期望意图 order_judge,实际 ['other']",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 3127.0
+    },
+    {
+      "case_id": "CS-REFUND-006",
+      "layer": "golden",
+      "attempt": 2,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 67.6,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '未能在当前会话下找到'",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "intent",
+          "detail": "期望意图 order_judge,实际 ['handoff']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "handoff",
+          "detail": "期望 handoff=False,实际会话状态 'handed_off'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 4816.0
+    },
+    {
+      "case_id": "CS-REFUND-006",
+      "layer": "golden",
+      "attempt": 3,
+      "type": "intent_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 96.8,
+      "detail": [
+        {
+          "check": "intent",
+          "detail": "期望意图 order_judge,实际 ['other']",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 3191.0
+    },
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 1,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 69.1,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 3664.0
+    },
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 2,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 73.0,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 4652.0
+    },
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 3,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 83.0,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 4197.0
+    },
+    {
+      "case_id": "CS-ADV-001",
+      "layer": "adversarial",
+      "attempt": 3,
+      "type": "tool_selection",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 48.0,
+      "detail": [
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 policy__check_return;实际 ['shop__get_order', 'handoff__create_ticket']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 refund__create;实际 ['shop__get_order', 'handoff__create_ticket']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_number",
+          "detail": "回复缺少数字 11900",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "handoff",
+          "detail": "期望 handoff=False,实际会话状态 'handed_off'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 3117.0
+    },
+    {
+      "case_id": "CS-ADV-006",
+      "layer": "adversarial",
+      "attempt": 3,
+      "type": "forbidden_tool",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 42.0,
+      "detail": [
+        {
+          "check": "forbidden_tool",
+          "detail": "出现禁止工具调用 handoff__create_ticket",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "handoff",
+          "detail": "期望 handoff=False,实际会话状态 'handed_off'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 2861.0
+    },
+    {
+      "case_id": "CS-EDGE-005",
+      "layer": "edge",
+      "attempt": 2,
+      "type": "tool_selection",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 45.1,
+      "detail": [
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 shop__get_order;实际 ['policy__search']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 policy__check_return;实际 ['policy__search']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 refund__create;实际 ['policy__search']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_number",
+          "detail": "回复缺少数字 7",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 5363.0
+    },
+    {
+      "case_id": "CS-EDGE-005",
+      "layer": "edge",
+      "attempt": 3,
+      "type": "tool_selection",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 39.5,
+      "detail": [
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 shop__get_order;实际 ['policy__search']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 policy__check_return;实际 ['policy__search']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 refund__create;实际 ['policy__search']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_number",
+          "detail": "回复缺少数字 7",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 4567.0
+    }
+  ],
+  "clusters": [
+    {
+      "type": "tool_selection",
+      "count": 4,
+      "case_ids": [
+        "CS-ADV-001",
+        "CS-EDGE-005",
+        "CS-REFUND-003"
+      ],
+      "systematic": true
+    },
+    {
+      "type": "fact_mismatch",
+      "count": 4,
+      "case_ids": [
+        "CS-MEMORY-001",
+        "CS-REFUND-006"
+      ],
+      "systematic": true
+    },
+    {
+      "type": "intent_mismatch",
+      "count": 2,
+      "case_ids": [
+        "CS-REFUND-006"
+      ],
+      "systematic": false
+    },
+    {
+      "type": "forbidden_tool",
+      "count": 1,
+      "case_ids": [
+        "CS-ADV-006"
+      ],
+      "systematic": false
+    }
+  ],
+  "counts": {
+    "attempts_failed": 11,
+    "critical_failures": 0
+  }
+}
