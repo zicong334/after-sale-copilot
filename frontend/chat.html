@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>售后 Copilot · 聊天</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">售后 Copilot<span class="sub">W3-C 聊天壳 · 确认卡 · 转人工</span></div>
+      <div class="conn" id="conn">未连接</div>
+    </header>
+
+    <div class="banner hidden" id="handoffBanner">
+      <strong>已转人工</strong>
+      <span>AI 已停止自动回复,工单进入人工队列,坐席会尽快回复。</span>
+    </div>
+
+    <main class="stream" id="stream" aria-live="polite">
+      <div class="hint" id="emptyHint">
+        输入问题开始对话。示例:订单 ORD-20240001 的衣服有线头,我要退货退款;
+        或直接说「转人工」。
+      </div>
+    </main>
+
+    <form class="composer" id="composer">
+      <input id="text" type="text" autocomplete="off"
+             placeholder="描述你的售后问题…" maxlength="2000" />
+      <button id="send" type="submit">发送</button>
+    </form>
+    <div class="meta">
+      <span id="trace">trace: -</span>
+      <span>本页为原生 HTML/CSS/JS,无 CDN、无构建工具;金额与用量为 MOCK 估算。</span>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

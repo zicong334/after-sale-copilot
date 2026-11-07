@@ -1,4 +1,4 @@
-"""api/chat.py — 会话薄路由 ``POST /api/c/chat``(W2-C 新增)。
+"""api/chat.py — 会话薄路由(W2-C 新增;W3-C 增 SSE 流式壳)。
 
 路由只做"无业务"的四件事:
 1. 请求校验 + 感知归一化(``app.perception``),非法输入 400;
@@ -7,16 +7,30 @@
 3. 落库 user 消息(trace_id / attachments) → 调编排 → 落库 assistant 消息(trace_id / intent);
 4. 原样返回编排结果(intent / citations / pending_confirm / tool_calls / trace_id)。
 
-业务判定(意图、工具调用顺序、条款引用、转人工条件)全部在
-``app.orchestrator.w1_router``;本文件不出现任何工具名与政策规则,便于 W3 换图时
-路由零改动。
+W3-C 新增 ``POST /api/c/chat/stream``:手写 ``text/event-stream``(FastAPI
+StreamingResponse,不引入 sse-starlette),事件类型:
+
+- ``message``:回复分片(本棒无真实 LLM,按字符切"模拟流式",注释见 ``_chunks``);
+- ``citation``:一条政策引用(``[n]`` 与前端高亮对应);
+- ``confirm_request``:待确认卡(pending_confirm 原样:what/impact/irreversibility/
+  alternatives/confirm_token);
+- ``handoff_notice``:会话已转人工(handed_off),前端显示横幅;
+- ``usage``:本轮计量 ``{tokens_in, tokens_out, cost_usd, latency_ms, estimated:true}``
+  (FakeLLM 口径:按字符数估算,MOCK 价目,非真实账单);
+- ``done``:本轮结束,带 session_id / trace_id / 完整结果摘要。
+
+所有 DB 工作与图执行都在 ``_run_turn`` 内同步完成,生成器只 yield 已算好的帧,
+避免在流式响应里持有请求级 Session。
 """
 
 from __future__ import annotations
 
-from typing import Any
+import json
+import time
+from typing import Any, Iterator
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -28,6 +42,13 @@ from app.perception import PerceptionError, normalize
 from app.trace import new_trace_id
 
 router = APIRouter(prefix="/api/c", tags=["chat"])
+
+# MOCK 计量:本棒不接真实 LLM,按字符数估 token(中文约 2 字符/token),
+# 价目仅用于前端展示口径,金额单位 USD、不是真实账单。
+_CHARS_PER_TOKEN = 2
+_PRICE_IN_PER_MTOK = 0.15
+_PRICE_OUT_PER_MTOK = 0.60
+_MESSAGE_CHUNK_CHARS = 12
 
 
 class ChatRequest(BaseModel):
@@ -50,9 +71,29 @@ class ChatRequest(BaseModel):
     context: dict[str, Any] | None = None
 
 
-@router.post("/chat")
-def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """一轮对话:感知 → 落库 → 编排 → 落库 → 返回。"""
+def _tokens(chars: int) -> int:
+    return max(1, (max(0, chars) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN)
+
+
+def _usage(text_in: str, text_out: str, latency_ms: int) -> dict[str, Any]:
+    """本轮用量(估算口径):FakeLLM 按字符数估 token,MOCK 价目算成本。"""
+    tokens_in = _tokens(len(text_in))
+    tokens_out = _tokens(len(text_out))
+    cost = (
+        tokens_in * _PRICE_IN_PER_MTOK + tokens_out * _PRICE_OUT_PER_MTOK
+    ) / 1_000_000
+    return {
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cost_usd": round(cost, 8),
+        "latency_ms": latency_ms,
+        "estimated": True,
+        "estimation": f"MOCK: {_CHARS_PER_TOKEN} 字符/token,${_PRICE_IN_PER_MTOK}/M in,${_PRICE_OUT_PER_MTOK}/M out",
+    }
+
+
+def _run_turn(db: Session, payload: ChatRequest) -> dict[str, Any]:
+    """一轮对话:感知 → 落库 → 编排 → 落库;返回对外响应体(含 usage)。"""
     try:
         percept = normalize(
             payload.text,
@@ -81,6 +122,7 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     db.add(user_msg)
     db.flush()
 
+    started = time.monotonic()
     if session_row.status != "active":
         # 会话已被人工接手/关闭:记录一条拦截事件后停止自动回复。
         result = runner.build_blocked_turn(
@@ -94,6 +136,7 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
             context=payload.context,
             trace_id=trace_id,
         )
+    latency_ms = int((time.monotonic() - started) * 1000)
 
     user_msg.intent = result.intent
     db.add(
@@ -116,9 +159,80 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
             "trace_id": trace_id,
             "truncated": percept.truncated,
             "original_length": percept.original_length,
+            "usage": _usage(percept.text, result.reply, latency_ms),
         }
     )
     return body
+
+
+@router.post("/chat")
+def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """一轮对话(JSON):感知 → 落库 → 编排 → 落库 → 返回。"""
+    return _run_turn(db, payload)
+
+
+def _chunks(text: str) -> Iterator[str]:
+    """模拟流式分片:无真实 LLM(本棒禁止接 key),按固定字符窗口切分。"""
+    for start in range(0, len(text), _MESSAGE_CHUNK_CHARS):
+        yield text[start : start + _MESSAGE_CHUNK_CHARS]
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _frames(body: dict[str, Any]) -> Iterator[str]:
+    """把一轮结果展开成 SSE 帧(全部在同步阶段算好,生成器零 IO)。"""
+    reply = str(body.get("reply") or "")
+    for delta in _chunks(reply):
+        yield _sse("message", {"delta": delta})
+    for citation in body.get("citations") or []:
+        yield _sse("citation", dict(citation))
+    if body.get("pending_confirm"):
+        card = dict(body["pending_confirm"])
+        card.setdefault("thread_id", body.get("session_id"))
+        yield _sse("confirm_request", card)
+    if body.get("session_status") == "handed_off":
+        yield _sse(
+            "handoff_notice",
+            {
+                "session_status": "handed_off",
+                "reply_stopped": not body.get("ai_replied", True),
+                "message": "已转人工,AI 已停止自动回复,坐席会尽快跟进。",
+            },
+        )
+    yield _sse("usage", dict(body.get("usage") or {}))
+    yield _sse(
+        "done",
+        {
+            "ok": True,
+            "session_id": body.get("session_id"),
+            "trace_id": body.get("trace_id"),
+            "intent": body.get("intent"),
+            "confidence": body.get("confidence"),
+            "classification_path": body.get("classification_path"),
+            "session_status": body.get("session_status"),
+            "ai_replied": body.get("ai_replied"),
+            "tool_calls": body.get("tool_calls"),
+            "reply": reply,
+            "usage": body.get("usage"),
+        },
+    )
+
+
+@router.post("/chat/stream")
+def chat_stream(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    """一轮对话(SSE):同一套编排,按事件流返回。"""
+    frames = list(_frames(_run_turn(db, payload)))
+    return StreamingResponse(
+        iter(frames),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _resolve_session(db: Session, payload: ChatRequest) -> ChatSession:

@@ -13,10 +13,15 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api import chat as chat_api
+from app.api import confirm as confirm_api
+from app.api import handoff as handoff_api
 from app.api import orders as orders_api
 from app.api import refunds as refunds_api
 from app.api import tickets as tickets_api
@@ -49,4 +54,18 @@ app.include_router(orders_api.router)
 app.include_router(tickets_api.router)
 app.include_router(refunds_api.router)
 app.include_router(chat_api.router)
+app.include_router(confirm_api.router)
+app.include_router(handoff_api.router)
 app.include_router(memory_maintenance_router)
+
+# 前端聊天壳(原生 HTML/CSS/JS,无构建工具、无 CDN):GET / 或 /chat.html → 200。
+# 挂载放最后,避免 "/" 抢在其他 API 路由之前匹配。
+_FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+if _FRONTEND_DIR.is_dir():
+
+    @app.get("/", include_in_schema=False)
+    def chat_page() -> FileResponse:
+        """聊天壳入口:GET / → chat.html(原生页面,无构建工具)。"""
+        return FileResponse(_FRONTEND_DIR / "chat.html", media_type="text/html")
+
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")

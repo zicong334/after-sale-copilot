@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.errors import AmountExceedsPaidError, NotFoundError, StateConflictError
-from app.models import Merchant, Order, RefundRequest, Ticket
+from app.models import Merchant, Order, RefundRequest, Ticket, TicketMessage
 from app.services import orders as order_svc
 from app.services import refunds as refund_svc
 from app.services import tickets as ticket_svc
@@ -144,6 +144,36 @@ def test_ticket_add_message_after_close_rejected(session):
     with pytest.raises(StateConflictError) as ei:
         ticket_svc.add_message(session, "tk-1", "user", "补充", False)
     assert ei.value.param == "closed"
+
+
+def test_ticket_add_message_races_concurrent_close(engine):
+    """TOCTOU 回归:add_message 已把工单读进身份映射后,另一会话抢先关单。
+
+    旧实现(先 SELECT 后 INSERT)在身份映射命中时读到的是关闭前的旧状态,
+    于是仍 INSERT 消息,留下"已关单工单上仍有新消息"的脏数据;
+    新实现用带 ``status != 'closed'`` 的守卫式 UPDATE 同事务校验,
+    rowcount=0 → 409 且一条消息都不落库。
+    """
+    with Session(engine) as s0:
+        s0.add(Merchant(id="m-1", name="测试店"))
+        s0.add(Ticket(id="tk-1", merchant_id="m-1", customer_id="cust-1", status="queued"))
+        s0.commit()
+
+    writer = Session(engine)
+    closer = Session(engine)
+    assert writer.get(Ticket, "tk-1").status == "queued"  # 载入身份映射(模拟读后写窗口)
+    assert ticket_svc.close(closer, "tk-1").status == "closed"  # 并发关单并提交
+
+    with pytest.raises(StateConflictError) as ei:
+        ticket_svc.add_message(writer, "tk-1", "user", "关单后补一句", False)
+    assert ei.value.param == "closed"
+
+    with Session(engine) as check:
+        assert check.scalar(
+            select(func.count()).select_from(TicketMessage).where(TicketMessage.ticket_id == "tk-1")
+        ) == 0
+    writer.close()
+    closer.close()
 
 
 # ---------------------------------------------------------------------------

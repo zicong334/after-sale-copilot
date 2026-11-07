@@ -61,12 +61,23 @@ def add_message(
     content: str,
     is_internal: bool = False,
 ) -> TicketMessage:
-    """添加工单消息;关单后拒绝(409)。"""
-    ticket = session.get(Ticket, ticket_id)
-    if ticket is None:
-        raise NotFoundError(f"工单不存在: {ticket_id}")
-    if ticket.status == "closed":
-        raise StateConflictError("工单已关闭,不能添加消息", ticket.status)
+    """添加工单消息;关单后拒绝(409)。
+
+    G2 守卫式:先用带状态条件的 UPDATE 在同一事务里"校验 + 加写锁 + 刷新
+    last_msg_at",rowcount=1 才继续 INSERT,消灭"先 SELECT 后 INSERT"的
+    TOCTOU 窗口(并发 close 提交后,本条 UPDATE 必然 rowcount=0 而拒绝)。
+    """
+    guard = session.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket_id, Ticket.status != "closed")
+        .values(last_msg_at=utc_now())
+    )
+    if guard.rowcount != 1:
+        session.rollback()
+        current = session.get(Ticket, ticket_id)
+        if current is None:
+            raise NotFoundError(f"工单不存在: {ticket_id}")
+        raise StateConflictError("工单已关闭,不能添加消息", current.status)
 
     message = TicketMessage(
         ticket_id=ticket_id,
@@ -75,12 +86,6 @@ def add_message(
         is_internal=is_internal,
     )
     session.add(message)
-    # 守卫式刷新 last_msg_at(仅当工单仍未关闭)
-    session.execute(
-        update(Ticket)
-        .where(Ticket.id == ticket_id, Ticket.status != "closed")
-        .values(last_msg_at=utc_now())
-    )
     session.commit()
     session.refresh(message)
     return message

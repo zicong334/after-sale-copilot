@@ -15,4 +15,6 @@
 - 2026-11-07 17:5x W4-C 解锁 | 用户交 key(只入 .env,不进 git/日志/回执)+锁定 deepseek-v4.1-flash;主会话实测 API ID 应为 deepseek-flash(HTTP 200),reasoning 模型空正文风险写入 W4-C 任务书 | 连通性验证 42 tokens | 周末目标升级为 W4-C+最终验收+收尾
 - 2026-11-07 W3-A | LangGraph 六节点图+SqliteSaver+interrupt 确认门,替换 w1_router(dsh flash,一次跑通) | 175 passed;check_w1_cases 10/10;重启恢复零重放;steps=9 熔断 | 确认流 HTTP 入口在 W3-C
 - 2026-11-07 W3-B | 记忆层:memory 表(0004 迁移)+白名单+注入+定价指令隔离+衰减路由(dsh flash 一次跑通) | 196 passed;G6 端到端取证;10/10 不倒退 | 无
+- 2026-11-07 W3-C | 确认卡闭环+转人工全链路+前端 SSE 壳+TOCTOU 定点修复(dsh flash 一次跑通) | 222 passed;10/10;五路由 200;确认卡四要素+verified 取证 | usage 为 MOCK 估算待 W4-C
+- 2026-11-07 W3 阶段门 | 主会话亲测通过,准入 W4 | 四承诺全有测试证据 | 队列:W4-A→W4-B→W4-C→最终验收
 - 
