@@ -1,0 +1,10 @@
+# 售后 Copilot 后端直接依赖(不锁版本;锁定版本见根 requirements.lock.txt)
+SQLAlchemy
+alembic
+fastapi
+pydantic
+pytest
+rank-bm25
+langgraph
+uvicorn
+python-dotenv
