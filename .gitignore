@@ -1,0 +1,17 @@
+# 环境
+.venv/
+__pycache__/
+*.pyc
+
+# 数据库与运行时产物
+*.db
+*.db-wal
+*.db-shm
+data/checkpoints.db*
+
+# 密钥
+.env
+
+# dsh 会话工作稿
+backend/_draft_*.md
+_draft_*.md
