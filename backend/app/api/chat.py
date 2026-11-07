@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from app.api import get_db
 from app.errors import AppError, NotFoundError
 from app.models import ChatMessage, ChatSession
-from app.orchestrator import w1_router
+from app.graph import runner
 from app.perception import PerceptionError, normalize
 from app.trace import new_trace_id
 
@@ -83,11 +83,11 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
 
     if session_row.status != "active":
         # 会话已被人工接手/关闭:记录一条拦截事件后停止自动回复。
-        result = w1_router.build_blocked_turn(
+        result = runner.build_blocked_turn(
             session=db, session_row=session_row, trace_id=trace_id, text=percept.text
         )
     else:
-        result = w1_router.handle_turn(
+        result = runner.handle_turn(
             session=db,
             session_row=session_row,
             percept_text=percept.text,
