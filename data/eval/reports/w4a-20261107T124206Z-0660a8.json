@@ -1,0 +1,87 @@
+{
+  "run_id": "w4a-20261107T124206Z-0660a8",
+  "generated_at": "2026-11-07T12:42:18.437951+00:00",
+  "meta": {
+    "mode": "mock",
+    "assumptions": "FakeLLM + FakeJudge(MOCK):基准值,不是真模型能力",
+    "cases_file": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\data\\eval\\cases_v1.json",
+    "eval_set_version": "cs-eval-v1-20261108a",
+    "rubric_version": "cs-v2",
+    "repeat": 3,
+    "cases_selected": 5,
+    "quotas": {
+      "golden": 19,
+      "adversarial": 14,
+      "edge": 10,
+      "regression": 5
+    },
+    "llm": "FakeLLM (MOCK)",
+    "judge": "fake-judge-v1 (MOCK)",
+    "scored_by": "heuristic",
+    "command": "run_eval.py --smoke"
+  },
+  "eval_set_version": "cs-eval-v1-20261108a",
+  "rubric_version": "cs-v2",
+  "metrics": {
+    "pass_rate": {
+      "value": 1.0,
+      "passed": 15,
+      "denominator": 15,
+      "n": 15,
+      "cases_passed": 5,
+      "cases_total": 5
+    },
+    "by_layer": {
+      "golden": {
+        "cases": 5,
+        "attempts": 15,
+        "passed_attempts": 15,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "adversarial": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      },
+      "edge": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      },
+      "regression": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      }
+    },
+    "critical_fail_count": 0,
+    "judge_agreement": {
+      "value": 1.0,
+      "agreed": 15,
+      "judged": 15
+    },
+    "cost_per_case_usd": {
+      "mean": 9.921e-05,
+      "total": 0.00148815,
+      "n": 15
+    },
+    "p95_latency_ms": {
+      "value": 686.0,
+      "n": 15,
+      "scope": "user_wait_only(对话轮+确认,不含裁判)"
+    }
+  },
+  "failures": [],
+  "clusters": [],
+  "counts": {
+    "attempts_failed": 0,
+    "critical_failures": 0
+  }
+}

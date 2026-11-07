@@ -175,6 +175,24 @@ def _load_json(path: Path) -> object:
         return json.load(fh)
 
 
+def _validate_for(data: object) -> list[str]:
+    """按用例集版本选择校验规则。
+
+    W1 的 10 条 golden 继续走本文件内冻结的 ``validate_cases``(10 条规则);
+    W4-A 起的 48 条(``cases_v1.json``,rubric cs-v2)统一走
+    ``app.eval.validate_cases``(48 条 + 配额 + 必造用例 + 17 字段),
+    避免两套规则长期漂移。
+    """
+    if isinstance(data, list) and len(data) != 10:
+        backend_dir = str(Path(__file__).resolve().parents[1])
+        if backend_dir not in sys.path:
+            sys.path.insert(0, backend_dir)
+        from app.eval.validate_cases import validate_cases as validate_v1_cases
+
+        return validate_v1_cases(data)
+    return validate_cases(data)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) >= 2:
         path = Path(argv[1])
@@ -191,7 +209,7 @@ def main(argv: list[str]) -> int:
         print(f"JSON 解析失败: {exc}", file=sys.stderr)
         return 1
 
-    errors = validate_cases(data)
+    errors = _validate_for(data)
     if errors:
         print(f"校验失败:共 {len(errors)} 个错误", file=sys.stderr)
         for e in errors:

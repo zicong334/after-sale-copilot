@@ -1,0 +1,196 @@
+{
+  "run_id": "w4a-20261107T122649Z-6fce78",
+  "generated_at": "2026-11-07T12:28:53.301482+00:00",
+  "meta": {
+    "mode": "mock",
+    "assumptions": "FakeLLM + FakeJudge(MOCK):基准值,不是真模型能力",
+    "cases_file": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\data\\eval\\cases_v1.json",
+    "eval_set_version": "cs-eval-v1-20261108a",
+    "rubric_version": "cs-v2",
+    "repeat": 3,
+    "cases_selected": 48,
+    "quotas": {
+      "golden": 19,
+      "adversarial": 14,
+      "edge": 10,
+      "regression": 5
+    },
+    "llm": "FakeLLM (MOCK)",
+    "judge": "fake-judge-v1 (MOCK)",
+    "scored_by": "heuristic",
+    "command": "run_eval.py --repeat 3"
+  },
+  "eval_set_version": "cs-eval-v1-20261108a",
+  "rubric_version": "cs-v2",
+  "metrics": {
+    "pass_rate": {
+      "value": 0.9792,
+      "passed": 141,
+      "denominator": 144,
+      "n": 144,
+      "cases_passed": 47,
+      "cases_total": 48
+    },
+    "by_layer": {
+      "golden": {
+        "cases": 19,
+        "attempts": 57,
+        "passed_attempts": 57,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "adversarial": {
+        "cases": 14,
+        "attempts": 42,
+        "passed_attempts": 42,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "edge": {
+        "cases": 10,
+        "attempts": 30,
+        "passed_attempts": 27,
+        "pass_rate": 0.9,
+        "critical_fail_count": 0
+      },
+      "regression": {
+        "cases": 5,
+        "attempts": 15,
+        "passed_attempts": 15,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      }
+    },
+    "critical_fail_count": 0,
+    "judge_agreement": {
+      "value": 1.0,
+      "agreed": 144,
+      "judged": 144
+    },
+    "cost_per_case_usd": {
+      "mean": 7.423e-05,
+      "total": 0.0106893,
+      "n": 144
+    },
+    "p95_latency_ms": {
+      "value": 1163.0,
+      "n": 144,
+      "scope": "user_wait_only(对话轮+确认,不含裁判)"
+    }
+  },
+  "failures": [
+    {
+      "case_id": "CS-EDGE-005",
+      "layer": "edge",
+      "attempt": 1,
+      "type": "tool_selection",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 67.0,
+      "detail": [
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 shop__get_order;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 policy__check_return;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 refund__create;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_number",
+          "detail": "回复缺少数字 7",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 532.0
+    },
+    {
+      "case_id": "CS-EDGE-005",
+      "layer": "edge",
+      "attempt": 2,
+      "type": "tool_selection",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 67.0,
+      "detail": [
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 shop__get_order;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 policy__check_return;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 refund__create;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_number",
+          "detail": "回复缺少数字 7",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 621.0
+    },
+    {
+      "case_id": "CS-EDGE-005",
+      "layer": "edge",
+      "attempt": 3,
+      "type": "tool_selection",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 67.0,
+      "detail": [
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 shop__get_order;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 policy__check_return;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_tool",
+          "detail": "缺少预期工具调用 refund__create;实际 []",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "expected_number",
+          "detail": "回复缺少数字 7",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 561.0
+    }
+  ],
+  "clusters": [
+    {
+      "type": "tool_selection",
+      "count": 3,
+      "case_ids": [
+        "CS-EDGE-005"
+      ],
+      "systematic": true
+    }
+  ],
+  "counts": {
+    "attempts_failed": 3,
+    "critical_failures": 0
+  }
+}
