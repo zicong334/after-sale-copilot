@@ -1,0 +1,134 @@
+{
+  "run_id": "w4c-20261107T144241Z-606218",
+  "generated_at": "2026-11-07T14:43:29.659631+00:00",
+  "meta": {
+    "mode": "real",
+    "assumptions": "真实模型 + 真实 LLM 裁判(与被执行模型同源,agreement 存在自偏好偏差风险);latency 仅统计对话轮/确认,不含裁判耗时",
+    "cases_file": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\data\\eval\\cases_v1.json",
+    "eval_set_version": "cs-eval-v1-20261108a",
+    "rubric_version": "cs-v2",
+    "repeat": 1,
+    "cases_selected": 5,
+    "quotas": {
+      "golden": 19,
+      "adversarial": 14,
+      "edge": 10,
+      "regression": 5
+    },
+    "llm": "deepseek-flash",
+    "judge": "deepseek-flash",
+    "scored_by": "llm",
+    "command": "run_eval.py --real --smoke --repeat 1",
+    "model_base_url": "https://api.deepseek.com/v1",
+    "temperatures": {
+      "agent": 0.2,
+      "judge": 0.1
+    },
+    "max_tokens": 2048,
+    "pricing": {
+      "input_per_mtok_usd": null,
+      "output_per_mtok_usd": null,
+      "status": "TBD",
+      "note": "单价未经官方确认时成本按 0 占位;token 用量为真实 API usage,见 meta.tokens"
+    },
+    "tokens": {
+      "prompt_tokens": 22731,
+      "completion_tokens": 4928,
+      "reasoning_tokens": 3250,
+      "total_tokens": 27659,
+      "requests": 20,
+      "retries": 0,
+      "empty_responses": 0,
+      "api_errors": 0
+    },
+    "tokens_by_role": {
+      "agent": {
+        "prompt_tokens": 5906,
+        "completion_tokens": 3345,
+        "reasoning_tokens": 2228,
+        "total_tokens": 9251,
+        "requests": 15,
+        "retries": 0,
+        "empty_responses": 0,
+        "api_errors": 0
+      },
+      "judge": {
+        "prompt_tokens": 16825,
+        "completion_tokens": 1583,
+        "reasoning_tokens": 1022,
+        "total_tokens": 18408,
+        "requests": 5,
+        "retries": 0,
+        "empty_responses": 0,
+        "api_errors": 0
+      }
+    },
+    "judge_fallback_count": 0,
+    "judge_same_source_risk": true,
+    "capture": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\.tmp\\w4c_capture\\w4c-20261107T144241Z-606218.jsonl"
+  },
+  "eval_set_version": "cs-eval-v1-20261108a",
+  "rubric_version": "cs-v2",
+  "metrics": {
+    "pass_rate": {
+      "value": 1.0,
+      "passed": 5,
+      "denominator": 5,
+      "n": 5,
+      "cases_passed": 5,
+      "cases_total": 5
+    },
+    "by_layer": {
+      "golden": {
+        "cases": 5,
+        "attempts": 5,
+        "passed_attempts": 5,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "adversarial": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      },
+      "edge": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      },
+      "regression": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      }
+    },
+    "critical_fail_count": 0,
+    "judge_agreement": {
+      "value": 1.0,
+      "agreed": 5,
+      "judged": 5
+    },
+    "cost_per_case_usd": {
+      "mean": 0.0,
+      "total": 0.0,
+      "n": 5
+    },
+    "p95_latency_ms": {
+      "value": 8167.0,
+      "n": 5,
+      "scope": "user_wait_only(对话轮+确认,不含裁判)"
+    }
+  },
+  "failures": [],
+  "clusters": [],
+  "counts": {
+    "attempts_failed": 0,
+    "critical_failures": 0
+  }
+}

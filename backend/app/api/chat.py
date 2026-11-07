@@ -38,6 +38,7 @@ from app.api import get_db
 from app.errors import AppError, NotFoundError
 from app.models import ChatMessage, ChatSession
 from app.graph import runner
+from app.llm import build_llm
 from app.perception import PerceptionError, normalize
 from app.trace import new_trace_id
 
@@ -75,8 +76,24 @@ def _tokens(chars: int) -> int:
     return max(1, (max(0, chars) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN)
 
 
-def _usage(text_in: str, text_out: str, latency_ms: int) -> dict[str, Any]:
-    """本轮用量(估算口径):FakeLLM 按字符数估 token,MOCK 价目算成本。"""
+def _usage(
+    text_in: str, text_out: str, latency_ms: int, llm: Any | None = None
+) -> dict[str, Any]:
+    """本轮用量:FakeLLM 按字符估算;真实客户端优先用 API 返回的真实 usage。"""
+    client_usage = getattr(llm, "usage", None)
+    if client_usage is not None and int(getattr(client_usage, "requests", 0) or 0) > 0:
+        return {
+            "tokens_in": int(client_usage.prompt_tokens),
+            "tokens_out": int(client_usage.completion_tokens),
+            "reasoning_tokens": int(client_usage.reasoning_tokens),
+            "cost_usd": client_usage.cost_usd(
+                getattr(llm, "price_in_per_mtok", None),
+                getattr(llm, "price_out_per_mtok", None),
+            ),
+            "latency_ms": latency_ms,
+            "estimated": False,
+            "estimation": "真实 API usage(单价未配置时 cost_usd=null/TBD)",
+        }
     tokens_in = _tokens(len(text_in))
     tokens_out = _tokens(len(text_out))
     cost = (
@@ -123,18 +140,23 @@ def _run_turn(db: Session, payload: ChatRequest) -> dict[str, Any]:
     db.flush()
 
     started = time.monotonic()
+    llm = None
     if session_row.status != "active":
         # 会话已被人工接手/关闭:记录一条拦截事件后停止自动回复。
         result = runner.build_blocked_turn(
             session=db, session_row=session_row, trace_id=trace_id, text=percept.text
         )
     else:
+        # W4-C:按进程环境自动选真实/Fake(本函数不读 .env;S6 由启动器注入环境,
+        # 测试环境无 LLM_API_KEY 时仍是 FakeLLM,D-05 密封不变)
+        llm = build_llm()
         result = runner.handle_turn(
             session=db,
             session_row=session_row,
             percept_text=percept.text,
             context=payload.context,
             trace_id=trace_id,
+            llm=llm,
         )
     latency_ms = int((time.monotonic() - started) * 1000)
 
@@ -159,7 +181,12 @@ def _run_turn(db: Session, payload: ChatRequest) -> dict[str, Any]:
             "trace_id": trace_id,
             "truncated": percept.truncated,
             "original_length": percept.original_length,
-            "usage": _usage(percept.text, result.reply, latency_ms),
+            "usage": _usage(
+                percept.text,
+                result.reply,
+                latency_ms,
+                llm=llm,
+            ),
         }
     )
     return body

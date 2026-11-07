@@ -16,6 +16,7 @@ LLMJudge 则先把整段用户输入转义并包进 ``<user_input>`` 数据块,s
 
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -366,17 +367,21 @@ class LLMJudge:
         artifact: dict[str, Any],
         hard: dict[str, Any] | None = None,
     ) -> JudgeVerdict:
-        # 裁判温度固定 0.1(真实 client 若支持 temperature 参数应在 W4-C 注入)
-        if getattr(self.client, "temperature", None) is None:
-            try:
-                setattr(self.client, "temperature", self.temperature)
-            except Exception:  # pragma: no cover - 只读客户端时忽略
-                pass
+        # 裁判温度固定 0.1:在 complete() 调用链上**显式传入**(W4-A 未尽事项④),
+        # 不再靠 setattr 猜测客户端内部状态;不支持该参数的 Fake 客户端会自动省略。
         system, user = build_judge_prompt(case, artifact, hard, self.rubric_text)
         try:
+            kwargs: dict[str, Any] = {}
+            try:
+                params = inspect.signature(self.client.complete).parameters
+                if "temperature" in params:
+                    kwargs["temperature"] = self.temperature
+            except (TypeError, ValueError):  # pragma: no cover - 内置实现不可用
+                pass
             raw = self.client.complete(
                 [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 SCHEMA_JUDGE,
+                **kwargs,
             )
             data = json.loads(raw)
             scores = {
@@ -400,6 +405,12 @@ class LLMJudge:
                 raw={"finish": "ok"},
             )
         except Exception as exc:  # 裁判失败 → 确定性兜底,并明确标注
+            # 鉴权/余额/限流/5xx 重试耗尽属于批次级错误:不得兜底成"成功评分",
+            # 否则会掩盖 key 失效或余额不足,继续烧钱。向上抛,由 run_eval 中止。
+            from app.llm.real_client import LLMBatchAbort
+
+            if isinstance(exc, LLMBatchAbort):
+                raise
             fallback = FakeJudge().judge(case, artifact, hard)
             fallback.fallback = True
             fallback.scored_by = "heuristic"
