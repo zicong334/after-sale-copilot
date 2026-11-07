@@ -26,9 +26,11 @@ def tmp_dir():
     注意:不用 tempfile.mkdtemp —— 它创建的目录权限受限(0o700),
     在 DSH 沙盒下会导致其内文件无法写入(sqlite "unable to open database file")。
     改用 os.getcwd() 绝对路径 + Path.mkdir()(默认 0o777),与 os.makedirs 一致。
+    位置统一放 .tmp/ 下(已 gitignore):会话中途被取消时残留也不污染项目根
+    (2026-11-07 主会话维护性修改,W1-A 原版建在根目录 .w1a_tmp_*)。
     """
-    d = Path(os.getcwd()) / f".w1a_tmp_{uuid.uuid4().hex}"
-    d.mkdir()
+    d = Path(os.getcwd()) / ".tmp" / f"w1a_{uuid.uuid4().hex}"
+    d.mkdir(parents=True)
     yield d
     shutil.rmtree(d, ignore_errors=True)
 
