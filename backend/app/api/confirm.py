@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +38,27 @@ router = APIRouter(prefix="/api/c/confirm", tags=["confirm"])
 
 _TOOL_REFUND = "refund__create"
 _TOOL_HANDOFF = "handoff__create_ticket"
+
+#: W6-A1:按确认 token 串行化"确认"入口(进程内)。
+#:
+#: 10 个线程同时点同一张卡时,若各自"先读状态再 resume",会并行进入图执行分支,
+#: 造成同一确认卡被多次执行(副作用重复)。这里用**每 token 一把锁**把"读状态 →
+#: 判定 → resume"变成临界区:第一个赢家把卡推进到 confirmed,其余线程在锁内重读
+#: 后直接走幂等回执。图内 ``_execute_confirmed`` 另有条件更新(CAS)做跨进程纵深。
+_CONFIRM_LOCKS: dict[str, threading.Lock] = {}
+_CONFIRM_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _confirm_lock(token: str):
+    """取该 token 的互斥锁(惰性创建;锁表本身用一把小锁保护)。"""
+    with _CONFIRM_LOCKS_GUARD:
+        lock = _CONFIRM_LOCKS.setdefault(str(token), threading.Lock())
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class ThreadRef(BaseModel):
@@ -204,9 +227,13 @@ def _timeout(
 
 
 def _receipt(
-    db: Session, state: dict[str, Any], request: ConfirmRequest
+    db: Session, state: dict[str, Any], request: ConfirmRequest, *, replay: bool = False
 ) -> dict[str, Any]:
-    """回执:业务单号 + DB 回读 status(verified)+ UTC 时间 + trace_id。"""
+    """回执:业务单号 + DB 回读 status(verified)+ UTC 时间 + trace_id。
+
+    ``replay=True`` 表示"本次是幂等回放"——业务单早先已创建,回执必须如实标注
+    ``idempotent_hit=True``,不能把回放当成新执行(W6-A1/A8)。
+    """
     confirm = state.get("confirm") or {}
     executed = dict(confirm.get("executed") or {})
     data = dict(executed.get("data") or {})
@@ -225,7 +252,7 @@ def _receipt(
             "occurred_at_utc": _iso(refund.created_at),
             "trace_id": trace_id,
             "verified": refund.status == str(data.get("status") or ""),
-            "idempotent_hit": bool(data.get("idempotent_hit")),
+            "idempotent_hit": True if replay else bool(data.get("idempotent_hit")),
         }
     ticket = db.get(Ticket, str(data.get("ticket_id") or ""))
     if ticket is None:  # pragma: no cover - 图内返回 ok 时必然已落库
@@ -238,7 +265,7 @@ def _receipt(
         "occurred_at_utc": _iso(ticket.created_at),
         "trace_id": trace_id,
         "verified": ticket.status == str(data.get("status") or ""),
-        "idempotent_hit": False,
+        "idempotent_hit": bool(replay),
     }
 
 
@@ -270,54 +297,61 @@ def pending(thread_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
 def confirm(
     confirm_token: str, payload: ThreadRef, db: Session = Depends(get_db)
 ) -> dict[str, Any]:
-    """人工确认 → graph resume → 真实写操作 → verified 回执(幂等,不重复执行)。"""
-    state, request = _require_confirm(db, payload.thread_id, confirm_token)
-    confirm_state = state.get("confirm") or {}
-    if request.status == "confirmed":
+    """人工确认 → graph resume → 真实写操作 → verified 回执(幂等,不重复执行)。
+
+    W6-A1:整段"读状态 → 判定 → resume"在**每 token 一把锁**内执行,锁内先
+    ``expire_all`` 再重读,保证并发点击时只有一个请求真正执行写工具,其余拿到
+    幂等回执(``idempotent=True``、``receipt.idempotent_hit=True``)。
+    """
+    with _confirm_lock(confirm_token):
+        db.expire_all()
+        state, request = _require_confirm(db, payload.thread_id, confirm_token)
+        confirm_state = state.get("confirm") or {}
+        if request.status == "confirmed":
+            receipt = _receipt(db, state, request, replay=True)
+            return {
+                "ok": True,
+                "decision": "confirmed",
+                "idempotent": True,
+                "thread_id": payload.thread_id,
+                "receipt": receipt,
+                "reply": str(state.get("draft") or ""),
+                "session_status": _status_of(db, payload.thread_id),
+                "trace_id": str(state.get("trace_id") or ""),
+            }
+        if request.status == "cancelled":
+            raise StateConflictError("确认卡已被拒绝,不能再次确认", request.status, param="status")
+        if request.status == "expired" or _expired(request):
+            return _timeout(db, payload.thread_id, state, confirm_state, request)
+
+        result = runner.resume(payload.thread_id, True, session=db)
+        request = get_confirm(db, confirm_token) or request
+        if request.status != "confirmed":
+            # 执行失败(业务拒绝/结果未知):不谎报成功,回执 verified=false。
+            executed = dict((_read_state(payload.thread_id).get("confirm") or {}).get("executed") or {})
+            return {
+                "ok": False,
+                "decision": "failed",
+                "thread_id": payload.thread_id,
+                "error": dict(executed.get("error") or {}),
+                "reply": result.reply,
+                "session_status": result.session_status,
+                "trace_id": str(state.get("trace_id") or ""),
+            }
+        state = _read_state(payload.thread_id)
         receipt = _receipt(db, state, request)
+        trace_id = str(state.get("trace_id") or "")
+        _append_assistant(db, payload.thread_id, result.reply, trace_id, "confirm")
         return {
             "ok": True,
             "decision": "confirmed",
-            "idempotent": True,
+            "idempotent": False,
             "thread_id": payload.thread_id,
             "receipt": receipt,
-            "reply": str(state.get("draft") or ""),
-            "session_status": _status_of(db, payload.thread_id),
-            "trace_id": str(state.get("trace_id") or ""),
-        }
-    if request.status == "cancelled":
-        raise StateConflictError("确认卡已被拒绝,不能再次确认", request.status, param="status")
-    if request.status == "expired" or _expired(request):
-        return _timeout(db, payload.thread_id, state, confirm_state, request)
-
-    result = runner.resume(payload.thread_id, True, session=db)
-    request = get_confirm(db, confirm_token) or request
-    if request.status != "confirmed":
-        # 执行失败(业务拒绝/结果未知):不谎报成功,回执 verified=false。
-        executed = dict((_read_state(payload.thread_id).get("confirm") or {}).get("executed") or {})
-        return {
-            "ok": False,
-            "decision": "failed",
-            "thread_id": payload.thread_id,
-            "error": dict(executed.get("error") or {}),
             "reply": result.reply,
             "session_status": result.session_status,
-            "trace_id": str(state.get("trace_id") or ""),
+            "trace_id": trace_id,
         }
-    state = _read_state(payload.thread_id)
-    receipt = _receipt(db, state, request)
-    trace_id = str(state.get("trace_id") or "")
-    _append_assistant(db, payload.thread_id, result.reply, trace_id, "confirm")
-    return {
-        "ok": True,
-        "decision": "confirmed",
-        "idempotent": False,
-        "thread_id": payload.thread_id,
-        "receipt": receipt,
-        "reply": result.reply,
-        "session_status": result.session_status,
-        "trace_id": trace_id,
-    }
 
 
 @router.post("/{confirm_token}/reject")

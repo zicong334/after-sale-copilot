@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 
 from app.models import Order
 from app.tools.registry import ToolSpec, clean_schema, register
@@ -64,21 +65,20 @@ SPEC = ToolSpec(
 
 
 def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """查询订单;不存在或非本客户订单 → NOT_FOUND_OR_FORBIDDEN(不区分真因)。"""
+    """查询订单;不存在或非本客户订单 → NOT_FOUND_OR_FORBIDDEN(不区分真因)。
+
+    W6-A6:归属校验下沉到 SQL 层(``WHERE id = ? AND customer_id = ?``),用绑定
+    参数,不再"先按主键取回再在 Python 里比"——避免主键查询把越权行读进内存,
+    也让审计能直接证明查询本身带了 customer 绑定。
+    """
     order_id = args["order_id"]
-    order = ctx.session.get(Order, order_id)
+    order = ctx.session.scalars(
+        select(Order).where(Order.id == order_id, Order.customer_id == ctx.customer_id)
+    ).first()
     if order is None:
-        logger.info("shop__get_order 真因=订单不存在: order_id=%s", order_id)
-        raise ToolExecutionError(
-            CODE_NOT_FOUND_OR_FORBIDDEN,
-            "当前会话下未找到该订单",
-            retryable=False,
-            param="order_id",
-        )
-    if order.customer_id != ctx.customer_id:
         logger.info(
-            "shop__get_order 真因=越权: order_id=%s 属于 %s,当前 %s",
-            order_id, order.customer_id, ctx.customer_id,
+            "shop__get_order 真因=订单不存在或不属于当前客户: order_id=%s customer_id=%s",
+            order_id, ctx.customer_id,
         )
         raise ToolExecutionError(
             CODE_NOT_FOUND_OR_FORBIDDEN,

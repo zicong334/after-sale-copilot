@@ -54,7 +54,9 @@ class Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     order_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{2,63}$")
-    amount_cents: int = Field(gt=0)
+    #: W6-A3 上界:单笔退款不得超过 1,000,000 分(¥10,000)——超出直接 schema 拒绝,
+    #: 不让"超大整数"进到业务层(数据库 INTEGER 也不会被撑爆)。
+    amount_cents: int = Field(gt=0, le=1_000_000)
     reason: Literal["质量问题", "错发漏发", "七天无理由", "物流破损"]
 
 

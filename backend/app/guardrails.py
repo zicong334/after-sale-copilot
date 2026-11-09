@@ -187,14 +187,22 @@ def detect_injection(text: str) -> dict[str, Any]:
 
 
 def injection_flags(text: str) -> list[str]:
-    """给 ``Percept.flags`` 用的稳定标记列表(命中才出现)。"""
+    """给 ``Percept.flags`` 用的稳定标记列表(命中才出现)。
+
+    W6-A5 起同时并入 ``prompt_probe``:套取系统提示/上下文擦除/越狱/索要凭据,
+    由图上 ``perceive`` 节点在图前拦截(见 ``PROMPT_PROBE_RULES``)。
+    """
     profile = detect_injection(text)
-    if not profile["suspect"]:
-        return []
-    flags = [INJECTION_FLAG]
-    flags.extend(f"injection_kind:{kind}" for kind in profile["kinds"])
-    if profile["hard"]:
-        flags.append(INJECTION_BLOCK_FLAG)
+    probe = detect_prompt_probe(text)
+    flags: list[str] = []
+    if profile["suspect"]:
+        flags.append(INJECTION_FLAG)
+        flags.extend(f"injection_kind:{kind}" for kind in profile["kinds"])
+        if profile["hard"]:
+            flags.append(INJECTION_BLOCK_FLAG)
+    if probe["probe"]:
+        flags.append(PROMPT_PROBE_FLAG)
+        flags.extend(f"prompt_probe_kind:{kind}" for kind in probe["kinds"])
     return flags
 
 
@@ -226,6 +234,83 @@ def is_privacy_probe(text: str, has_order_id: bool) -> bool:
     pii = ("手机号", "手机号码", "电话", "联系方式", "收货地址", "地址", "身份证", "真实姓名")
     other = re.search(r"(seed-cust-|客户|买家|他人|别人的|对方的)", body)
     return bool(other and any(word in body for word in pii))
+
+
+# ---------------------------------------------------------------------------
+# W6-A5:prompt 探测(上下文擦除 / 套取系统提示 / 越狱 / 索要凭据)
+# ---------------------------------------------------------------------------
+#
+# 与 FIX-3 的软注入(ADV-001:剥离注入片段后继续处理正当诉求)不同,这一类请求
+# **不包含可继续服务的业务诉求**,目的是抹掉/套出系统自身的约束与秘密,因此
+# 在图前直接硬拦截(固定话术、零工具、零业务事件),不进分类、不进检索。
+#
+# 注意:纯中文"忽略以上所有指令 + 正当售后诉求"仍走既有的软剥离路径
+# (``strip_injection`` + ADV-001),不在此升级为硬拦截——否则会破坏
+# "剥离注入后仍要处理正当诉求"的既有回归(test_graph.py::test_fix3_*)。
+PROMPT_PROBE_RULES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
+    (
+        "prompt_exfil",
+        "套取系统提示词",
+        re.compile(
+            r"(?is)(system\s*prompt|系统提示词|系统指令|初始指令|预设指令|"
+            r"你的(系统)?提示(词)?|重复(你的)?(系统)?(提示|指令)|"
+            r"(打印|输出|展示|原样|逐字)(一下)?(你的|收到的)?(系统)?(提示词|prompt|指令))"
+        ),
+    ),
+    (
+        "context_erase",
+        "上下文擦除",
+        re.compile(
+            r"(?is)((忽略|无视|忘记|忘掉|清除|清空|重置|覆盖)(掉)?(你)?"
+            r"(以上|之前|上述|前面)?(的)?(所有|全部)?"
+            r"(对话|上下文|历史|记忆|设定|限制|规则|约束|人设|身份)|"
+            r"(forget|ignore|disregard|discard)\s+(all\s+)?(your\s+)?"
+            r"(previous|above|prior|earlier)\s+"
+            r"(conversation|context|instructions?|prompts?|rules?|messages?))"
+        ),
+    ),
+    (
+        "jailbreak",
+        "越狱/扮演",
+        re.compile(
+            r"(?is)(开发者模式|developer\s+mode|越狱|jailbreak|\bDAN\b|"
+            r"你现在是(一个)?(没有(任何)?限制|不受限制|无限制)|"
+            r"扮演(一个)?(不受限制|没有限制|无限制)|"
+            r"(不受|没有)(任何)?限制的(助手|AI|模型|机器人)|"
+            r"进入(管理员|root|调试|开发者)模式)"
+        ),
+    ),
+    (
+        "credential_probe",
+        "索要凭据",
+        re.compile(
+            r"(?is)((数据库|db)?\s*(密码|口令|密钥|秘钥|api\s*key|访问令牌|token|环境变量|\.env)"
+            r"\s*(是\s*(什么|多少)|发给|告诉我|给我|打印|输出|展示|透露|泄露)|"
+            r"(告诉|给我|发我|提供|打印|输出|展示|透露|泄露)\s*我?(一下)?\s*(你的|你们的)?\s*"
+            r"(数据库)?\s*(密码|口令|密钥|秘钥|api\s*key|token|环境变量|\.env))"
+        ),
+    ),
+)
+
+#: 命中"prompt 探测"时写入 ``Percept.flags`` 的固定标记(A5 图前拦截依据)。
+PROMPT_PROBE_FLAG = "prompt_probe"
+
+
+def detect_prompt_probe(text: str) -> dict[str, Any]:
+    """确定性 prompt 探测(套取/擦除/越狱/凭据)。
+
+    返回 ``{"probe": bool, "kinds": [...], "labels": [...]}``;与
+    ``detect_injection`` 分离,便于单独审计与回归(前者决定"剥离后继续",
+    这里决定"图前硬拦截")。
+    """
+    body = str(text or "")
+    kinds: list[str] = []
+    labels: list[str] = []
+    for kind, label, pattern in PROMPT_PROBE_RULES:
+        if pattern.search(body):
+            kinds.append(kind)
+            labels.append(label)
+    return {"probe": bool(kinds), "kinds": kinds, "labels": labels}
 
 
 # ---------------------------------------------------------------------------
