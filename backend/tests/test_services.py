@@ -267,8 +267,8 @@ def test_refund_active_unique_race_state_conflict(session):
     assert session.scalar(select(func.count()).select_from(RefundRequest)) == 1
 
 
-def test_alembic_upgrade_head_fresh_db_four_migrations():
-    """F3:全新空库 alembic upgrade head,0001→0002→0003→0004 依次成功且 ticket 有 summary 列。
+def test_alembic_upgrade_head_fresh_db_five_migrations():
+    """F3:全新空库 alembic upgrade head,0001→…→0005 依次成功且 ticket 有 summary/session_id 列。
 
     用 alembic 命令 API 在进程内跑 ``upgrade head``(等价 CLI 命令);临时库显式建在
     ROOT/.tmp 下并在 teardown 清理(不用 tmp_path:pytest 以 0o700 创建 basetemp,
@@ -290,7 +290,8 @@ def test_alembic_upgrade_head_fresh_db_four_migrations():
             columns = [r[1] for r in con.execute("PRAGMA table_info(ticket)")]
         finally:
             con.close()
-        assert versions == ["0004_memory"]
+        assert versions == ["0005_ticket_session_id"]
         assert "summary" in columns
+        assert "session_id" in columns
     finally:
         shutil.rmtree(work, ignore_errors=True)

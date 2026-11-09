@@ -41,6 +41,9 @@ class ToolContext:
     merchant_id: str
     customer_id: str
     trace_id: str
+    # 当前聊天会话 id(W5-FIX R1):handoff 建单时写入 ticket.session_id,
+    # 让"会话 → 工单"精确归属,不再按客户取最近一张。
+    session_id: str | None = None
 
 
 @dataclass

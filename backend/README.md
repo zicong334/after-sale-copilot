@@ -47,7 +47,7 @@
    write: refund__create / handoff__create_ticket(均 requires_confirm,落 confirm_request 确认卡)
                                    ▼
    数据层 SQLite WAL(backend/dev.db) 17 张业务表 = PRD 14 张 + tool_events/confirm_request(0002)
-                                     + memory(0004);迁移 0001→0004
+                                     + memory(0004);迁移 0001→0005(ticket.session_id)
                                    ▼
    评测层 backend/app/eval             硬断言(FAIL_HARD/FAIL_CRITICAL)→ FakeJudge 三维 rubric → 6 指标报告
 ```
@@ -96,7 +96,7 @@ run_eval.bat
 ## 5. 测试
 
 ```bat
-:: 全量测试(367 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(380 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
@@ -114,7 +114,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:367 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:380 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -162,9 +162,10 @@ set PYTHONPATH=%CD%\backend
 
 ## 8. 已知声明(交接必读)
 
-1. **Ticket 无 session_id**:`ticket` 表只有 `merchant_id` / `customer_id` / `refund_request_id` 等列,没有 `session_id`;
-   转人工摘要按 `merchant_id + customer_id` 关联上下文生成,不按会话精确回溯(PRD 未要求,列为扩展点)。
-   证据:`backend/app/models/ticket.py:30-34`。
+1. **Ticket 已有 session_id(W5-FIX 后)**:`ticket` 表新增可空 `session_id` 列(迁移 `0005_ticket_session_id`,索引 `ix_ticket_session_id`);
+   转人工 execute 建单时写入当前 `thread_id`(即会话 id),`/api/c/handoff/sessions/{id}/summary` 按会话精确取单,不再按客户最近工单推断全局状态;
+   历史工单 `session_id` 为 NULL,旧行为(按 `merchant_id + customer_id` 取最近一张)保留在 `GET /api/c/handoff/summary` 不传 `session_id` 时,仅作兼容。
+   证据:`backend/app/models/ticket.py`、`backend/alembic/versions/0005_ticket_session_id.py`、`backend/app/api/handoff.py`、`backend/tests/test_session_scope.py`。
 2. **usage 计量(W4-C 后已升级为真实 token)**:`.env` 提供 key 时,`usage.tokens_in/tokens_out/reasoning_tokens`
    来自 provider 真实响应(`estimated: false`);`cost_usd` 因 deepseek-flash 单价未获官方确认而为 `null`(价目 TBD,
    token 数可复算,见 `data/eval/reports/w4c-*.json` 的 meta.tokens)。无 key 时回退 FakeLLM,usage 为 MOCK 估算(`estimated: true`)。
@@ -234,9 +235,9 @@ set PYTHONPATH=%CD%\backend
 backend/
 ├── app/            main.py / db.py / models/ / api/(含 agent.py:工作台 API) / services/ /
 │                   tools/ / graph/ / memory/ / retrieval/ / eval/ / perception / schemas/ / trace
-├── alembic/        0001_initial → 0002_add_tool_events → 0003_ticket_summary → 0004_memory
+├── alembic/        0001_initial → 0002_add_tool_events → 0003_ticket_summary → 0004_memory → 0005_ticket_session_id
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          367 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
+├── tests/          380 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
 └── README.md       本文件
 
 frontend/           chat.html / app.js / agent.html / agent.js / style.css(原生实现,零 CDN、零构建)

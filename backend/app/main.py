@@ -9,14 +9,16 @@
 - 静态注册 8 个错误处理器
 - 业务路由用 include_router 挂载,不在本文件直接写路由
 - 无 key 启动:本文件不 import 任何 LLM / 外部 key / 网络客户端
+- html 响应统一 Cache-Control: no-store(W5-FIX R4:僵尸服务缓存曾污染浏览器)
+- 内联 SVG favicon(W5-FIX R3:消掉 /favicon.ico 404)
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.api import agent as agent_api
@@ -43,6 +45,42 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="售后 Copilot 服务", lifespan=lifespan)
 
 register_error_handlers(app)
+
+
+@app.middleware("http")
+async def no_store_html(request: Request, call_next):
+    """给所有 text/html 响应加 ``Cache-Control: no-store``(W5-FIX R4)。
+
+    CSS/JS 仍走 StaticFiles 的 etag/last-modified 正常缓存;只有页面壳不缓存,
+    避免僵尸服务时代的残破 HTML 缓存继续污染用户浏览器。
+    """
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("text/html"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# 内联 SVG favicon(W5-FIX R3):浏览器默认会请求 /favicon.ico,
+# 之前落到 StaticFiles 变成 404;两页 HTML 里也内联了 data URI 图标。
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect width="32" height="32" rx="9" fill="#C05621"/>'
+    '<text x="16" y="22.5" font-size="16" text-anchor="middle" fill="#FFFFFF" '
+    'font-family="system-ui, sans-serif">客</text>'
+    "</svg>"
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+@app.get("/favicon.svg", include_in_schema=False)
+def favicon() -> Response:
+    """品牌色内联 SVG 图标:消掉浏览器 /favicon.ico 404(W5-FIX R3)。"""
+    return Response(
+        content=_FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/health")

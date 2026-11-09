@@ -3,7 +3,9 @@
  * - append_ack:转人工后的轻量系统行(不是 AI 气泡)
  * - handoff_notice:全流程只弹一次 3.5s toast
  * - handed_off 后每 3s 轮询会话 summary,把 author_type=agent 渲染成「人工」绿气泡
- * - ticket_closed:禁用输入 + 提示「工单已关闭」
+ * - W5-FIX R1:会话状态**只**由本 session 的工单驱动(`/api/c/handoff/summary?session_id=`),
+ *   不再按客户取最近工单;handed_off 且工单未关闭时输入框保持可用(留言追加到工单),
+ *   只有本 session 的工单 closed 才禁用输入 + 提示「工单已关闭」
  * - usage.estimated===true:小字「演示估算,非真实账单」
  */
 (function () {
@@ -25,7 +27,8 @@
     status: document.getElementById("statusBadge"),
     trace: document.getElementById("trace"),
     toastWrap: document.getElementById("toastWrap"),
-    closedHint: document.getElementById("closedHint")
+    closedHint: document.getElementById("closedHint"),
+    handoffBar: document.getElementById("handoffBar")
   };
 
   var state = {
@@ -33,6 +36,8 @@
     busy: false,
     handedOff: false,
     closed: false,
+    ticketId: null,
+    ticketStatus: null,
     handoffToastShown: false,
     handoffLineShown: false,
     closedNotified: false,
@@ -371,6 +376,7 @@
     var first = !state.handedOff;
     state.handedOff = true;
     renderStatus();
+    applyHandoffUi();
     if (withToast && !state.handoffToastShown) {
       state.handoffToastShown = true;
       toast("已转人工:AI 已停止自动回复,坐席会尽快跟进。", "warn");
@@ -380,6 +386,19 @@
       addSysLine("已转人工,AI 已停止自动回复,坐席会尽快跟进。");
     }
     startPolling();
+  }
+
+  /**
+   * W5-FIX R1:已转人工但**本会话工单仍未关闭**时,输入区保持可用。
+   * 买家继续输入 = 追加留言到人工工单(后端 blocked 轮会 append),不是新会话。
+   */
+  function applyHandoffUi() {
+    if (!state.handedOff || state.closed) return;
+    if (els.handoffBar) els.handoffBar.classList.remove("hidden");
+    els.form.classList.remove("is-closed");
+    els.input.disabled = false;
+    els.send.disabled = state.busy;
+    els.input.placeholder = "留言将追加到人工工单…(Enter 发送,Shift+Enter 换行)";
   }
 
   function startPolling() {
@@ -399,8 +418,9 @@
   async function pollSummary() {
     if (!state.sessionId || state.closed) return;
     try {
+      // W5-FIX R1:会话作用域端点——只返回本 session 的工单,不再按客户取最近一张。
       var resp = await fetch(
-        "/api/c/handoff/sessions/" + encodeURIComponent(state.sessionId) + "/summary",
+        "/api/c/handoff/summary?session_id=" + encodeURIComponent(state.sessionId),
         { headers: { Accept: "application/json" } }
       );
       if (!resp.ok) {
@@ -412,6 +432,8 @@
       }
       state.pollFails = 0;
       var data = await resp.json();
+      state.ticketId = (data.ticket && data.ticket.ticket_id) || null;
+      state.ticketStatus = data.ticket_status || null;
       if (data.session_status === "handed_off" || data.session_status === "closed") {
         markHandedOff(false);
       }
@@ -426,7 +448,12 @@
         state.seenHuman[key] = true;
         addBubble("human", msg.content || "", { time: fmtTime(msg.created_at_utc) });
       });
-      if (data.ticket_closed === true) onTicketClosed();
+      // 只有「本会话的工单」关闭才禁用输入;同客户历史 closed 工单不再参与判断。
+      if (data.ticket_closed === true) {
+        onTicketClosed();
+      } else if (state.handedOff) {
+        applyHandoffUi();
+      }
     } catch (err) {
       state.pollFails += 1;
     }
@@ -437,6 +464,7 @@
     state.closed = true;
     stopPolling();
     renderStatus();
+    if (els.handoffBar) els.handoffBar.classList.add("hidden");
     els.input.disabled = true;
     els.send.disabled = true;
     els.form.classList.add("is-closed");
@@ -631,7 +659,10 @@
     } finally {
       state.busy = false;
       renderStatus();
+      // 未关单时恢复可输入(转人工后仍要能继续留言);关单才禁用。
       els.send.disabled = state.closed;
+      els.input.disabled = state.closed;
+      if (state.handedOff && !state.closed) applyHandoffUi();
       els.input.focus();
     }
   }

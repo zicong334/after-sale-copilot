@@ -131,6 +131,7 @@ def execute(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         merchant_id=ctx.merchant_id,
         customer_id=ctx.customer_id,
         order_id=order_id,
+        session_id=ctx.session_id,
         status="queued",
         handoff_reason=reason,
         summary=summary,

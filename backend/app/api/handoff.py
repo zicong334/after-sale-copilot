@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from app.api import get_db
 from app.db import utc_now
-from app.errors import NotFoundError, StateConflictError
+from app.errors import AppError, NotFoundError, StateConflictError
 from app.models import ChatMessage, ChatSession, Ticket, TicketMessage
 from app.services import tickets as ticket_svc
 
@@ -58,6 +58,7 @@ def _ticket_dict(ticket: Ticket) -> dict[str, Any]:
         "merchant_id": ticket.merchant_id,
         "customer_id": ticket.customer_id,
         "order_id": ticket.order_id,
+        "session_id": ticket.session_id,
         "status": ticket.status,
         "claimed_by": ticket.claimed_by,
         "handoff_reason": ticket.handoff_reason,
@@ -134,50 +135,63 @@ def close(ticket_id: str, payload: CloseIn | None = None, db: Session = Depends(
 
 @router.get("/sessions/{session_id}/summary")
 def session_summary(session_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """会话摘要:会话状态 + 最近工单 + 最近消息(坐席接手用)。"""
+    """会话摘要:会话状态 + 本会话工单 + 最近消息(坐席接手用)。
+
+    W5-FIX R1:工单按 ``ticket.session_id`` **精确归属**本会话;
+    历史工单没有 session_id 时返回 ticket=None,绝不回退到
+    「按客户取最近一张」的启发式(那会把同客户历史 closed 工单误当成当前会话)。
+    """
     row = db.get(ChatSession, session_id)
     if row is None:
         raise NotFoundError(f"会话不存在: {session_id}")
-    # Ticket 表(W1-A 冻结)无 session_id/transcript_ref 列:按 merchant+customer
-    # 关联该客户最近一张工单,并在响应里显式标注关联方式。
-    ticket = db.scalars(
+    ticket = _session_ticket(db, session_id)
+    return _summary_body(db, row, ticket, link="session_id(精确归属)")
+
+
+def _session_ticket(db: Session, session_id: str) -> Ticket | None:
+    """按 session_id 精确取本会话的工单(W5-FIX R1,不做客户级回退)。"""
+    return db.scalars(
         select(Ticket)
-        .where(Ticket.merchant_id == row.merchant_id, Ticket.customer_id == row.customer_id)
-        .order_by(Ticket.created_at.desc())
+        .where(Ticket.session_id == session_id)
+        .order_by(Ticket.created_at.desc(), Ticket.id.desc())
         .limit(1)
     ).first()
+
+
+def _public_ticket_messages(db: Session, ticket: Ticket | None) -> list[dict[str, Any]]:
+    """买家侧可见的工单消息:is_internal=True 的坐席内部备注不下发。"""
+    if ticket is None:
+        return []
+    return [
+        {
+            "id": item.id,
+            "author_type": item.author_type,
+            "content": item.content,
+            "is_internal": bool(item.is_internal),
+            "created_at_utc": _iso(item.created_at),
+        }
+        for item in db.scalars(
+            select(TicketMessage)
+            .where(
+                TicketMessage.ticket_id == ticket.id,
+                TicketMessage.is_internal.is_(False),
+            )
+            .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
+        ).all()
+    ]
+
+
+def _summary_body(
+    db: Session, row: ChatSession, ticket: Ticket | None, *, link: str,
+) -> dict[str, Any]:
+    """会话摘要响应体(两个入口共用,保证形状一致)。"""
     messages = list(
         db.scalars(
             select(ChatMessage)
-            .where(ChatMessage.session_id == session_id)
+            .where(ChatMessage.session_id == row.id)
             .order_by(ChatMessage.created_at.asc())
             .limit(20)
         ).all()
-    )
-    # W5:该会话关联工单的 ticket_message(转人工后买家追加 + 坐席回复),
-    # 让买家/摘要侧看到人工侧的工作记录(created_at asc)。
-    # 安全边界:is_internal=True 的坐席内部备注**不下发**买家侧接口
-    # (app.js 只是客户端过滤,不能当作保护;工作台 /api/b 详情仍返回内部备注)。
-    ticket_messages = (
-        [
-            {
-                "id": item.id,
-                "author_type": item.author_type,
-                "content": item.content,
-                "is_internal": bool(item.is_internal),
-                "created_at_utc": _iso(item.created_at),
-            }
-            for item in db.scalars(
-                select(TicketMessage)
-                .where(
-                    TicketMessage.ticket_id == ticket.id,
-                    TicketMessage.is_internal.is_(False),
-                )
-                .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
-            ).all()
-        ]
-        if ticket is not None
-        else []
     )
     return {
         "ok": True,
@@ -186,10 +200,10 @@ def session_summary(session_id: str, db: Session = Depends(get_db)) -> dict[str,
         "merchant_id": row.merchant_id,
         "customer_id": row.customer_id,
         "ticket": _ticket_dict(ticket) if ticket is not None else None,
-        "ticket_link": "merchant_id+customer_id(最近一张;Ticket 无 session_id 列)",
+        "ticket_link": link,
         "ticket_status": ticket.status if ticket is not None else None,
         "ticket_closed": bool(ticket is not None and ticket.status == "closed"),
-        "ticket_messages": ticket_messages,
+        "ticket_messages": _public_ticket_messages(db, ticket),
         "messages": [
             {
                 "role": item.role,
@@ -200,4 +214,52 @@ def session_summary(session_id: str, db: Session = Depends(get_db)) -> dict[str,
             }
             for item in messages
         ],
+    }
+
+
+@router.get("/summary")
+def summary(
+    session_id: str | None = Query(default=None),
+    merchant_id: str | None = Query(default=None),
+    customer_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """会话摘要兼容入口(买家页轮询用 ``?session_id=...``)。
+
+    - 传 ``session_id``:与本会话摘要完全一致,只返回该会话的工单;
+    - 不传 ``session_id``:保持旧行为——按 ``merchant_id+customer_id``
+      取该客户最近一张工单(兼容既有调用方,新前端不再使用)。
+    """
+    if session_id:
+        row = db.get(ChatSession, session_id)
+        if row is None:
+            raise NotFoundError(f"会话不存在: {session_id}")
+        return _summary_body(
+            db, row, _session_ticket(db, session_id), link="session_id(精确归属)",
+        )
+    if not merchant_id or not customer_id:
+        raise AppError(
+            "VALIDATION_ERROR",
+            "缺少 session_id,或同时提供 merchant_id 与 customer_id",
+            400,
+            param="session_id",
+        )
+    legacy_ticket = db.scalars(
+        select(Ticket)
+        .where(Ticket.merchant_id == merchant_id, Ticket.customer_id == customer_id)
+        .order_by(Ticket.created_at.desc(), Ticket.id.desc())
+        .limit(1)
+    ).first()
+    return {
+        "ok": True,
+        "session_id": None,
+        "session_status": None,
+        "merchant_id": merchant_id,
+        "customer_id": customer_id,
+        "ticket": _ticket_dict(legacy_ticket) if legacy_ticket is not None else None,
+        "ticket_link": "merchant_id+customer_id(最近一张;旧行为兼容)",
+        "ticket_status": legacy_ticket.status if legacy_ticket is not None else None,
+        "ticket_closed": bool(legacy_ticket is not None and legacy_ticket.status == "closed"),
+        "ticket_messages": _public_ticket_messages(db, legacy_ticket),
+        "messages": [],
     }

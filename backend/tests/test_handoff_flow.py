@@ -426,10 +426,18 @@ def test_summary_hides_internal_agent_notes(client, engine):
     里没有内部备注内容,但普通坐席回复仍可见。
     """
     with Session(engine) as db:
-        # 复用 seed 里已存在的 merchant/customer(chat_session 有外键),
-        # 且 seed-cust-001 无工单 —— 本测试建的单就是该客户最近一张。
+        # 复用 seed 里已存在的 merchant/customer(chat_session 有外键)。
+        # W5-FIX R1:工单按 session_id 精确归属,不再按客户取最近一张。
         db.add(ChatSession(id="s-hf-internal", merchant_id=MERCHANT_ID, customer_id=CUSTOMER))
-        db.add(Ticket(id="tk-hf-internal", merchant_id=MERCHANT_ID, customer_id=CUSTOMER, status="queued"))
+        db.add(
+            Ticket(
+                id="tk-hf-internal",
+                merchant_id=MERCHANT_ID,
+                customer_id=CUSTOMER,
+                session_id="s-hf-internal",
+                status="queued",
+            )
+        )
         db.add_all(
             [
                 TicketMessage(id="tm-hf-public", ticket_id="tk-hf-internal", author_type="agent", content="您好,我来跟进"),

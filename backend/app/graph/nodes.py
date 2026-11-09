@@ -412,6 +412,7 @@ def make_nodes(
             merchant_id=merchant_id,
             customer_id=session_row.customer_id,
             trace_id=trace_id,
+            session_id=session_row.id,
         )
 
     def _clause(clause_id: Any) -> dict[str, Any] | None:

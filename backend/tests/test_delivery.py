@@ -136,6 +136,11 @@ def _sqlite_table_exists(db_path: Path, table: str) -> bool:
     return row is not None
 
 
+def _sqlite_column_exists(db_path: Path, table: str, column: str) -> bool:
+    with sqlite3.connect(str(db_path)) as conn:
+        return column in [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
 def _markers() -> tuple[str, str]:
     return "<!-- gen_readme_numbers:begin -->", "<!-- gen_readme_numbers:end -->"
 
@@ -259,10 +264,11 @@ def test_rollback_drill(tmp_dir):
     db_url = f"sqlite:///{db_path.as_posix()}"
 
     up = rollback.upgrade_database(db_url)
-    assert up["current_revision"] == "0004_memory"
+    assert up["current_revision"] == "0005_ticket_session_id"
     assert up["integrity_check"] == "ok"
     assert up["foreign_key_violations"] == 0
     assert _sqlite_table_exists(db_path, "memory")
+    assert _sqlite_column_exists(db_path, "ticket", "session_id")
 
     down = rollback.downgrade_database(db_url, "0003", backup_dir=tmp_dir / "backup")
     assert down["target"] == "0003_ticket_summary"
@@ -271,10 +277,12 @@ def test_rollback_drill(tmp_dir):
     assert down["foreign_key_violations"] == 0
     assert Path(down["backup"]).is_file() and Path(down["backup"]).stat().st_size > 0
     assert not _sqlite_table_exists(db_path, "memory")
+    assert not _sqlite_column_exists(db_path, "ticket", "session_id")
 
     up2 = rollback.upgrade_database(db_url)
-    assert up2["current_revision"] == "0004_memory"
+    assert up2["current_revision"] == "0005_ticket_session_id"
     assert _sqlite_table_exists(db_path, "memory")
+    assert _sqlite_column_exists(db_path, "ticket", "session_id")
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +328,7 @@ def test_readme_required_sections():
         "merchant_id 扩展点": "merchant_id",
         "向量检索扩展点": "向量检索",
         "pricing.* 命名空间": "pricing.*",
-        "已知声明 1(Ticket 无 session_id)": "Ticket 无 session_id",
+        "已知声明 1(Ticket 已有 session_id)": "Ticket 已有 session_id",
         "已知声明 2(usage 估算)": "usage",
         "数字生成命令": "gen_readme_numbers.py",
         "回滚脚本": "rollback.py",

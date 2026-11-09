@@ -36,6 +36,9 @@ class Ticket(Base):
         String(36), ForeignKey("order.id", ondelete="SET NULL"),
         nullable=True, index=True,
     )
+    # 会话精确归属(W5-FIX R1):handoff 确认建单时写入当前 thread_id。
+    # 可空是为了兼容 0005 之前的历史工单(那时 ticket 表没有会话列)。
+    session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="queued",
     )
