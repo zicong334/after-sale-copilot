@@ -698,3 +698,145 @@ def test_fix7_memory_preference_scene(db, ckpt):
     assert result.tool_calls == []
     assert "尺码" in result.reply
     assert "已为您退款" not in result.reply
+
+
+# ---------------------------------------------------------------------------
+# FIX-8 订单快捷路径 / 越权查单标准话术
+# ---------------------------------------------------------------------------
+
+
+class _DriftingLLM(FakeLLM):
+    """故意给不出标准拒绝句的模型桩(MOCK):用于验证 FIX-8 的后置拼接。"""
+
+    def compose(self, facts: dict | None = None) -> str:  # noqa: ARG002
+        return "该订单信息无法展示,请联系人工核实。"
+
+
+def test_fix8_order_id_with_query_goes_rule_path(db, ckpt):
+    """自造输入(不带评测编号):订单号 + 物流诉求 → 规则直判,不进模型分类。"""
+    row = new_row(db)
+    trace_id = new_trace_id()
+    result = run_turn(
+        db, row, "帮我查一下订单 seed-order-019 的物流到哪了", ckpt=ckpt, trace_id=trace_id
+    )
+
+    assert result.intent == "order_judge"
+    assert result.classification_path == "rule"
+    events = events_of(db, trace_id)
+    classify = [e for e in events if e.tool_name == EVENT_CLASSIFY]
+    assert classify and json.loads(classify[-1].payload)["path"] == "rule"
+    assert json.loads(classify[-1].payload)["confidence"] == 1.0
+
+
+def test_fix8_order_id_only_does_not_trigger_rule_path(db, ckpt):
+    """只有订单号、没有售后诉求词 → 不走规则路径。"""
+    row = new_row(db)
+    result = run_turn(db, row, "订单 seed-order-019 是我下的", ckpt=ckpt)
+
+    assert result.classification_path != "rule"
+
+
+def test_fix8_denied_lookup_reply_contains_standard_clause(db, ckpt):
+    """越权查单(订单不属于当前客户):回复必须以标准拒绝句打头,零字段泄露。"""
+    row = new_row(db)
+    result = run_turn(
+        db,
+        row,
+        "帮我查一下订单 seed-order-019 的收货地址和买家手机号",
+        ckpt=ckpt,
+        context={"order_id": "seed-order-019", "current_customer_id": CUSTOMER_OTHER},
+    )
+
+    assert result.intent == "order_judge"
+    assert result.classification_path == "rule"
+    assert result.reply.startswith(graph_nodes.guardrails.ORDER_NOT_FOUND_CLAUSE)
+    for forbidden in ("收货地址是", "手机号是", "实付"):
+        assert forbidden not in result.reply
+    observations = snapshot_of(db, row, ckpt).values.get("observations") or []
+    assert graph_nodes.guardrails.order_lookup_denied(observations)
+
+
+def test_fix8_drifted_reply_is_spliced_with_standard_clause():
+    """模型话术不含标准句时,compose 后置守卫确定性拼接(走同一接线,不只测纯函数)。"""
+    drifted = _DriftingLLM().compose({"kind": "order_not_found"})
+    assert graph_nodes.guardrails.ORDER_NOT_FOUND_KEY not in drifted
+    state = {
+        "observations": [
+            {"name": "shop__get_order", "ok": False, "error_code": "NOT_FOUND_OR_FORBIDDEN"}
+        ],
+        "intent": {"name": "other"},
+        "percept": {"text": "帮我查一下订单 seed-order-019 的物流"},
+        "memory": {"text": "无历史偏好", "count": 0, "scopes": []},
+    }
+    fixed = graph_nodes._apply_reply_guards(drifted, state)
+    assert fixed.startswith(graph_nodes.guardrails.ORDER_NOT_FOUND_CLAUSE)
+    assert drifted in fixed
+
+
+def test_fix8_rule_path_does_not_override_handoff_or_risk(db, ckpt):
+    """既有优先级不可被订单快捷路径绕过:明示人工 → fast_path;风险信号 → handoff。"""
+    row = new_row(db)
+    explicit = run_turn(db, row, "订单 seed-order-019 别查了，直接给我转人工客服", ckpt=ckpt)
+    assert explicit.intent == "handoff"
+    assert explicit.classification_path == "fast_path"
+
+    row2 = new_row(db)
+    risk = run_turn(db, row2, "订单 seed-order-019 的退款不给我就投诉", ckpt=ckpt)
+    assert risk.intent == "handoff"
+
+
+# ---------------------------------------------------------------------------
+# FIX-9 偏好引用保真
+# ---------------------------------------------------------------------------
+
+
+class _ForgetfulLLM(FakeLLM):
+    """故意不引用偏好的模型桩(MOCK):用于验证 FIX-9 的后置拼接。"""
+
+    def compose(self, facts: dict | None = None) -> str:  # noqa: ARG002
+        return "好的,我已关注您的需求。"
+
+
+def test_fix9_related_memory_turn_cites_preference_verbatim(db, ckpt):
+    """注入尺码偏好 + 相关意图 → 回复必须逐字含偏好正文,否则确定性拼接。"""
+    llm = _ForgetfulLLM()
+    row = new_row(db)
+    first = run_turn(db, row, "我 M 码偏紧，以后都给我推荐 L 码", ckpt=ckpt, llm=llm)
+    assert first.intent == "other"
+
+    second = run_turn(db, row, "再帮我推荐一个尺码", ckpt=ckpt, llm=llm)
+    assert second.intent == "other"
+    assert "优先推荐 L" in second.reply
+    assert graph_nodes.guardrails.MEMORY_REFERENCE_PREFIX in second.reply
+
+
+def test_fix9_unrelated_intent_does_not_cite_preference(db, ckpt):
+    """注入尺码偏好但本轮问政策 → 不拼接偏好引用。"""
+    llm = _ForgetfulLLM()
+    row = new_row(db)
+    run_turn(db, row, "我 M 码偏紧，以后都给我推荐 L 码", ckpt=ckpt, llm=llm)
+    policy = run_turn(db, row, "无理由退货是几天？", ckpt=ckpt, llm=llm)
+
+    assert policy.intent == "policy_qa"
+    assert graph_nodes.guardrails.MEMORY_REFERENCE_PREFIX not in policy.reply
+    assert "优先推荐 L" not in policy.reply
+
+
+def test_fix9_unrelated_other_turn_does_not_cite_preference(db, ckpt):
+    """同为 other 但本轮只是问候 → 不硬拼偏好引用(相关性由本轮文本判定)。"""
+    llm = _ForgetfulLLM()
+    row = new_row(db)
+    run_turn(db, row, "我 M 码偏紧，以后都给我推荐 L 码", ckpt=ckpt, llm=llm)
+    greeting = run_turn(db, row, "你好，在吗？", ckpt=ckpt, llm=llm)
+
+    assert greeting.intent == "other"
+    assert graph_nodes.guardrails.MEMORY_REFERENCE_PREFIX not in greeting.reply
+
+
+def test_fix9_empty_memory_turn_does_not_cite_preference(db, ckpt):
+    """空记忆(新客户首轮)→ 不拼接偏好引用。"""
+    row = new_row(db)
+    result = run_turn(db, row, "再帮我推荐一个尺码", ckpt=ckpt, llm=_ForgetfulLLM())
+
+    assert result.intent == "other"
+    assert graph_nodes.guardrails.MEMORY_REFERENCE_PREFIX not in result.reply

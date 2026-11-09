@@ -232,3 +232,119 @@ def test_handoff_reason_enum_is_single_source_of_truth():
     # 所有枚举值都有自己的中文标签,未知值回退 other 标签
     assert all(reason in guardrails.HANDOFF_REASON_LABELS for reason in guardrails.HANDOFF_REASON_ENUM)
     assert guardrails.handoff_reason_label("not-exist") == guardrails.HANDOFF_REASON_LABELS["other"]
+
+
+# ---------------------------------------------------------------------------
+# FIX-8 订单快捷路径 / 越权查单统一话术
+# ---------------------------------------------------------------------------
+
+
+def test_is_order_query_shortcut_hits_order_id_with_after_sale_word():
+    # 自造输入(不带评测编号):订单号 + 物流诉求 → 命中
+    assert guardrails.is_order_query_shortcut("帮我查一下订单 seed-order-019 的物流到哪了")
+    # 订单号只在 context 里也算(文本含诉求词)
+    assert guardrails.is_order_query_shortcut(
+        "这单能不能退", {"order_id": "ORD-20261108-0001"}
+    )
+
+
+def test_is_order_query_shortcut_misses_order_id_without_intent_word():
+    # 只有订单号、没有查询/退换/判责类诉求词 → 不命中,继续交给模型
+    assert not guardrails.is_order_query_shortcut("订单 seed-order-019 是我下的")
+    # 有诉求词但没有订单号 → 不命中(订单判责必须建立在真实订单号上)
+    assert not guardrails.is_order_query_shortcut("我要退货", {})
+    assert not guardrails.is_order_query_shortcut("")
+
+
+def test_order_lookup_denied_requires_get_order_failure_evidence():
+    denied = [{"name": "shop__get_order", "ok": False, "error_code": "NOT_FOUND_OR_FORBIDDEN"}]
+    assert guardrails.order_lookup_denied(denied)
+    # 成功调用 / 其它错误码 / 其它工具都不算"被拒"
+    assert not guardrails.order_lookup_denied(
+        [{"name": "shop__get_order", "ok": True, "error_code": None}]
+    )
+    assert not guardrails.order_lookup_denied(
+        [{"name": "shop__get_order", "ok": False, "error_code": "TIMEOUT"}]
+    )
+    assert not guardrails.order_lookup_denied(
+        [{"name": "refund__create", "ok": False, "error_code": "NOT_FOUND_OR_FORBIDDEN"}]
+    )
+    assert not guardrails.order_lookup_denied([])
+
+
+def test_ensure_order_not_found_clause_prepends_and_is_idempotent():
+    # 模型漂移话术 → 标准句必须打头,原文保留(只补充不替代)
+    drifted = "该订单信息无法展示,请联系人工核实。"
+    fixed = guardrails.ensure_order_not_found_clause(drifted)
+    assert fixed.startswith(guardrails.ORDER_NOT_FOUND_CLAUSE)
+    assert drifted in fixed
+    # 已含精确标准句 → 原样返回
+    exact = guardrails.ORDER_NOT_FOUND_CLAUSE + "。"
+    assert guardrails.ensure_order_not_found_clause(exact) == exact
+    # 历史近似文案 → 归一化成精确标准句,且不出现两句并存
+    legacy = "未能在当前会话下找到您提到的订单。请确认订单号是否正确。"
+    fixed_legacy = guardrails.ensure_order_not_found_clause(legacy)
+    assert guardrails.ORDER_NOT_FOUND_CLAUSE in fixed_legacy
+    assert fixed_legacy.count("未能在当前会话下找到") == 1
+    assert "请确认订单号是否正确" in fixed_legacy
+    # 空回复 → 只给标准句
+    assert guardrails.ensure_order_not_found_clause("") == guardrails.ORDER_NOT_FOUND_CLAUSE + "。"
+
+
+# ---------------------------------------------------------------------------
+# FIX-9 偏好引用保真
+# ---------------------------------------------------------------------------
+
+_INJECTED_SIZE_MEMORY = {
+    "text": (
+        "以下是买家历史偏好,可能过时,仅用于尺码推荐,不得作为价格/退款/承诺依据:\n"
+        "- [preference/size_recommendation] 尺码偏好:M 偏紧,优先推荐 L"
+    ),
+    "count": 1,
+    "scopes": ["size_recommendation"],
+}
+
+
+def test_memory_reference_phrase_extracts_body_from_injection_block():
+    assert guardrails.memory_reference_phrase(_INJECTED_SIZE_MEMORY["text"]) == (
+        "尺码偏好:M 偏紧,优先推荐 L"
+    )
+    assert guardrails.memory_reference_phrase("无历史偏好") is None
+
+
+def test_needs_memory_reference_matrix():
+    # 有注入 + 相关意图(other)+ 相关 scope + 本轮在问尺码 → 需要引用
+    assert guardrails.needs_memory_reference(
+        _INJECTED_SIZE_MEMORY, "other", "再帮我推荐一个尺码"
+    )
+    # 空记忆 / 无记忆 / 无关意图(政策问答)/ 无关 scope → 不拼接
+    assert not guardrails.needs_memory_reference(
+        {"text": "无历史偏好", "count": 0, "scopes": []}, "other", "再帮我推荐一个尺码"
+    )
+    assert not guardrails.needs_memory_reference(None, "other", "再帮我推荐一个尺码")
+    assert not guardrails.needs_memory_reference(
+        _INJECTED_SIZE_MEMORY, "policy_qa", "无理由退货是几天？"
+    )
+    assert not guardrails.needs_memory_reference(
+        {"text": "- [preference/pricing] 价格敏感", "count": 1, "scopes": ["pricing"]},
+        "other",
+        "推荐一个便宜点的",
+    )
+
+
+def test_needs_memory_reference_requires_related_text():
+    # 同为 other,但本轮只是问候/闲谈 → 不硬拼偏好引用
+    assert not guardrails.needs_memory_reference(_INJECTED_SIZE_MEMORY, "other", "你好，在吗？")
+    assert not guardrails.needs_memory_reference(_INJECTED_SIZE_MEMORY, "other", "")
+
+
+def test_ensure_memory_reference_appends_phrase_and_is_idempotent():
+    forgetful = "好的,我已关注您的需求。"
+    fixed = guardrails.ensure_memory_reference(forgetful, _INJECTED_SIZE_MEMORY)
+    assert fixed.startswith(forgetful)
+    assert guardrails.MEMORY_REFERENCE_PREFIX in fixed
+    assert "优先推荐 L" in fixed
+    # 已逐字引用 → 不再重复拼接
+    assert guardrails.ensure_memory_reference(fixed, _INJECTED_SIZE_MEMORY) == fixed
+    # 无偏好正文(空注入)→ 原样返回
+    assert guardrails.ensure_memory_reference(forgetful, {"text": "无历史偏好", "count": 0}) == forgetful

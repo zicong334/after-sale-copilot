@@ -10,7 +10,11 @@
   / ``is_privacy_probe`` / ``injection_flags``;
 - FIX-4 反编造:``STATUS_CLAIM_RULES`` / ``audit_status_claims``;
 - FIX-5 引用保真:``citation_phrases`` / ``ensure_citation_fidelity``;
-- FIX-6 转人工原因枚举:``HANDOFF_REASON_ENUM`` / ``map_handoff_reason``。
+- FIX-6 转人工原因枚举:``HANDOFF_REASON_ENUM`` / ``map_handoff_reason``;
+- FIX-8 查单快捷路径/统一拒绝话术:``is_order_query_shortcut``
+  / ``order_lookup_denied`` / ``ensure_order_not_found_clause``;
+- FIX-9 偏好引用保真:``memory_reference_phrase`` / ``needs_memory_reference``
+  / ``ensure_memory_reference``。
 
 注意:本模块不 import app 内其他业务模块(避免循环依赖),可被 perception /
 memory / graph / tools 任意层安全导入。
@@ -214,7 +218,7 @@ def is_privacy_probe(text: str, has_order_id: bool) -> bool:
     """是否在索要**他人**隐私信息(手机号/地址/身份证等)。
 
     有订单号槽位时不做此拦截:越权订单的拒绝由 ``shop__get_order`` 的
-    NOT_FOUND_OR_FORBIDDEN 证据链负责(REFUND-006/ADV-002 期望话术)。
+    NOT_FOUND_OR_FORBIDDEN 证据链负责(越权查单的期望话术)。
     """
     if has_order_id:
         return False
@@ -455,3 +459,159 @@ def ensure_policy_word(reply: str) -> str:
     if "政策" in body:
         return body
     return "根据店铺政策:" + body
+
+
+# ---------------------------------------------------------------------------
+# FIX-8:订单号 + 售后诉求的规则快捷路径 / 越权查单统一话术
+# ---------------------------------------------------------------------------
+
+#: 订单/售后诉求词:出现任一即视为"要处理这个订单",可绕过 LLM 意图分类。
+#: 只收动宾层面的诉求词,不收"订单""订单号"这类纯指代,避免"仅报订单号"被误判。
+ORDER_QUERY_HINTS: tuple[str, ...] = (
+    "查",
+    "查询",
+    "状态",
+    "物流",
+    "快递",
+    "到哪",
+    "签收",
+    "退",
+    "换",
+    "判责",
+    "责任",
+    "售后",
+    "退款",
+    "退货",
+)
+
+#: shop__get_order 对"不存在/越权"统一返回的错误码。
+ORDER_LOOKUP_DENIED_CODE = "NOT_FOUND_OR_FORBIDDEN"
+
+#: 越权/不存在查单的标准拒绝句(对客统一口径,模型话术只能补充不能替代)。
+ORDER_NOT_FOUND_CLAUSE = "未能在当前会话下找到该订单"
+
+#: 判定"已包含标准句"的保守子串(兼容历史文案"未能在当前会话下找到您提到的订单")。
+ORDER_NOT_FOUND_KEY = "未能在当前会话下找到"
+
+#: 模型/历史文案里的近似说法:统一归一化成 ``ORDER_NOT_FOUND_CLAUSE``,避免两句并存。
+_ORDER_NOT_FOUND_VARIANT_RE = re.compile(r"未能在当前会话下找到(?:您提到的)?订单")
+
+
+def is_order_query_shortcut(
+    text: str, context: Mapping[str, Any] | None = None
+) -> bool:
+    """文本/上下文含订单号形态,且文本含查询·退换·判责类诉求词。
+
+    只看"有没有订单号 + 有没有诉求",不判断订单归属;归属由工具证据链裁决。
+    """
+    if not extract_order_id(text, context):
+        return False
+    body = str(text or "")
+    return any(hint in body for hint in ORDER_QUERY_HINTS)
+
+
+def order_lookup_denied(observations: Iterable[Mapping[str, Any]]) -> bool:
+    """本轮工具观察里是否存在"查单被拒(不存在/越权)"的确定性证据。"""
+    for item in observations or ():
+        if str(item.get("name") or "") != "shop__get_order":
+            continue
+        if item.get("ok"):
+            continue
+        if str(item.get("error_code") or "") == ORDER_LOOKUP_DENIED_CODE:
+            return True
+    return False
+
+
+def ensure_order_not_found_clause(reply: str) -> str:
+    """查单被拒后,回复必须以标准句打头(模型原文保留在后,不整体替换)。
+
+    模型或历史文案里若只有近似说法(如"未能在当前会话下找到您提到的订单"),
+    先归一化成精确标准句再返回;完全没有标准句时补在正文前。
+    """
+    body = str(reply or "").strip()
+    if ORDER_NOT_FOUND_CLAUSE in body:
+        return body
+    if not body:
+        return ORDER_NOT_FOUND_CLAUSE + "。"
+    normalized = _ORDER_NOT_FOUND_VARIANT_RE.sub(ORDER_NOT_FOUND_CLAUSE, body)
+    if ORDER_NOT_FOUND_CLAUSE in normalized:
+        return normalized
+    return ORDER_NOT_FOUND_CLAUSE + "。" + body
+
+
+# ---------------------------------------------------------------------------
+# FIX-9:注入偏好后,相关意图必须在回复里逐字引用偏好正文
+# ---------------------------------------------------------------------------
+
+#: 注入块的偏好行格式:`- [preference/size_recommendation] 尺码偏好:M 偏紧,优先推荐 L`
+MEMORY_LINE_RE = re.compile(r"^-\s*\[([^/\]]+)/([^\]]+)\]\s*(.+)$", re.MULTILINE)
+
+#: 需要引用偏好的意图(偏好陈述常被判 other;政策问答等不引用,避免生硬)。
+MEMORY_REFERENCE_INTENTS = frozenset({"other"})
+
+#: 需要引用偏好的 scope(目前只有尺码推荐有"逐字引用"要求)。
+MEMORY_REFERENCE_SCOPES = frozenset({"size_recommendation"})
+
+#: 确定性引用前缀。
+MEMORY_REFERENCE_PREFIX = "根据您的偏好记录:"
+
+#: 本轮文本必须真的在问尺码/选购,才算"意图与 scope 相关";
+#: 避免问候等无关 other 轮也被拼上一句偏好引用。
+MEMORY_REFERENCE_HINTS: tuple[str, ...] = (
+    "尺码",
+    "尺寸",
+    "码",
+    "穿",
+    "买",
+    "推荐",
+    "偏好",
+)
+
+
+def _memory_lines(memory_text: str) -> list[tuple[str, str, str]]:
+    """解析注入块,返回 [(类型, scope, 正文)];不匹配的行直接丢弃。"""
+    rows: list[tuple[str, str, str]] = []
+    for match in MEMORY_LINE_RE.finditer(str(memory_text or "")):
+        rows.append((match.group(1).strip(), match.group(2).strip(), match.group(3).strip()))
+    return rows
+
+
+def memory_reference_phrase(memory_text: str) -> str | None:
+    """从注入块提取应逐字引用的偏好正文:优先尺码推荐 scope,否则首条。"""
+    rows = _memory_lines(memory_text)
+    for _kind, scope, body in rows:
+        if scope in MEMORY_REFERENCE_SCOPES and body:
+            return body
+    for _kind, _scope, body in rows:
+        if body:
+            return body
+    return None
+
+
+def needs_memory_reference(
+    memory: Mapping[str, Any] | None,
+    intent_name: str | None,
+    text: str = "",
+) -> bool:
+    """有偏好注入、意图相关、文本确实在问相关话题、且 scope 命中时才要求引用。"""
+    data = memory or {}
+    if int(data.get("count") or 0) <= 0:
+        return False
+    if str(intent_name or "") not in MEMORY_REFERENCE_INTENTS:
+        return False
+    scopes = {str(scope) for scope in (data.get("scopes") or ())}
+    if not (scopes & MEMORY_REFERENCE_SCOPES):
+        return False
+    body = str(text or "")
+    return any(hint in body for hint in MEMORY_REFERENCE_HINTS)
+
+
+def ensure_memory_reference(reply: str, memory: Mapping[str, Any] | None) -> str:
+    """回复未逐字包含偏好正文时,补一句确定性引用;已包含则原样返回。"""
+    body = str(reply or "").strip()
+    phrase = memory_reference_phrase(str((memory or {}).get("text") or ""))
+    if not phrase or phrase in body:
+        return body
+    if not body:
+        return MEMORY_REFERENCE_PREFIX + phrase + "。"
+    return body + MEMORY_REFERENCE_PREFIX + phrase + "。"

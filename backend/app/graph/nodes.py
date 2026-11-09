@@ -196,6 +196,24 @@ def _has_risk(text: str) -> bool:
     return any(h in text for h in RISK_HINTS)
 
 
+def _apply_reply_guards(draft: str, state: GraphState) -> str:
+    """FIX-8/9:compose 后的确定性守卫(模型话术只能补充,不能漏标准句/偏好原文)。
+
+    抽成模块级纯函数,让单测走"compose 同一接线",不必依赖图调度。
+    """
+    # FIX-8:本轮查单被拒(不存在/越权)→ 回复必须以标准句打头。
+    if guardrails.order_lookup_denied(state.get("observations") or ()):
+        draft = guardrails.ensure_order_not_found_clause(draft)
+    # FIX-9:注入偏好 + 相关意图 → 回复必须逐字引用偏好正文,否则确定性拼接。
+    if guardrails.needs_memory_reference(
+        state.get("memory"),
+        (state.get("intent") or {}).get("name"),
+        text_of(state),
+    ):
+        draft = guardrails.ensure_memory_reference(draft, state.get("memory"))
+    return draft
+
+
 def _claimed_amounts_cents(text: str, context: dict[str, Any]) -> list[int]:
     """客户声称的金额(分):上下文显式字段 + 文本"实付/按…元"表达。"""
     amounts: list[int] = []
@@ -554,6 +572,19 @@ def make_nodes(
 
         blocked = bool(guard["hard"] or guard["privacy"])
         shortcut = None if blocked else _shortcut_intent(text)
+        shortcut_path = "fast_path"
+        # FIX-8:订单号 + 售后诉求可直接判 order_judge,不进 LLM(避免真实模型意图漂移);
+        # 明示人工/风险信号/伪造政策/连续未解决必须优先,顺序与既有护栏一致。
+        if (
+            shortcut is None
+            and not blocked
+            and not _has_risk(text)
+            and "policy_forgery" not in profile["kinds"]
+            and int(context.get("unresolved_rounds") or 0) < 3
+            and guardrails.is_order_query_shortcut(text, context)
+        ):
+            shortcut = INTENT_ORDER_JUDGE
+            shortcut_path = "rule"
         if guard["privacy"]:
             decision: dict[str, Any] = {
                 "intent": INTENT_OTHER,
@@ -572,9 +603,9 @@ def make_nodes(
             decision = {
                 "intent": shortcut,
                 "confidence": 1.0,
-                "reason": "明示人工",
+                "reason": "订单号+售后诉求" if shortcut_path == "rule" else "明示人工",
             }
-            path = "fast_path"
+            path = shortcut_path
         else:
             messages = [
                 {
@@ -953,6 +984,8 @@ def make_nodes(
                 draft, _missing = guardrails.ensure_citation_fidelity(draft, retrieved)
             if verdict.get("kind") == "policy_answer":
                 draft = guardrails.ensure_policy_word(draft)
+            # FIX-8/9:越权查单标准句 + 偏好逐字引用,由确定性后置保证。
+            draft = _apply_reply_guards(draft, state)
             # FIX-4:转人工确认卡未确认前,统一"将为您转接人工(待确认)"口径。
             if confirm and not confirm.get("decided") and confirm.get("tool") == TOOL_HANDOFF:
                 reason_label = str(verdict.get("reason") or "用户主动要求人工")
@@ -1004,9 +1037,9 @@ def make_nodes(
         if kind == "order_missing_id":
             return _render({"kind": "order_missing_id"})
         if kind == "order_not_found":
-            # FIX-1:越权/不存在统一口径,由工具返回的错误码驱动,不臆造订单信息。
+            # FIX-1/FIX-8:越权/不存在统一口径,由工具返回的错误码驱动,不臆造订单信息。
             return (
-                "未能在当前会话下找到您提到的订单。请确认订单号是否正确;"
+                f"{guardrails.ORDER_NOT_FOUND_CLAUSE}。请确认订单号是否正确;"
                 "若该订单不属于当前账号,我无法展示其信息。"
             )
         if kind == "order_verdict_eligible":

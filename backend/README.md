@@ -100,7 +100,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:334 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:351 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -141,8 +141,10 @@ set PYTHONPATH=%CD%\backend
 | FIX-5 引用保真 | fact_mismatch 7 | `guardrails.citation_phrases/ensure_citation_fidelity` + `nodes.compose` | 条款关键数字短语(如"满 99 元包邮""8 元基础运费")未逐字出现 → 确定性追加条款原文;政策问答必含"政策"字样 |
 | FIX-6 转人工原因枚举 | handoff_reason 7 | `guardrails.HANDOFF_REASON_ENUM/map_handoff_reason` + `tools/handoff.py` schema | `reason` 只接受七枚举,入库为枚举;summary 保留自然语言;评测期望值同步 `cs-eval-v1-20261108b` |
 | FIX-7 记忆场景意图 | MEMORY-001 | `llm/base.py` 规则 + `nodes.classify` few-shot + `nodes.compose` memory | 尺码/偏好/以后推荐类陈述判 `other`,回复引用记忆注入正文;不误判政策问答、不误调退款工具 |
+| FIX-8 查单快捷路径+统一拒绝话术 | 越权查单话术漂移 | `guardrails.is_order_query_shortcut/order_lookup_denied/ensure_order_not_found_clause` + `nodes.classify/compose` | 订单号 + 查询/退换/判责诉求 → 规则直判 `order_judge`(`path=rule`,不进模型);本轮 `shop__get_order` 返回 `NOT_FOUND_OR_FORBIDDEN` → 回复必须以标准句打头,模型话术只补充不替代 |
+| FIX-9 偏好引用保真 | 偏好未逐字引用 | `guardrails.memory_reference_phrase/needs_memory_reference/ensure_memory_reference` + `nodes.compose` | 已注入偏好、本轮意图与 scope 相关且文本确在问尺码/选购 → 回复必须逐字包含偏好正文,缺失则确定性追加"根据您的偏好记录:…";空记忆/无关意图/无关 other 轮不拼接 |
 
-护栏单测:`backend/tests/test_guardrails.py`(纯函数);图级回归:`backend/tests/test_graph.py` 第 6 节(`fix1/fix3/fix4/fix5/fix7`)。
+护栏单测:`backend/tests/test_guardrails.py`(纯函数);图级回归:`backend/tests/test_graph.py` 第 6 节(`fix1/fix3/fix4/fix5/fix7/fix8/fix9`)。
 
 ## 8. 已知声明(交接必读)
 
