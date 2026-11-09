@@ -700,3 +700,91 @@ def ensure_memory_reference(reply: str, memory: Mapping[str, Any] | None) -> str
     if not body:
         return MEMORY_REFERENCE_PREFIX + phrase + "。"
     return body + MEMORY_REFERENCE_PREFIX + phrase + "。"
+
+
+# ---------------------------------------------------------------------------
+# W7-1:出网前 PII 识别正则(纯常量;替换与映射表由 app/pii.py 负责)
+# ---------------------------------------------------------------------------
+# 说明:正则只负责"认出片段",不负责改写。三条规则按 ID → 手机号 → 地址 的
+# 顺序应用(pii.py 保证),ID 与手机号都带数字边界,避免把 18 位身份证的
+# 中间 11 位误判成手机号。
+PII_ID_CARD_RE = re.compile(
+    r"(?<![0-9A-Za-z])([1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?![0-9A-Za-z])"
+)
+
+PII_PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
+
+#: 地址启发式:省/市/区县 + 街道门牌等后缀。只要求"像收货地址"即可,
+#: 单说"杭州市西湖区"(无街道门牌)不算,避免把政策问答里的地名也涂掉。
+PII_ADDRESS_RE = re.compile(
+    r"(?:[\u4e00-\u9fa5]{2,8}(?:省|自治区|特别行政区))?"
+    r"[\u4e00-\u9fa5]{2,10}(?:市|自治州|地区)"
+    r"[\u4e00-\u9fa5]{2,10}(?:区|县|市|旗)"
+    r"[\u4e00-\u9fa5A-Za-z0-9 \-]{2,30}?"
+    r"(?:路|街|道|巷|弄|村|小区|花园|苑|大厦|号楼|号院)"
+    r"[\u4e00-\u9fa5A-Za-z0-9 \-]{0,20}"
+)
+
+#: (占位前缀, 正则) —— 顺序即替换顺序;占位符形如 [PHONE_1]。
+PII_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("ID", PII_ID_CARD_RE),
+    ("PHONE", PII_PHONE_RE),
+    ("ADDR", PII_ADDRESS_RE),
+)
+
+#: 反解用的占位符形状;只把"本进程本轮真实分配过"的占位符换回原文。
+PII_PLACEHOLDER_RE = re.compile(r"\[(?:ID|PHONE|ADDR)_\d+\]")
+
+
+# ---------------------------------------------------------------------------
+# W7-4:坐席建议回复的承诺性话术禁词(命中即删整句,不整段重写)
+# ---------------------------------------------------------------------------
+#: 到账时间承诺:"3 个工作日内到账""明天退款""24 小时退回"等。
+COMMITMENT_ETA_RE = re.compile(
+    r"(?:\d+\s*(?:个)?工作日|\d+\s*(?:个)?小时|\d+\s*天|今天|当天|今日|明天|明日|次日)"
+    r"[^,。;!?！?]{0,12}?(?:到账|退回|退款|原路返回|返还)"
+)
+
+#: 金额承诺:"赔偿 200 元""补偿您 50 元"等。
+COMMITMENT_AMOUNT_RE = re.compile(
+    r"(?:赔偿|赔付|补偿|补偿金)[^,。;!?！?]{0,12}?(?:\d+(?:\.\d+)?\s*元|\d+\s*(?:元|块))"
+)
+
+#: 兜底承诺动词:"保证退款""一定到账""100% 退"等。
+COMMITMENT_GUARANTEE_RE = re.compile(
+    r"(?:保证|承诺|一定|百分百|100\s*%|包退|包赔)"
+    r"[^,。;!?！?]{0,16}?(?:退款|退货|到账|赔偿|赔付|退回)"
+)
+
+COMMITMENT_BAN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    COMMITMENT_ETA_RE,
+    COMMITMENT_AMOUNT_RE,
+    COMMITMENT_GUARANTEE_RE,
+)
+
+#: 分句:保留标点,逐句判断,避免把整段建议都删掉。
+SENTENCE_SPLIT_RE = re.compile(r"[^。！？!?\n]*[。！？!?\n]?")
+
+
+def has_commitment_claim(text: str) -> bool:
+    """文本是否含承诺性话术(到账时间/赔偿金额/保证类)。"""
+    body = str(text or "")
+    return any(pattern.search(body) for pattern in COMMITMENT_BAN_PATTERNS)
+
+
+def split_sentences(text: str) -> list[str]:
+    """按中英文句末标点与换行切句,标点留在原句尾。"""
+    body = str(text or "")
+    if not body:
+        return []
+    parts = [part for part in SENTENCE_SPLIT_RE.findall(body) if part]
+    return parts
+
+
+def strip_commitment_sentences(text: str) -> str:
+    """剔除含承诺性话术的整句,其余句子原样保留(顺序不变)。
+
+    若剔除后为空,返回空串由调用方决定兜底话术(不做新的承诺)。
+    """
+    kept = [part for part in split_sentences(text) if not has_commitment_claim(part)]
+    return "".join(kept).strip()

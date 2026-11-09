@@ -493,3 +493,203 @@ def test_agent_frontend_served_without_cdn(client):
     joined = (page.text + js.text + client.get("/style.css").text).lower()
     for banned in ("cdn.", "unpkg", "jsdelivr", "webpack", "vite", "npm "):
         assert banned not in joined, f"前端不得依赖 CDN/构建工具: {banned}"
+
+
+# ===========================================================================
+# W7-4 Copilot 建议回复(suggest):结构 / 禁词剔除 / GET 缓存 / 前端 DOM 静态断言
+# ===========================================================================
+
+from sqlalchemy import select  # noqa: E402  (W7-4 增量:校验 citations 来自真实条款)
+
+from app.api import agent as agent_api  # noqa: E402
+from app.guardrails import has_commitment_claim  # noqa: E402
+from app.models import KnowledgeItem, TicketMessage  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _clear_suggest_cache():
+    """建议结果是进程内缓存;每个用例前清空,避免跨用例串数据。"""
+    agent_api._SUGGEST_CACHE.clear()
+    yield
+    agent_api._SUGGEST_CACHE.clear()
+
+
+def _add_ticket_message(
+    engine,
+    ticket_id: str,
+    author_type: str,
+    content: str,
+    *,
+    is_internal: bool = False,
+    created_at: datetime | None = None,
+) -> None:
+    """直接落一条工单消息(绕过图,专测 suggest 的转录输入)。"""
+    with Session(engine) as db:
+        db.add(
+            TicketMessage(
+                ticket_id=ticket_id,
+                author_type=author_type,
+                content=content,
+                is_internal=is_internal,
+                created_at=created_at or datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+
+
+def _policy_pairs(engine) -> set[tuple[str, str]]:
+    """商户知识库里的真实 (clause_id, version) 集合。"""
+    with Session(engine) as db:
+        rows = db.execute(
+            select(KnowledgeItem.clause_id, KnowledgeItem.version).where(
+                KnowledgeItem.merchant_id == MERCHANT_ID
+            )
+        ).all()
+    return {(row[0], row[1]) for row in rows if row[0]}
+
+
+def _make_suggest_ticket(engine, ticket_id: str, *, status: str = "claimed") -> str:
+    """建一张有买家转录的工单(商户 seed-merchant-1,已加载政策语料)。"""
+    _add_ticket(
+        engine,
+        ticket_id,
+        merchant=MERCHANT_ID,
+        status=status,
+        claimed_by="seed-agent-1" if status != "queued" else None,
+        summary="买家反馈商品质量问题,要求退款",
+    )
+    _add_ticket_message(engine, ticket_id, "user", "收到的锅是坏的,我要退款,这是质量问题")
+    _add_ticket_message(engine, ticket_id, "agent", "您好,我帮您看看")
+    return ticket_id
+
+
+def test_suggest_post_structure_and_real_citations(client, engine):
+    ticket_id = _make_suggest_ticket(engine, "tk-wb-suggest-1")
+    resp = client.post(f"/api/b/tickets/{ticket_id}/suggest")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    data = body["data"]
+
+    for key in (
+        "summary", "suggested_reply", "citations", "mock", "model", "generated_at",
+    ):
+        assert key in data, f"suggest 响应缺少键: {key}"
+    assert data["mock"] is True
+    assert data["model"] == "rule-suggest-v1 (MOCK)"
+    assert data["ticket_id"] == ticket_id
+    assert data["generated_at"]
+
+    assert data["summary"].strip(), "摘要不能为空"
+    assert len(data["summary"]) <= 120, "摘要必须 ≤120 字"
+    assert data["suggested_reply"].strip(), "建议回复不能为空"
+    assert not has_commitment_claim(data["suggested_reply"]), "建议回复不得含承诺性话术"
+    assert not has_commitment_claim(data["summary"]), "摘要不得含承诺性话术"
+
+    # citations 必须来自真实的 kb 条款(条款号 + 版本都能在库里对上)
+    assert data["citations"], "质量问题查询应命中政策条款"
+    pairs = _policy_pairs(engine)
+    for citation in data["citations"]:
+        assert set(citation) == {"clause_id", "version", "score"}
+        assert (citation["clause_id"], citation["version"]) in pairs
+        assert citation["score"] > 0
+    # 摘要里要带命中的条款 id(任务书:含关键诉求与命中的条款 id)
+    assert any(c["clause_id"] in data["summary"] for c in data["citations"])
+
+
+def test_suggest_strips_commitment_sentences_via_monkeypatch(client, engine, monkeypatch):
+    """monkeypatch 模板注入承诺句 → 整句剔除;全被剔除时给确定性兜底话术。"""
+    ticket_id = _make_suggest_ticket(engine, "tk-wb-suggest-strip")
+
+    def _draft(*args, **kwargs):
+        return {
+            "summary": "买家要求退款。退款将在 3 个工作日内到账。",
+            "suggested_reply": "退款将在 3 个工作日内到账。我们赔偿 200 元。",
+        }
+
+    monkeypatch.setattr(agent_api, "_compose_suggestion", _draft)
+    resp = client.post(f"/api/b/tickets/{ticket_id}/suggest")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+
+    assert "3 个工作日" not in data["suggested_reply"]
+    assert "200 元" not in data["suggested_reply"]
+    assert data["suggested_reply"] == agent_api._SUGGEST_FALLBACK_REPLY
+    assert "尽快核实处理" in data["suggested_reply"]
+    assert not has_commitment_claim(data["suggested_reply"])
+
+    # 摘要里只剔除含承诺的那句,其余保留
+    assert "3 个工作日" not in data["summary"]
+    assert data["summary"] == "买家要求退款。"
+    assert not has_commitment_claim(data["summary"])
+
+
+def test_suggest_closed_ticket_conflict(client, engine):
+    ticket_id = _make_suggest_ticket(engine, "tk-wb-suggest-closed", status="closed")
+    resp = client.post(f"/api/b/tickets/{ticket_id}/suggest")
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "STATE_CONFLICT"
+    assert "已关闭" in error["message"]
+
+
+def test_suggest_unknown_ticket_404(client):
+    post = client.post("/api/b/tickets/no-such-suggest/suggest")
+    assert post.status_code == 404, post.text
+    assert post.json()["error"]["code"] == "NOT_FOUND"
+    get = client.get("/api/b/tickets/no-such-suggest/suggest")
+    assert get.status_code == 404, get.text
+    assert get.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_suggest_get_returns_cache_only_after_post(client, engine):
+    """GET 无缓存 → data:null;POST 后 GET 返回最近一次结果;重复 GET 无副作用。"""
+    ticket_id = _make_suggest_ticket(engine, "tk-wb-suggest-cache")
+    path = f"/api/b/tickets/{ticket_id}/suggest"
+
+    first = client.get(path)
+    assert first.status_code == 200, first.text
+    assert first.json() == {"ok": True, "data": None}
+    second = client.get(path)
+    assert second.json() == {"ok": True, "data": None}, "GET 不得写缓存(无副作用)"
+
+    posted = client.post(path)
+    assert posted.status_code == 200, posted.text
+    generated = posted.json()["data"]
+
+    cached = client.get(path).json()
+    assert cached["ok"] is True
+    assert cached["data"]["suggested_reply"] == generated["suggested_reply"]
+    assert cached["data"]["summary"] == generated["summary"]
+    assert cached["data"]["generated_at"] == generated["generated_at"]
+    assert cached["data"]["mock"] is True
+    # 再 GET 一次,结果保持不变(仍无副作用)
+    assert client.get(path).json() == cached
+
+
+def test_agent_workbench_suggest_dom_keywords():
+    """静态断言:TestClient 不执行 JS,只校验前端源码里的按钮 id / 绑定 / 填入目标。"""
+    root = Path(__file__).resolve().parents[2]
+    html = (root / "frontend" / "agent.html").read_text(encoding="utf-8")
+    js = (root / "frontend" / "agent.js").read_text(encoding="utf-8")
+
+    for dom_id in (
+        "suggestPanel", "suggest-btn", "suggest-summary", "suggest-reply",
+        "fill-reply-btn",
+    ):
+        assert f'id="{dom_id}"' in html, f"工作台详情面板缺少 DOM id: {dom_id}"
+        assert f'getElementById("{dom_id}")' in js, f"agent.js 未绑定 DOM id: {dom_id}"
+
+    assert 'els.suggestBtn.addEventListener("click"' in js
+    assert 'els.fillReplyBtn.addEventListener("click"' in js
+    assert '"/suggest"' in js, "agent.js 必须调用 suggest 接口"
+    assert "payload.suggested_reply" in js, "前端必须读取建议回复字段"
+    assert 'textarea.id = "reply-input"' in js
+    assert 'querySelector("#reply-input")' in js
+    assert ".value = els.suggestReply.value" in js
+
+    # 一键填入只写回复框,不自动发送(messages 接口不得出现在填入逻辑里)
+    fill_block = js.split("function fillReplyFromSuggestion()")[1].split(
+        "/* --------------------------------- 动作"
+    )[0]
+    assert "/messages" not in fill_block, "填入建议不得自动发送回复"

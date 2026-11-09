@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from app.api import get_db
 from app.db import utc_now
 from app.graph import build as graph_build
 from app.main import app
-from app.models import ChatSession, RefundRequest, Ticket
+from app.models import ChatMessage, ChatSession, RefundRequest, Ticket
 from app.tools.events import get_confirm
 from scripts.seed import seed
 
@@ -249,6 +250,59 @@ def test_reject_twice_is_idempotent(client):
     second = client.post(f"/api/c/confirm/{token}/reject", json={"thread_id": thread_id})
     assert second.status_code == 200
     assert second.json()["idempotent"] is True
+
+
+def test_reject_concurrent_is_single_shot(client, engine):
+    """W7-6:同一张卡的并发 reject 只有一个真正执行,其余回放幂等回执。
+
+    四个线程同时进入 reject:每 token 一把锁把"读状态 → resume → 置 cancelled"
+    变成临界区;第一个赢家真正落终态,其余在锁内重读后走 cancelled 幂等回执。
+    断言:没有异常/409(win32 上由 API 抛出的 StateConflictError 会进 errors)、
+    ``idempotent=False`` 恰好一次、确认卡只迁移一次、assistant 终态回复只补一条。
+    """
+    body = start_refund(client)
+    thread_id = body["session_id"]
+    token = body["pending_confirm"]["confirm_token"]
+
+    from app.api import confirm as confirm_api
+
+    workers = 4
+    barrier = threading.Barrier(workers)
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        db = Session(engine)
+        try:
+            barrier.wait(timeout=5)
+            out = confirm_api.reject(
+                token, confirm_api.ThreadRef(thread_id=thread_id), db=db
+            )
+            results.append(out)
+        except BaseException as exc:  # noqa: BLE001 - 并发下任何异常都算失败
+            errors.append(exc)
+        finally:
+            db.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert errors == [], f"并发 reject 不应抛异常/409: {errors!r}"
+    assert len(results) == workers
+    assert all(out["decision"] == "rejected" for out in results)
+    assert sum(1 for out in results if not out["idempotent"]) == 1, results
+
+    with Session(engine) as db:
+        assert count(db, RefundRequest) == 0
+        card = get_confirm(db, token)
+        assert card is not None and card.status == "cancelled"
+        reject_replies = db.scalars(
+            select(ChatMessage).where(ChatMessage.intent == "confirm_reject")
+        ).all()
+        assert len(reject_replies) == 1, "拒绝终态回复只能补一条(不双写)"
 
 
 # ---------------------------------------------------------------------------

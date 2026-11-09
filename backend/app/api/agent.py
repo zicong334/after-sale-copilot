@@ -16,7 +16,9 @@
 - ``GET  /tickets/{id}``:工单详情 + 全量消息(created_at asc);
 - ``POST /tickets/{id}/claim``:领单(被抢 → 409「已被他人领取」);
 - ``POST /tickets/{id}/messages``:坐席回复(author_type=agent,关单后 409);
-- ``POST /tickets/{id}/close``:关单(重复关单 409)。
+- ``POST /tickets/{id}/close``:关单(重复关单 409);
+- ``POST /tickets/{id}/suggest``:Copilot 建议回复(W7-4,规则模板 MOCK);
+- ``GET  /tickets/{id}/suggest``:读取最近一次建议(进程内缓存,只读无副作用)。
 """
 
 from __future__ import annotations
@@ -32,8 +34,15 @@ from sqlalchemy.orm import Session
 from app.api import get_db
 from app.db import utc_now
 from app.errors import AppError, NotFoundError, StateConflictError
-from app.guardrails import handoff_reason_label
-from app.models import Ticket, TicketMessage
+from app.guardrails import (
+    handoff_reason_label,
+    has_commitment_claim,
+    strip_commitment_sentences,
+)
+from app.models import KnowledgeItem, Ticket, TicketMessage
+from app.retrieval.base import RetrievedChunk
+from app.retrieval.bm25_backend import DEFAULT_THRESHOLD, BM25Backend
+from app.retrieval.chunker import PolicyChunk
 from app.services import tickets as ticket_svc
 
 router = APIRouter(prefix="/api/b", tags=["agent-workbench"])
@@ -297,3 +306,164 @@ def close_ticket(
     if payload is not None and payload.service_id:
         body["closed_by"] = payload.service_id
     return body
+
+
+# ---------------------------------------------------------------------------
+# W7-4:Copilot 建议回复(规则模板,标 MOCK;不发起真实 LLM 调用)
+# ---------------------------------------------------------------------------
+
+#: MOCK:确定性规则模板版本串;本接口不调用任何真实模型,响应里显式标注。
+_SUGGEST_MODEL = "rule-suggest-v1 (MOCK)"
+#: 建议回复被禁词整句剔除后为空时的兜底话术(不承诺时效/金额)。
+_SUGGEST_FALLBACK_REPLY = "已收到您的问题,我们会尽快核实处理,请以实际处理结果为准。"
+#: 摘要被禁词剔除后为空时的兜底摘要(同样不含承诺)。
+_SUGGEST_FALLBACK_SUMMARY = "买家诉求待坐席进一步核实。"
+#: 摘要字数上限(任务书 W7-4:≤120 字)。
+_SUGGEST_SUMMARY_MAX = 120
+#: POST 生成结果的进程内缓存(按 ticket_id);GET 只读缓存,不产生副作用。
+_SUGGEST_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _suggest_user_texts(messages: list[TicketMessage]) -> list[str]:
+    """取买家可见消息正文(created_at asc),作为生成建议的转录输入。"""
+    return [
+        message.content.strip()
+        for message in messages
+        if message.author_type == "user"
+        and not message.is_internal
+        and message.content.strip()
+    ]
+
+
+def _suggest_query(ticket: Ticket, user_texts: list[str]) -> str:
+    """用最后 3 条买家消息 + 工单摘要拼检索 query(无消息时用摘要兜底)。"""
+    parts = user_texts[-3:]
+    if ticket.summary:
+        parts.append(ticket.summary)
+    return " ".join(parts).strip()
+
+
+def _suggest_citations(
+    db: Session, merchant_id: str, query: str, top_k: int = 3
+) -> list[RetrievedChunk]:
+    """从商户知识库重建 BM25 索引并检索真实条款;未覆盖时返回空列表(不编造)。"""
+    if not query:
+        return []
+    rows = db.execute(
+        select(KnowledgeItem).where(
+            KnowledgeItem.merchant_id == merchant_id,
+            KnowledgeItem.deleted_at.is_(None),
+            KnowledgeItem.clause_id.is_not(None),
+        )
+    ).scalars().all()
+    chunks = [
+        PolicyChunk(
+            clause_id=row.clause_id or "",
+            version=row.version,
+            title=row.title or "",
+            text=row.content,
+            effective_date="",
+        )
+        for row in rows
+    ]
+    backend = BM25Backend()
+    backend.build(chunks)
+    return backend.search(query, top_k=top_k, threshold=DEFAULT_THRESHOLD).results
+
+
+def _compose_suggestion(
+    ticket: Ticket, user_texts: list[str], citations: list[RetrievedChunk]
+) -> dict[str, str]:
+    """MOCK:规则模板生成 ``{summary, suggested_reply}``,不调用真实模型。
+
+    确定性拼装:摘要 = 关键诉求 + 命中条款号;建议回复 = 致谢 + 条款依据 +
+    处理中说明,模板本身不含时效/金额承诺;调用方仍统一过禁词剔除。
+    monkeypatch 本函数即可测试禁词剔除分支(测试注入含承诺的草稿)。
+    """
+    demand = (user_texts[-1] if user_texts else (ticket.summary or "")).strip()
+    demand = demand[:60] or "买家转人工咨询售后问题"
+    clause_ids = "、".join(chunk.clause_id for chunk in citations[:2])
+    if clause_ids:
+        summary = f"买家诉求:{demand};命中条款:{clause_ids}"
+    else:
+        summary = f"买家诉求:{demand};政策未覆盖,需坐席人工核实"
+
+    if clause_ids:
+        body = f"经核对店铺相关政策条款({clause_ids}),我们会按政策为您跟进核实。"
+    else:
+        body = "您的诉求已记录,我们会尽快为您核实处理。"
+    return {
+        "summary": summary,
+        "suggested_reply": (
+            "您好,已收到您反馈的问题。" + body + "处理结果会通过本工单同步给您,请以实际处理结果为准。"
+        ),
+    }
+
+
+@router.post("/tickets/{ticket_id}/suggest")
+def suggest_reply(ticket_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """生成建议回复:工单转录 + 命中条款 → ``{summary, suggested_reply}``。
+
+    - 规则模板 + MOCK 标注(``mock``/``model``),不发起真实 LLM 调用;
+    - 摘要与建议回复都过 ``has_commitment_claim`` / ``strip_commitment_sentences``,
+      剔除含到账时间/赔偿金额的整句;剔除后为空则给确定性兜底话术;
+    - 工单不存在 404;已关闭工单按现有写接口风格返回 409(关单后无法再回复)。
+    """
+    ticket = _get_ticket(db, ticket_id)
+    if ticket.status == "closed":
+        raise StateConflictError(
+            "工单已关闭,不能生成建议回复",
+            ticket.status,
+            param="status",
+        )
+    messages = list(
+        db.scalars(
+            select(TicketMessage)
+            .where(TicketMessage.ticket_id == ticket_id)
+            .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
+        ).all()
+    )
+    user_texts = _suggest_user_texts(messages)
+    citations = _suggest_citations(
+        db, ticket.merchant_id, _suggest_query(ticket, user_texts)
+    )
+    draft = _compose_suggestion(ticket, user_texts, citations)
+
+    summary = str(draft.get("summary") or "").strip()
+    if has_commitment_claim(summary):
+        summary = strip_commitment_sentences(summary)
+    summary = summary[:_SUGGEST_SUMMARY_MAX] or _SUGGEST_FALLBACK_SUMMARY
+
+    suggested_reply = str(draft.get("suggested_reply") or "").strip()
+    if has_commitment_claim(suggested_reply):
+        suggested_reply = strip_commitment_sentences(suggested_reply)
+    suggested_reply = suggested_reply or _SUGGEST_FALLBACK_REPLY
+
+    data: dict[str, Any] = {
+        "ticket_id": ticket.id,
+        "summary": summary,
+        "suggested_reply": suggested_reply,
+        "citations": [
+            {
+                "clause_id": chunk.clause_id,
+                "version": chunk.version,
+                "score": round(float(chunk.score), 4),
+            }
+            for chunk in citations
+        ],
+        "mock": True,
+        "model": _SUGGEST_MODEL,
+        "generated_at": _iso(utc_now()),
+    }
+    _SUGGEST_CACHE[ticket.id] = data
+    return {"ok": True, "data": data}
+
+
+@router.get("/tickets/{ticket_id}/suggest")
+def get_suggestion(ticket_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """读取最近一次生成结果(进程内缓存按 ticket_id);无缓存返回 ``data=null``。
+
+    GET 只读缓存、不写任何状态,因此重复调用不会改变后续 GET 的结果。
+    """
+    ticket = _get_ticket(db, ticket_id)
+    return {"ok": True, "data": _SUGGEST_CACHE.get(ticket.id)}

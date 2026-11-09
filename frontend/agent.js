@@ -6,6 +6,8 @@
  *   POST /api/b/tickets/{id}/claim      {service_id}
  *   POST /api/b/tickets/{id}/messages   {service_id, content, is_internal?}
  *   POST /api/b/tickets/{id}/close      {service_id?}
+ *   POST /api/b/tickets/{id}/suggest     → {data:{summary, suggested_reply, citations, mock}}
+ *   GET  /api/b/tickets/{id}/suggest     → 最近一次建议(进程内缓存)
  * 409 时 toast 后端 message(含「已被他人领取」)。
  */
 (function () {
@@ -45,6 +47,11 @@
     refreshBtn: document.getElementById("refreshBtn"),
     detailEmpty: document.getElementById("detailEmpty"),
     detailBody: document.getElementById("detailBody"),
+    suggestPanel: document.getElementById("suggestPanel"),
+    suggestBtn: document.getElementById("suggest-btn"),
+    suggestSummary: document.getElementById("suggest-summary"),
+    suggestReply: document.getElementById("suggest-reply"),
+    fillReplyBtn: document.getElementById("fill-reply-btn"),
     toastWrap: document.getElementById("toastWrap")
   };
 
@@ -54,6 +61,7 @@
     tickets: [],
     selectedId: null,
     selectedTicket: null,
+    suggestTicketId: null,
     loadingQueue: false,
     detailBusy: false,
     timer: null
@@ -403,6 +411,7 @@
     var reply = el("div", "reply-box");
     reply.appendChild(el("div", "section-title", "回复买家"));
     var textarea = el("textarea");
+    textarea.id = "reply-input";
     textarea.placeholder = "以「人工客服」身份回复买家…(演示环境,内容会落库)";
     textarea.setAttribute("aria-label", "回复买家内容");
     reply.appendChild(textarea);
@@ -431,6 +440,8 @@
       sendBtn.disabled = true;
     }
     els.detailBody.appendChild(reply);
+
+    showSuggestPanel(ticket);
   }
 
   async function loadDetail(ticketId) {
@@ -444,6 +455,7 @@
     els.detailEmpty.classList.add("hidden");
     els.detailBody.classList.remove("hidden");
     els.detailBody.textContent = "";
+    els.suggestPanel.classList.add("hidden");
     els.detailBody.appendChild(el("div", "panel-state", "正在加载工单详情…"));
     try {
       var data = await api("/api/b/tickets/" + encodeURIComponent(ticketId));
@@ -453,6 +465,7 @@
     } catch (err) {
       if (state.selectedId !== ticketId) return;
       els.detailBody.textContent = "";
+      els.suggestPanel.classList.add("hidden");
       var box = el("div", "panel-state error");
       box.appendChild(el("div", "state-icon", "!"));
       box.appendChild(document.createTextNode("工单详情加载失败:" + errorMessage(err)));
@@ -462,6 +475,61 @@
       retry.addEventListener("click", function () { loadDetail(ticketId); });
       els.detailBody.appendChild(retry);
     }
+  }
+
+  /* ------------------ Copilot 建议回复(W7-4,MOCK 规则模板) ------------------ */
+
+  function resetSuggestion() {
+    els.suggestSummary.textContent = "尚未生成建议。";
+    els.suggestSummary.classList.add("empty-text");
+    els.suggestReply.value = "";
+    els.fillReplyBtn.disabled = true;
+  }
+
+  function showSuggestPanel(ticket) {
+    els.suggestPanel.classList.remove("hidden");
+    if (state.suggestTicketId !== ticket.ticket_id) {
+      state.suggestTicketId = ticket.ticket_id;
+      resetSuggestion();
+    }
+    els.suggestBtn.disabled = ticket.status === "closed";
+    els.suggestBtn.textContent = "生成建议";
+  }
+
+  async function suggestReply(ticket, btn) {
+    btn.disabled = true;
+    btn.textContent = "生成中…";
+    try {
+      var data = await postJSON(
+        "/api/b/tickets/" + encodeURIComponent(ticket.ticket_id) + "/suggest", {});
+      var payload = data.data || {};
+      els.suggestSummary.textContent = payload.summary || "暂无摘要";
+      els.suggestSummary.classList.remove("empty-text");
+      els.suggestReply.value = payload.suggested_reply || "";
+      els.fillReplyBtn.disabled = !els.suggestReply.value;
+      toast("建议已生成(MOCK 规则模板,仅供坐席参考)", "success");
+    } catch (err) {
+      toast("生成建议失败:" + errorMessage(err), "error");
+    } finally {
+      btn.textContent = "生成建议";
+      btn.disabled = ticket.status === "closed";
+    }
+  }
+
+  function fillReplyFromSuggestion() {
+    var text = els.suggestReply.value.trim();
+    if (!text) {
+      toast("还没有可填入的建议回复", "error");
+      return;
+    }
+    var target = els.detailBody.querySelector("#reply-input");
+    if (!target) {
+      toast("回复框尚未就绪,请重新打开工单", "error");
+      return;
+    }
+    target.value = els.suggestReply.value;
+    target.focus();
+    toast("已填入回复框,请确认或编辑后发送", "success");
   }
 
   /* --------------------------------- 动作 --------------------------------- */
@@ -548,6 +616,17 @@
     state.statusFilter = chip.getAttribute("data-status") || "";
     loadQueue();
   });
+
+  /* W7-4:生成建议 + 一键填入回复框(只填入不发送,坐席可编辑) */
+  els.suggestBtn.addEventListener("click", function () {
+    if (!state.selectedTicket || !state.selectedId) {
+      toast("请先选择工单", "error");
+      return;
+    }
+    suggestReply(state.selectedTicket, els.suggestBtn);
+  });
+
+  els.fillReplyBtn.addEventListener("click", fillReplyFromSuggestion);
 
   /* --------------------------------- 启动 --------------------------------- */
 

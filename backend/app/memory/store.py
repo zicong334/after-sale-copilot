@@ -17,7 +17,7 @@ import re
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import bindparam, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import utc_now
@@ -142,6 +142,12 @@ def soft_delete(session: Session, memory_id: str, *, now=None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+#: 单次注入查询的硬上限(W7-6 第二道闸)。
+#: 第一道闸在注入侧 ``app/graph/nodes.py::_cap_memory``(条数/字符双封顶);
+#: 这里在 SQL 层再封顶,防止调用方绕过注入侧(或注入侧封顶被改坏)时一次拉爆。
+QUERY_MEMORIES_LIMIT = 50
+
+
 def query_memories(
     session: Session,
     *,
@@ -155,6 +161,10 @@ def query_memories(
 
     固定排序 (scope, type, created_at, id):同一份记忆每次注入的顺序完全一致,
     利于 KV cache(03§4.2.4 三时机之一)。
+
+    结果按 ``QUERY_MEMORIES_LIMIT`` 封顶(W7-6):这是注入侧 ``_cap_memory``
+    条数/字符封顶之外的**第二道闸**——正常调用方拿不到多于 50 条,行为不变;
+    万一调用方绕过注入侧封顶,这里也不会一次把全库拉进内存。
     """
     now = now or utc_now()
     stmt = select(Memory).where(
@@ -173,7 +183,7 @@ def query_memories(
         Memory.type.asc(),
         Memory.created_at.asc(),
         Memory.id.asc(),
-    )
+    ).limit(bindparam("limit", QUERY_MEMORIES_LIMIT))
     return list(session.scalars(stmt))
 
 

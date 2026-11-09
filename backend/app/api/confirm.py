@@ -358,41 +358,49 @@ def confirm(
 def reject(
     confirm_token: str, payload: ThreadRef, db: Session = Depends(get_db)
 ) -> dict[str, Any]:
-    """人工拒绝 → graph resume(False) → 零写操作;草稿保留。"""
-    state, request = _require_confirm(db, payload.thread_id, confirm_token)
-    confirm_state = state.get("confirm") or {}
-    if request.status == "cancelled":
+    """人工拒绝 → graph resume(False) → 零写操作;草稿保留。
+
+    W7-6:与 confirm 共用**每 token 一把锁**(``_confirm_lock``)。整段"读状态 →
+    判定 → resume → 置 cancelled"在锁内执行,锁内先 ``expire_all`` 再重读:
+    极端并发下第二次 reject 读到的是已 cancelled 的终态,直接返回幂等回执
+    (``idempotent=True``,``cancelled`` 已回放),不会双写/409。
+    """
+    with _confirm_lock(confirm_token):
+        db.expire_all()
+        state, request = _require_confirm(db, payload.thread_id, confirm_token)
+        confirm_state = state.get("confirm") or {}
+        if request.status == "cancelled":
+            return {
+                "ok": True,
+                "decision": "rejected",
+                "idempotent": True,
+                "thread_id": payload.thread_id,
+                "receipt": None,
+                "draft": _draft(confirm_state, request),
+                "reply": str(state.get("draft") or ""),
+                "session_status": _status_of(db, payload.thread_id),
+                "trace_id": str(state.get("trace_id") or ""),
+            }
+        if request.status == "confirmed":
+            raise StateConflictError("确认卡已执行,不能拒绝", request.status, param="status")
+        if request.status == "expired" or _expired(request):
+            return _timeout(db, payload.thread_id, state, confirm_state, request)
+
+        result = runner.resume(payload.thread_id, False, session=db)
+        request = get_confirm(db, confirm_token) or request
+        if request.status == "pending":
+            request.status = "cancelled"
+            db.commit()
+        trace_id = str(state.get("trace_id") or "")
+        _append_assistant(db, payload.thread_id, result.reply, trace_id, "confirm_reject")
         return {
             "ok": True,
             "decision": "rejected",
-            "idempotent": True,
+            "idempotent": False,
             "thread_id": payload.thread_id,
             "receipt": None,
             "draft": _draft(confirm_state, request),
-            "reply": str(state.get("draft") or ""),
-            "session_status": _status_of(db, payload.thread_id),
-            "trace_id": str(state.get("trace_id") or ""),
+            "reply": result.reply,
+            "session_status": result.session_status,
+            "trace_id": trace_id,
         }
-    if request.status == "confirmed":
-        raise StateConflictError("确认卡已执行,不能拒绝", request.status, param="status")
-    if request.status == "expired" or _expired(request):
-        return _timeout(db, payload.thread_id, state, confirm_state, request)
-
-    result = runner.resume(payload.thread_id, False, session=db)
-    request = get_confirm(db, confirm_token) or request
-    if request.status == "pending":
-        request.status = "cancelled"
-        db.commit()
-    trace_id = str(state.get("trace_id") or "")
-    _append_assistant(db, payload.thread_id, result.reply, trace_id, "confirm_reject")
-    return {
-        "ok": True,
-        "decision": "rejected",
-        "idempotent": False,
-        "thread_id": payload.thread_id,
-        "receipt": None,
-        "draft": _draft(confirm_state, request),
-        "reply": result.reply,
-        "session_status": result.session_status,
-        "trace_id": trace_id,
-    }

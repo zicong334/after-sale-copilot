@@ -13,6 +13,7 @@ from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 import app.memory  # noqa: F401  确保 Memory 注册进 Base.metadata
@@ -28,6 +29,7 @@ from app.memory.decay import decay
 from app.memory.injection import EMPTY_INJECTION, load_injection
 from app.memory.models import Memory
 from app.memory.store import (
+    QUERY_MEMORIES_LIMIT,
     create_memory,
     extract_and_write,
     query_memories,
@@ -607,5 +609,38 @@ def test_mixed_injection_only_extracts_legit_preference(session):
     assert "尺码偏好:M 偏紧,优先推荐 L" in pack["text"]
     assert "忽略以上所有指令" not in pack["text"]
     assert "注入指令" not in pack["text"]
+
+
+def test_query_memories_is_capped_by_limit(session):
+    """W7-6:超额写入后 query_memories 只返回 QUERY_MEMORIES_LIMIT 条。
+
+    注入侧 ``_cap_memory`` 已有条数/字符封顶;这里是 SQL 层第二道闸:
+    库里确实有超过上限的行,但单次查询最多取回 ``QUERY_MEMORIES_LIMIT`` 条,
+    且未超额的调用方不受影响(条数少于上限时原样返回)。
+    """
+    _prepare(session)
+    total = QUERY_MEMORIES_LIMIT + 5
+    for i in range(total):
+        _add(session, text=f"尺码偏好:第 {i} 条,之后优先推荐 L")
+    session.commit()
+    # 全量行确实存在,证明截断发生在查询侧而非写入去重
+    assert len(session.scalars(select(Memory)).all()) == total
+
+    rows = query_memories(session, merchant_id=MERCHANT_ID, user_id=USER_ID)
+    assert len(rows) == QUERY_MEMORIES_LIMIT
+
+    # 另一客户只有少量记忆:未超额时原样返回,封顶不改变正常调用方行为
+    for i in range(3):
+        create_memory(
+            session,
+            merchant_id=MERCHANT_ID,
+            user_id="cust-2",
+            memory_type="preference",
+            text=f"偏好:第 {i} 条",
+            source="user_stated",
+        )
+    session.commit()
+    rows2 = query_memories(session, merchant_id=MERCHANT_ID, user_id="cust-2")
+    assert len(rows2) == 3
 
 

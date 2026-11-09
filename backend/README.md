@@ -96,7 +96,7 @@ run_eval.bat
 ## 5. 测试
 
 ```bat
-:: 全量测试(396 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(434 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
@@ -114,7 +114,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:396 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:434 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -161,6 +161,26 @@ set PYTHONPATH=%CD%\backend
 | W6-A5 套提示/上下文擦除硬拦截 | prompt 套取 / 越狱扮演 / 索要凭据 | `guardrails.PROMPT_PROBE_RULES/detect_prompt_probe` + `perception.flags` + `nodes.perceive/classify/act` | 命中即 `prompt_probe` flag → 图前拦截(只写 `graph__prompt_probe_block` 一条事件,不进 classify、零工具、零记忆写入),回复固定安全话术;会话下一轮不受污染。**纯"忽略以上指令+正当诉求"仍走 FIX-3 软剥离路径,不升级为硬拦截** |
 
 护栏单测:`backend/tests/test_guardrails.py`(纯函数);图级回归:`backend/tests/test_graph.py` 第 6 节(`fix1/fix3/fix4/fix5/fix7/fix8/fix9`);破坏性对抗包:`backend/tests/test_destructive.py`(A1-A8,含 W6-A4/A5)。
+
+### 7.2 生产卫生清单(W7)
+
+> 原则:每项都是确定性守卫或可单测的接口行为,不依赖真模型;涉及模型的建议/降级在代码与文案里标注 `MOCK`。
+> PII 与降级用「捕获断言」验收:Fake/Spy LLM 捕获出网消息只见占位符;stub 抛错时响应 `degraded:true` 且本轮零写操作。
+
+| 项 | 实现位置 | 确定性语义 | 单测 |
+|---|---|---|---|
+| W7-1 PII 脱敏 | `app/guardrails.py`(PII 正则常量)、`app/pii.py`(`PIIMasker`/`MaskingLLM`)、`app/api/chat.py`(接线) | 手机号/18 位身份证/地址(启发式)→ `[PHONE_n]`/`[ID_n]`/`[ADDR_n]`;LLM 出网前统一 mask、回包 restore;chat_message 存原文、tool_events payload 存 mask 后文本;响应带 `pii_restore` 映射供前端反解 | `tests/test_pii.py` |
+| W7-2 LLM 降级 | `app/api/chat.py`(`_degraded_result` + SAVEPOINT) | 对话路径遇 5xx/429/超时/空正文耗尽 → 固定安全话术 + `degraded:true` + `llm_degraded` 事件;回滚本轮写操作(用户消息先 flush 保留),不裸抛 500;话术不声称已退款/已转接;评测路径的 `LLMBatchAbort` 语义不变 | `tests/test_degrade.py` |
+| W7-3 同义别名 | `app/retrieval/bm25_backend.py`(`QUERY_ALIASES`/`tokenize_query`) | 仅查询侧扩展 14 类口语别名(退钱/坏了/不想要了/穿不了/快递破…),索引构建与条款原文零改动;`DEFAULT_THRESHOLD=20.0` 与分布依据不变;9 问句修复前后分数表见模块 docstring | `tests/test_aliases.py` |
+| W7-4 坐席建议回复 | `app/api/agent.py`(`POST/GET /api/b/tickets/{id}/suggest`)、`frontend/agent.html` + `agent.js`(生成建议/一键填入) | 基于工单转录 + `policy__search` 命中条款生成 `summary/suggested_reply/citations`;承诺性话术(到账时间/赔偿金额/保证)整句剔除;`mock:true`、`model:"rule-suggest-v1 (MOCK)"`;GET 只读缓存、无副作用;一键填入只写回复框不自动发送 | `tests/test_agent_workbench.py`(suggest 6 例) |
+| W7-5 审计导出 | `scripts/export_audit.py` | `--trace-id` / `--refund-id` 导出单案审计 JSON:`case/actors/timeline/percepts/events/tool_events/citations/confirm/refund/integrity`;缺失字段显式 `null`;成功 stdout 恰好一个 JSON,失败退出码 2 且错误只进 stderr | `tests/test_audit.py` |
+| W7-6 W6 遗留加固 | `app/api/confirm.py`(reject 复用 per-token 锁)、`app/memory/store.py`(`QUERY_MEMORIES_LIMIT=50`) | reject 与 confirm 共用每 token 一把锁,锁内 `expire_all` 重读,极端并发第二次返回 cancelled 幂等回执而非 409/双写;记忆注入查询在 SQL 层硬封顶 50 条(注入侧 `_cap_memory` 之外的第二道闸) | `tests/test_confirm.py::test_reject_concurrent_is_single_shot`、`tests/test_memory.py::test_query_memories_is_capped_by_limit` |
+
+已知边界:PII 地址识别是**启发式**(省/市/区县 + 路/街/村/小区等特征词 + 尾串),可能连带吞掉紧邻的「地址/收货」2~4 字,
+但 `PIIMasker.restore` 基于映射表原样还原,不改变业务语义;未命中特征词的自由文本地址不保证脱敏。
+降级轮与 blocked 轮一致**不落 assistant 消息**(只保留用户消息),因此该 trace 的 `chat_messages` 只有 `user` 一条。
+W7-2 回滚边界:SAVEPOINT 只能回滚本轮**未提交**写入;若某工具已自行 `commit` 之后才发生 LLM 故障,
+已提交的工具写无法回收(降级仍返回 200 + 固定话术并记 `llm_degraded`);单测覆盖的是 LLM 首调失败这一「零写」路径。
 
 ## 8. 已知声明(交接必读)
 
@@ -239,7 +259,7 @@ backend/
 │                   tools/ / graph/ / memory/ / retrieval/ / eval/ / perception / schemas/ / trace
 ├── alembic/        0001_initial → 0002_add_tool_events → 0003_ticket_summary → 0004_memory → 0005_ticket_session_id
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          396 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
+├── tests/          434 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
 └── README.md       本文件
 
 frontend/           chat.html / app.js / agent.html / agent.js / style.css(原生实现,零 CDN、零构建)

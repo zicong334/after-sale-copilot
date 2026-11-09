@@ -61,6 +61,25 @@
           <p>队列按「待领取优先 + 最近消息倒序」排列;领取后即可回复买家。</p>
         </div>
         <div class="detail-body hidden" id="detailBody" aria-live="polite"></div>
+
+        <!-- W7-4 Copilot 建议回复:选择工单后由 agent.js 显示;MOCK 规则模板,不自动发送 -->
+        <div class="reply-box hidden" id="suggestPanel" aria-label="Copilot 建议回复"
+             style="margin:0 20px 20px">
+          <div class="reply-bar">
+            <span class="block-label">Copilot 建议回复<span class="demo-note">MOCK 规则模板</span></span>
+            <button class="btn btn-ghost btn-sm" id="suggest-btn" type="button">生成建议</button>
+          </div>
+          <div class="summary-block">
+            <span class="block-label">问题摘要</span>
+            <span class="summary-text empty-text" id="suggest-summary">尚未生成建议。</span>
+          </div>
+          <textarea id="suggest-reply" aria-label="建议回复内容"
+                    placeholder="点击「生成建议」后,建议回复会显示在这里…"></textarea>
+          <div class="reply-bar">
+            <span class="reply-hint">建议仅供参考,填入后可在回复框内编辑,不会自动发送。</span>
+            <button class="btn btn-ghost btn-sm" id="fill-reply-btn" type="button" disabled>填入回复框</button>
+          </div>
+        </div>
       </section>
     </main>
 
