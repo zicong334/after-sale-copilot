@@ -16,11 +16,54 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, utc_now
-from app.models import Merchant, Order, OrderItem, RefundRequest, Ticket, TicketMessage
+from app.models import (
+    AuthUser,
+    Merchant,
+    Order,
+    OrderItem,
+    RefundRequest,
+    Ticket,
+    TicketMessage,
+)
+from app.security import hash_password
 
 MERCHANT_ID = "seed-merchant-1"
 AGENT_1 = "seed-agent-1"
 AGENT_2 = "seed-agent-2"
+
+#: W8 演示账号(明文口令只写在 README「演示账号」节;库里只存 pbkdf2 哈希)。
+#: buyer 绑定 seed-cust-001/002,agent 绑定 seed-agent-1/2。
+DEMO_PASSWORD = "demo1234"
+DEMO_ACCOUNTS: list[dict[str, str]] = [
+    {
+        "username": "buyer_demo",
+        "role": "buyer",
+        "customer_id": "seed-cust-001",
+        "service_id": "",
+        "display": "买家演示账号(客户 seed-cust-001)",
+    },
+    {
+        "username": "buyer_demo2",
+        "role": "buyer",
+        "customer_id": "seed-cust-002",
+        "service_id": "",
+        "display": "买家演示账号 2(客户 seed-cust-002)",
+    },
+    {
+        "username": "agent_demo",
+        "role": "agent",
+        "customer_id": "",
+        "service_id": AGENT_1,
+        "display": "坐席演示账号(客服 seed-agent-1)",
+    },
+    {
+        "username": "agent_demo2",
+        "role": "agent",
+        "customer_id": "",
+        "service_id": AGENT_2,
+        "display": "坐席演示账号 2(客服 seed-agent-2)",
+    },
+]
 
 # 30 单状态序列:6×created + 6×paid + 6×shipped + 6×delivered + 3×closed + 3×refunded
 _ORDER_STATUSES: list[str] = (
@@ -35,6 +78,7 @@ _ORDER_STATUSES: list[str] = (
 
 def _clear(session: Session) -> None:
     """先删子后删父(幂等)。seed 只碰 seed- 前缀数据。"""
+    session.execute(delete(AuthUser).where(AuthUser.id.like("seed-user-%")))
     session.execute(
         delete(TicketMessage).where(TicketMessage.ticket_id.like("seed-ticket-%"))
     )
@@ -114,6 +158,22 @@ def _seed_tickets(session: Session, order_ids: list[str], now) -> None:
             )
 
 
+def _seed_accounts(session: Session) -> None:
+    """W8 演示账号:4 个固定 id 的 auth_user 行(口令统一 ``DEMO_PASSWORD``)。"""
+    for account in DEMO_ACCOUNTS:
+        session.add(
+            AuthUser(
+                id=f"seed-user-{account['username']}",
+                username=account["username"],
+                password_hash=hash_password(DEMO_PASSWORD),
+                role=account["role"],
+                merchant_id=MERCHANT_ID,
+                customer_id=account["customer_id"] or None,
+                service_id=account["service_id"] or None,
+            )
+        )
+
+
 def seed(session: Session) -> dict[str, int]:
     """执行 seed,返回各表行数统计(供幂等验证比较)。"""
     _clear(session)
@@ -130,6 +190,7 @@ def seed(session: Session) -> dict[str, int]:
     )
     order_ids = _seed_orders(session, now)
     _seed_tickets(session, order_ids, now)
+    _seed_accounts(session)
     session.commit()
 
     return {
@@ -139,6 +200,7 @@ def seed(session: Session) -> dict[str, int]:
         "ticket_message": session.scalar(
             select(func.count()).select_from(TicketMessage)
         ),
+        "auth_user": session.scalar(select(func.count()).select_from(AuthUser)),
     }
 
 
