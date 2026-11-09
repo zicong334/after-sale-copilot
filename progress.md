@@ -29,4 +29,5 @@
 - 2026-11-09 W5 | 产品修正四件落地:转人工真静默/客服工作台(agent.html)/温暖C端视觉重做/blocked零usage(dsh flash+三子代理分工) | 367 passed(dsh)/366+1(我方);静默与闭环库级实测通过 | 用户实机验收 http://127.0.0.1:8000 中;过后再跑第三轮真实评测
 - 2026-11-09 UI实机验收失败→根因确诊 | 用户截图+主会话 headless Edge 实测:视觉本身成立,死穴=summary 按客户取最近工单+Ticket 无 session_id→历史 closed 工单毒化新会话(disabled composer/误徽章);另缺工作台入口/404/无 no-cache | — | W5-FIX 派发(hrun-mw8ut2ec);用户大厂清单 triage 落 docs/大厂差距triage与采纳.md(W6 八项破坏性测试/W7 五项增强/缓做留痕/架构反思自写)
 - 2026-11-09 W5-FIX | 前端状态机根修:迁移0005 ticket.session_id+会话域状态机+双页入口+favicon+no-cache(dsh flash) | 380 passed(dsh)/379+1(我方);headless 零错误;截图 10 张 | 等用户 UI 复核;W6 破坏性测试包派发中
+- 2026-11-09 授权边界(用户) | UI 复核延后不阻塞;W6→W7 连续做完直接汇报;**仅第三轮全量真实评测需用户批准才动**;W7 任务书已立(PII脱敏/LLM降级/别名扩展/坐席建议/审计导出) | — | W6 执行中
 - 
