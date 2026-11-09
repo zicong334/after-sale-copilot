@@ -1,0 +1,252 @@
+{
+  "run_id": "w4c-20261109T141553Z-5bbfcb",
+  "generated_at": "2026-11-09T14:39:04.822082+00:00",
+  "meta": {
+    "mode": "real",
+    "assumptions": "真实模型 + 真实 LLM 裁判(与被执行模型同源,agreement 存在自偏好偏差风险);latency 仅统计对话轮/确认,不含裁判耗时",
+    "cases_file": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\data\\eval\\cases_v1.json",
+    "eval_set_version": "cs-eval-v1-20261108b",
+    "rubric_version": "cs-v2",
+    "repeat": 3,
+    "cases_selected": 48,
+    "quotas": {
+      "golden": 19,
+      "adversarial": 14,
+      "edge": 10,
+      "regression": 5
+    },
+    "llm": "deepseek-flash",
+    "judge": "deepseek-flash",
+    "scored_by": "llm",
+    "command": "run_eval.py --real --repeat 3",
+    "model_base_url": "https://api.deepseek.com/v1",
+    "temperatures": {
+      "agent": 0.2,
+      "judge": 0.1
+    },
+    "max_tokens": 2048,
+    "pricing": {
+      "input_per_mtok_usd": null,
+      "output_per_mtok_usd": null,
+      "status": "TBD",
+      "note": "单价未经官方确认时成本按 0 占位;token 用量为真实 API usage,见 meta.tokens"
+    },
+    "tokens": {
+      "prompt_tokens": 653420,
+      "completion_tokens": 128937,
+      "reasoning_tokens": 91019,
+      "total_tokens": 782357,
+      "requests": 468,
+      "retries": 1,
+      "empty_responses": 2,
+      "api_errors": 0
+    },
+    "tokens_by_role": {
+      "agent": {
+        "prompt_tokens": 168322,
+        "completion_tokens": 61509,
+        "reasoning_tokens": 40801,
+        "total_tokens": 229831,
+        "requests": 323,
+        "retries": 1,
+        "empty_responses": 1,
+        "api_errors": 0
+      },
+      "judge": {
+        "prompt_tokens": 485098,
+        "completion_tokens": 67428,
+        "reasoning_tokens": 50218,
+        "total_tokens": 552526,
+        "requests": 145,
+        "retries": 0,
+        "empty_responses": 1,
+        "api_errors": 0
+      }
+    },
+    "judge_fallback_count": 0,
+    "judge_same_source_risk": true,
+    "capture": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\.tmp\\w4c_capture\\w4c-20261109T141553Z-5bbfcb.jsonl"
+  },
+  "eval_set_version": "cs-eval-v1-20261108b",
+  "rubric_version": "cs-v2",
+  "metrics": {
+    "pass_rate": {
+      "value": 0.9653,
+      "passed": 139,
+      "denominator": 144,
+      "n": 144,
+      "cases_passed": 46,
+      "cases_total": 48
+    },
+    "by_layer": {
+      "golden": {
+        "cases": 19,
+        "attempts": 57,
+        "passed_attempts": 52,
+        "pass_rate": 0.9123,
+        "critical_fail_count": 0
+      },
+      "adversarial": {
+        "cases": 14,
+        "attempts": 42,
+        "passed_attempts": 42,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "edge": {
+        "cases": 10,
+        "attempts": 30,
+        "passed_attempts": 30,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "regression": {
+        "cases": 5,
+        "attempts": 15,
+        "passed_attempts": 15,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      }
+    },
+    "critical_fail_count": 0,
+    "judge_agreement": {
+      "value": 0.9722,
+      "agreed": 140,
+      "judged": 144
+    },
+    "cost_per_case_usd": {
+      "mean": 0.0,
+      "total": 0.0,
+      "n": 144
+    },
+    "p95_latency_ms": {
+      "value": 8910.0,
+      "n": 144,
+      "scope": "user_wait_only(对话轮+确认,不含裁判)"
+    }
+  },
+  "failures": [
+    {
+      "case_id": "CS-REFUND-005",
+      "layer": "golden",
+      "attempt": 1,
+      "type": "intent_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 82.2,
+      "detail": [
+        {
+          "check": "intent",
+          "detail": "期望意图 handoff,实际 ['order_judge', 'order_judge']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "handoff_reason",
+          "detail": "期望转人工原因 'complaint',实际 ['amount_dispute']",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 7342.0
+    },
+    {
+      "case_id": "CS-REFUND-005",
+      "layer": "golden",
+      "attempt": 3,
+      "type": "intent_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 71.0,
+      "detail": [
+        {
+          "check": "intent",
+          "detail": "期望意图 handoff,实际 ['order_judge', 'order_judge']",
+          "severity": "FAIL_HARD"
+        },
+        {
+          "check": "handoff_reason",
+          "detail": "期望转人工原因 'complaint',实际 ['amount_dispute']",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 9464.0
+    },
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 1,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 76.0,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 4528.0
+    },
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 2,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 68.5,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 7018.0
+    },
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 3,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 74.5,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 5663.0
+    }
+  ],
+  "clusters": [
+    {
+      "type": "fact_mismatch",
+      "count": 3,
+      "case_ids": [
+        "CS-MEMORY-001"
+      ],
+      "systematic": true
+    },
+    {
+      "type": "intent_mismatch",
+      "count": 2,
+      "case_ids": [
+        "CS-REFUND-005"
+      ],
+      "systematic": false
+    }
+  ],
+  "counts": {
+    "attempts_failed": 5,
+    "critical_failures": 0
+  }
+}
