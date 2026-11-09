@@ -20,11 +20,18 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api import get_db
+from app.graph import build as graph_build
 from app.llm.base import FakeLLM
 from app.main import app
 from app.memory.models import Memory
-from app.models import ChatMessage, ChatSession, KnowledgeItem, RefundRequest
-from app.orchestrator.w1_router import HANDOFF_BLOCKED_REPLY
+from app.models import (
+    ChatMessage,
+    ChatSession,
+    KnowledgeItem,
+    RefundRequest,
+    Ticket,
+    TicketMessage,
+)
 from app.tools.events import ConfirmRequest, ToolEvent
 from app.trace import EVENT_CLASSIFY, EVENT_QUERY_REWRITE, EVENT_ROUTE_BLOCKED, trace_events
 from scripts.load_policies import parse_policies, upsert_policies
@@ -53,7 +60,11 @@ def seeded(engine):
 
 
 @pytest.fixture()
-def client(engine, seeded):
+def client(engine, seeded, tmp_dir, monkeypatch):
+    # W5:本文件新增了"确认建单"步骤,断点库必须落在临时目录,
+    # 不能写项目 data/checkpoints.db(并发跑测试时还会互相锁库)。
+    monkeypatch.setattr(graph_build, "DEFAULT_CHECKPOINT_PATH", tmp_dir / "checkpoints.db")
+
     def override_get_db():
         with Session(engine) as session:
             yield session
@@ -284,23 +295,73 @@ def test_explicit_handoff_creates_ticket_and_stops_ai(client, engine):
     with Session(engine) as session:
         assert session.get(ChatSession, session_id).status == "handed_off"
 
-    # 转人工后:入口守卫拦截,AI 不回复、不调编排、不产生任何工具调用
+    # 转人工后:入口守卫拦截,AI 真静默(零 AI 文本)、不调编排、不产生任何工具调用
     second = post_chat(
         client, "我再补充一句:快递单号发你了", customer_id=CUSTOMER_OTHER, session_id=session_id
     )
     blocked = second.json()
     assert blocked["ai_replied"] is False
     assert blocked["intent"] == "blocked"
-    assert blocked["reply"] == HANDOFF_BLOCKED_REPLY
+    assert blocked["reply"] == ""
     assert blocked["tool_calls"] == []
     assert blocked["session_status"] == "handed_off"
+    # W5 真静默:没有 AI 生成 → 响应整键不含 usage,改由轻量 ack 提示(不是 AI 气泡)
+    assert "usage" not in blocked
+    assert blocked["ack"], "blocked 轮必须返回系统回执文本"
     events = events_of(engine, blocked["trace_id"])
     assert [e.tool_name for e in events] == [EVENT_ROUTE_BLOCKED]
 
-    # 两轮消息都带同一个 trace_id 落库(第二轮 trace 只有拦截事件)
+    # blocked 轮只落 buyer 消息,不落 assistant 空消息(避免前端出现空气泡)
     msgs = messages_of(engine, session_id, trace_id=blocked["trace_id"])
-    assert {m.role for m in msgs} == {"user", "assistant"}
+    assert {m.role for m in msgs} == {"user"}
     assert msgs[0].content == "我再补充一句:快递单号发你了"
+
+    # 确认建单后再发:买家文本必须真正追加进工单(ticket_message,author=user)
+    token = data["pending_confirm"]["confirm_token"]
+    confirmed = client.post(
+        f"/api/c/confirm/{token}/confirm", json={"thread_id": session_id}
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    ticket_id = confirmed.json()["receipt"]["ticket_id"]
+
+    third = post_chat(
+        client, "转人工后追加给坐席的话", customer_id=CUSTOMER_OTHER, session_id=session_id
+    ).json()
+    assert third["reply"] == ""
+    assert third["ack_ticket_id"] == ticket_id
+    assert ticket_id in third["ack"]
+    with Session(engine) as session:
+        rows = list(
+            session.scalars(
+                select(TicketMessage)
+                .where(TicketMessage.ticket_id == ticket_id)
+                .order_by(TicketMessage.created_at.asc())
+            )
+        )
+    assert [(m.author_type, m.content) for m in rows] == [
+        ("user", "转人工后追加给坐席的话")
+    ]
+
+
+def test_blocked_turn_without_ticket_keeps_generic_ack(client, engine):
+    """未确认建单时再发消息:仍真静默,ack 走通用文案,且不新增工单/工单消息。"""
+    first = post_chat(client, "直接给我转人工", customer_id=CUSTOMER_OTHER)
+    first_data = first.json()
+    session_id = first_data["session_id"]
+    assert first_data["pending_confirm"] is not None
+
+    blocked = post_chat(
+        client, "补充一句还没确认", customer_id=CUSTOMER_OTHER, session_id=session_id
+    ).json()
+    assert blocked["ai_replied"] is False
+    assert blocked["reply"] == ""
+    assert "usage" not in blocked
+    assert blocked["ack"] == "消息已记录,坐席会尽快跟进。"
+    assert blocked["ack_ticket_id"] is None
+    # 图仍停在确认门,未确认 → 不建工单;确认前也不会写工单消息
+    assert count_rows(engine, Ticket) == 8
+    # seed 自带 9 条工单消息(specs 里 0+0+1+1+2+1+2+2),blocked 轮不得新增
+    assert count_rows(engine, TicketMessage) == 9
 
 
 def test_unresolved_rounds_handoff_trigger(client, engine):

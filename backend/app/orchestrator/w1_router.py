@@ -12,7 +12,7 @@ W2 工具,**没有 LangGraph、没有真实模型**。W3-A 将把它整体替换
 2. 订单判责:``shop__get_order`` → ``policy__check_return`` → 符合则 ``refund__create``
    生成**确认卡**(真正落库要等 W3 的确认流执行 ``execute``);不符合只解释+引用条款;
 3. 转人工:三触发(明示人工 / 连续 3 轮未解决 / 金额争议)→ ``handoff__create_ticket``
-   确认卡 + 会话 ``status='handed_off'``,此后入口直接返回固定话术、AI 不再回复;
+   确认卡 + 会话 ``status='handed_off'``,此后入口真静默(不回固定话术)、AI 不再回复;
 4. 每步(意图判定 / 查询改写 / 工具调用 / 状态变更)都写统一 trace_id 的结构化事件。
 """
 
@@ -53,12 +53,6 @@ from app.trace import (
 # ---------------------------------------------------------------------------
 # 对外常量:路由层(api/chat.py)与测试共用
 # ---------------------------------------------------------------------------
-
-#: 会话已 handed_off 后的固定话术:AI 不再自动回复,避免"人工已接手还在自动答"。
-HANDOFF_BLOCKED_REPLY = (
-    "您的问题已转交人工客服处理,工单已进入人工队列,坐席会尽快回复。"
-    "为避免与人工重复,我先不再自动作答;如需补充信息请直接留言。"
-)
 
 #: 高置信快捷路径:命中即返回 conf=1.0,且**必须**被路由消费(跳过 FakeLLM)。
 #: 只放"无需理解就能确定"的显式表达,杜绝"硬编码低置信度却无人消费"的反模式。
@@ -235,7 +229,7 @@ def build_blocked_turn(
     trace_id: str,
     text: str,
 ) -> TurnResult:
-    """会话非 active 时的入口守卫:写拦截事件,返回固定话术,AI 不回复。"""
+    """会话非 active 时的入口守卫:写拦截事件,AI 不回复(W5 真静默:reply 为空)。"""
     record_event(
         session,
         trace_id=trace_id,
@@ -247,7 +241,7 @@ def build_blocked_turn(
         confidence=1.0,
         intent_reason="会话非 active(已转人工),AI 停止自动回复",
         classification_path="route_guard",
-        reply=HANDOFF_BLOCKED_REPLY,
+        reply="",
         session_status=session_row.status,
         ai_replied=False,
     )

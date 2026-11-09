@@ -25,9 +25,8 @@ from app.api import get_db
 from app.errors import StateConflictError
 from app.services import tickets as ticket_svc
 from app.graph import build as graph_build
-from app.graph.runner import HANDOFF_BLOCKED_REPLY
 from app.main import app
-from app.models import ChatSession, Merchant, Ticket
+from app.models import ChatSession, Merchant, Ticket, TicketMessage
 from app.trace import EVENT_ROUTE_BLOCKED, trace_events
 from scripts.load_policies import parse_policies, upsert_policies
 from scripts.seed import seed
@@ -124,12 +123,15 @@ def test_handoff_then_ai_stops_without_running_graph(client, engine):
         assert db.get(ChatSession, thread_id).status == "handed_off"
         assert first["pending_confirm"], "建单前必须先出确认卡"
 
-    # 第二次发消息:会话已 handed_off → 固定话术,不跑图
+    # 第二次发消息:会话已 handed_off → AI 真静默(不回固定话术),不跑图
     second = post_chat(client, "我还在吗？", session_id=thread_id)
     assert second["ai_replied"] is False
     assert second["intent"] == "blocked"
     assert second["classification_path"] == "route_guard"
-    assert second["reply"] == HANDOFF_BLOCKED_REPLY
+    assert second["reply"] == ""
+    assert "usage" not in second, "blocked 轮没有 AI 生成,不得带 usage"
+    assert second["ack"] == "消息已记录,坐席会尽快跟进。"
+    assert second["ack_ticket_id"] is None, "还没确认建单,没有可追加的工单"
     assert second["tool_calls"] == []
     assert second["session_status"] == "handed_off"
 
@@ -220,7 +222,8 @@ def test_stream_handoff_emits_notice(client):
     assert done["ai_replied"] is True  # 首轮还说话,确认后才停答
 
 
-def test_stream_handed_off_still_emits_usage(client):
+def test_stream_handed_off_emits_append_ack_without_usage(client):
+    """W5 真静默:handed_off 后的 SSE 只有 append_ack + done(零 message/usage/横幅)。"""
     first = post_chat(client, HANDOFF_TEXT)
     resp = client.post(
         "/api/c/chat/stream",
@@ -229,11 +232,85 @@ def test_stream_handed_off_still_emits_usage(client):
     )
     assert resp.status_code == 200
     frames = parse_sse(resp.text)
-    assert any(name == "handoff_notice" for name, _ in frames)
-    usage = next(data for name, data in frames if name == "usage")
-    assert usage["estimated"] is True
+    names = [name for name, _ in frames]
+    assert names.count("append_ack") == 1, names
+    assert "handoff_notice" not in names, "横幅只在转人工创建当轮发一次"
+    assert "usage" not in names
+    assert "message" not in names, "blocked 轮不得有任何 AI 文本分片"
+    ack = next(data for name, data in frames if name == "append_ack")
+    assert ack["ack"]
+    assert ack["session_status"] == "handed_off"
+    assert ack["ticket_id"] is None  # 尚未确认建单
     done = next(data for name, data in frames if name == "done")
     assert done["ai_replied"] is False
+    assert done["reply"] == ""
+    assert "usage" not in done, "blocked 轮的 done 不得带 usage 键"
+    assert done["ack"]
+
+
+def test_three_blocked_messages_append_to_ticket_and_notice_once(client, engine):
+    """连发 3 条:每轮零 AI 文本/零 usage/1 次 append_ack;买家消息全部进工单;横幅仅 1 次。"""
+    first = client.post(
+        "/api/c/chat/stream",
+        json={"merchant_id": MERCHANT_ID, "customer_id": CUSTOMER, "text": HANDOFF_TEXT},
+    )
+    assert first.status_code == 200, first.text
+    first_frames = parse_sse(first.text)
+    first_names = [name for name, _ in first_frames]
+    assert first_names.count("handoff_notice") == 1, "转人工创建当轮必须发横幅"
+    # 横幅携带 reply_stopped=False(当轮 AI 还说话),确认后才彻底静默
+    notice = next(data for name, data in first_frames if name == "handoff_notice")
+    assert notice["reply_stopped"] is False
+    session_id = next(data for name, data in first_frames if name == "done")["session_id"]
+    token = next(
+        data for name, data in first_frames if name == "confirm_request"
+    )["confirm_token"]
+    confirmed = client.post(
+        f"/api/c/confirm/{token}/confirm", json={"thread_id": session_id}
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    ticket_id = confirmed.json()["receipt"]["ticket_id"]
+
+    texts = ["转人工后第一条", "转人工后第二条", "转人工后第三条"]
+    notice_count = first_names.count("handoff_notice")
+    for text in texts:
+        resp = client.post(
+            "/api/c/chat/stream",
+            json={
+                "merchant_id": MERCHANT_ID,
+                "customer_id": CUSTOMER,
+                "text": text,
+                "session_id": session_id,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        frames = parse_sse(resp.text)
+        names = [name for name, _ in frames]
+        assert names.count("append_ack") == 1, names
+        assert names.count("handoff_notice") == 0
+        assert "message" not in names and "usage" not in names
+        ack = next(data for name, data in frames if name == "append_ack")
+        assert ack["ticket_id"] == ticket_id, "买家消息必须真正追加到该工单"
+        done = next(data for name, data in frames if name == "done")
+        assert done["reply"] == "" and done["ai_replied"] is False
+        assert "usage" not in done
+        assert done["ack_ticket_id"] == ticket_id
+        notice_count += names.count("handoff_notice")
+    assert notice_count == 1, "整条流程只允许 1 次 handoff_notice"
+
+    with Session(engine) as db:
+        rows = list(
+            db.scalars(
+                select(TicketMessage)
+                .where(
+                    TicketMessage.ticket_id == ticket_id,
+                    TicketMessage.author_type == "user",
+                )
+                .order_by(TicketMessage.created_at.asc())
+            )
+        )
+    assert [m.content for m in rows] == texts
+    assert all(m.is_internal is False for m in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +417,40 @@ def test_summary_unknown_session_404(client):
     resp = client.get("/api/c/handoff/sessions/no-such-session/summary")
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_summary_hides_internal_agent_notes(client, engine):
+    """买家侧会话摘要不下发坐席内部备注(is_internal=True),只下发买家可见消息。
+
+    前端 app.js 只是客户端过滤,接口本身必须过滤 —— 这里断言 ticket_messages
+    里没有内部备注内容,但普通坐席回复仍可见。
+    """
+    with Session(engine) as db:
+        # 复用 seed 里已存在的 merchant/customer(chat_session 有外键),
+        # 且 seed-cust-001 无工单 —— 本测试建的单就是该客户最近一张。
+        db.add(ChatSession(id="s-hf-internal", merchant_id=MERCHANT_ID, customer_id=CUSTOMER))
+        db.add(Ticket(id="tk-hf-internal", merchant_id=MERCHANT_ID, customer_id=CUSTOMER, status="queued"))
+        db.add_all(
+            [
+                TicketMessage(id="tm-hf-public", ticket_id="tk-hf-internal", author_type="agent", content="您好,我来跟进"),
+                TicketMessage(
+                    id="tm-hf-internal",
+                    ticket_id="tk-hf-internal",
+                    author_type="agent",
+                    content="内部备注:该买家伙同惯犯,注意核实",
+                    is_internal=True,
+                ),
+            ]
+        )
+        db.commit()
+
+    resp = client.get("/api/c/handoff/sessions/s-hf-internal/summary")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    contents = [item["content"] for item in body["ticket_messages"]]
+    assert "您好,我来跟进" in contents
+    assert all("内部备注" not in text for text in contents), "内部备注不得下发买家侧"
+    assert all(item["is_internal"] is False for item in body["ticket_messages"])
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,495 @@
+"""test_agent_workbench.py — W5 客服工作台 API 专项验收(契约 .tmp/w5_contract.md §二/§四)。
+
+覆盖(13 条):
+1.  GET /api/b/services:两名 seed 坐席 + demo_no_password;
+2.  GET /api/b/tickets:queued 优先 → 组内 last_msg_at DESC(NULL 最后);
+3.  GET /api/b/tickets:工单结构完整 + status_label 中文 + status 过滤;
+4.  POST claim:queued → claimed,verified 回执;
+5.  重复 claim:409「已被他人领取」;
+6.  GET /api/b/tickets/{id}:含转人工后追加的买家消息(author=user);
+7.  POST messages:author=agent/author_label=人工客服,买家 summary 可见;
+8.  关单后 reply 409、重复关单 409;
+9.  关单后 claim 409;
+10. 全链路:转人工→回复→关单→买家 summary ticket_closed/ticket_messages;
+11. GET /api/b/tickets/{id} 未知工单 404;
+12. reply 空白 content 400 VALIDATION_ERROR;
+13. GET /agent.html 200 + agent.js + 无 CDN/构建工具。
+
+只读 backend/app;本文件是 qa-tests 唯一写入产物。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from app.api import get_db
+from app.graph import build as graph_build
+from app.main import app
+from app.models import Merchant, Ticket
+from scripts.load_policies import parse_policies, upsert_policies
+from scripts.seed import seed
+
+MERCHANT_ID = "seed-merchant-1"
+CUSTOMER = "seed-cust-001"
+HANDOFF_TEXT = "我不跟你聊了,直接给我转人工客服"
+POLICY_DIR = Path(__file__).resolve().parents[2] / "data" / "policies"
+
+
+# ---------------------------------------------------------------------------
+# fixtures(与 test_handoff_flow.py 一致:独立 SQLite + TestClient)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def seeded(engine):
+    with Session(engine) as session:
+        seed(session)
+        upsert_policies(session, parse_policies(POLICY_DIR))
+        session.commit()
+
+
+@pytest.fixture()
+def ckpt(tmp_dir, monkeypatch) -> Path:
+    path = tmp_dir / "checkpoints.db"
+    monkeypatch.setattr(graph_build, "DEFAULT_CHECKPOINT_PATH", path)
+    return path
+
+
+@pytest.fixture()
+def client(engine, seeded, ckpt):
+    def _override():
+        db = Session(engine)
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _add_ticket(
+    engine,
+    ticket_id: str,
+    *,
+    merchant: str,
+    status: str = "queued",
+    customer: str = "c-wb",
+    claimed_by: str | None = None,
+    handoff_reason: str | None = None,
+    summary: str | None = None,
+    last_msg_at: datetime | None = None,
+    created_at: datetime | None = None,
+) -> None:
+    """直接落一张工单(绕过图,专测工作台路由;约束照 CHECK 不走后门)。"""
+    if status in ("claimed", "waiting_customer") and claimed_by is None:
+        claimed_by = "seed-agent-1"
+    with Session(engine) as db:
+        if db.get(Merchant, merchant) is None:
+            db.add(Merchant(id=merchant, name="工作台测试店"))
+            db.flush()
+        db.add(
+            Ticket(
+                id=ticket_id,
+                merchant_id=merchant,
+                customer_id=customer,
+                status=status,
+                claimed_by=claimed_by,
+                handoff_reason=handoff_reason,
+                summary=summary,
+                last_msg_at=last_msg_at,
+                created_at=created_at or datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+
+
+def _chat(client: TestClient, text: str, *, session_id: str | None = None) -> dict:
+    payload = {
+        "merchant_id": MERCHANT_ID,
+        "customer_id": CUSTOMER,
+        "text": text,
+        "context": None,
+    }
+    if session_id:
+        payload["session_id"] = session_id
+    resp = client.post("/api/c/chat", json=payload)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _handoff_and_confirm(client: TestClient) -> tuple[str, str]:
+    """聊天转人工 → 确认建单;返回 (session_id, ticket_id)。"""
+    first = _chat(client, HANDOFF_TEXT)
+    token = first["pending_confirm"]["confirm_token"]
+    resp = client.post(
+        f"/api/c/confirm/{token}/confirm", json={"thread_id": first["session_id"]}
+    )
+    assert resp.status_code == 200, resp.text
+    return first["session_id"], resp.json()["receipt"]["ticket_id"]
+
+
+# ---------------------------------------------------------------------------
+# 1. 坐席列表
+# ---------------------------------------------------------------------------
+
+
+def test_services_lists_two_seed_agents(client):
+    resp = client.get("/api/b/services")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["demo_no_password"] is True
+    assert len(body["items"]) == 2
+    ids = [item["service_id"] for item in body["items"]]
+    assert ids == ["seed-agent-1", "seed-agent-2"]
+    names = {item["service_id"]: item["display_name"] for item in body["items"]}
+    assert "客服" in names["seed-agent-1"]
+    assert "客服" in names["seed-agent-2"]
+
+
+# ---------------------------------------------------------------------------
+# 2-3. 工单队列排序 / 结构 / 状态标签
+# ---------------------------------------------------------------------------
+
+
+def test_ticket_queue_queued_first_then_last_msg_desc(client, engine):
+    merchant = "m-wb-queue"
+    base = datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc)
+    _add_ticket(engine, "tk-wb-q-old", merchant=merchant, status="queued", last_msg_at=base)
+    _add_ticket(
+        engine, "tk-wb-q-new", merchant=merchant, status="queued",
+        last_msg_at=base + timedelta(hours=2),
+    )
+    _add_ticket(
+        engine, "tk-wb-q-null", merchant=merchant, status="queued",
+        last_msg_at=None, created_at=base + timedelta(hours=3),
+    )
+    _add_ticket(
+        engine, "tk-wb-c-new", merchant=merchant, status="claimed",
+        claimed_by="seed-agent-1", last_msg_at=base + timedelta(hours=5),
+    )
+    _add_ticket(
+        engine, "tk-wb-c-old", merchant=merchant, status="claimed",
+        claimed_by="seed-agent-2", last_msg_at=base + timedelta(hours=1),
+    )
+
+    body = client.get("/api/b/tickets", params={"merchant_id": merchant}).json()
+    assert body["ok"] is True
+    assert body["queued_first"] is True
+    assert body["total"] == 5
+    # queued 优先 → queued 组内 last_msg_at DESC(NULL 最后)→ 其它组同样规则
+    assert [item["ticket_id"] for item in body["items"]] == [
+        "tk-wb-q-new",
+        "tk-wb-q-old",
+        "tk-wb-q-null",
+        "tk-wb-c-new",
+        "tk-wb-c-old",
+    ]
+
+
+def test_ticket_list_structure_labels_and_status_filter(client, engine):
+    merchant = "m-wb-labels"
+    _add_ticket(
+        engine, "tk-wb-label-q", merchant=merchant, status="queued",
+        handoff_reason="explicit_request",
+    )
+    _add_ticket(
+        engine, "tk-wb-label-c", merchant=merchant, status="claimed",
+        claimed_by="seed-agent-1",
+    )
+    _add_ticket(
+        engine, "tk-wb-label-w", merchant=merchant, status="waiting_customer",
+        claimed_by="seed-agent-1",
+    )
+    _add_ticket(
+        engine, "tk-wb-label-x", merchant=merchant, status="closed",
+        claimed_by="seed-agent-1",
+    )
+
+    body = client.get("/api/b/tickets", params={"merchant_id": merchant}).json()
+    items = body["items"]
+    assert body["total"] == 4
+    expected_labels = {
+        "tk-wb-label-q": "待领取",
+        "tk-wb-label-c": "跟进中",
+        "tk-wb-label-w": "待客户回复",
+        "tk-wb-label-x": "已关闭",
+    }
+    assert {item["ticket_id"]: item["status_label"] for item in items} == expected_labels
+
+    ticket_keys = {
+        "ticket_id", "merchant_id", "customer_id", "order_id", "status",
+        "status_label", "claimed_by", "handoff_reason", "handoff_reason_label",
+        "summary", "created_at_utc", "last_msg_at_utc", "message_count",
+        "last_message",
+    }
+    for item in items:
+        assert ticket_keys <= set(item)
+
+    queued = next(item for item in items if item["ticket_id"] == "tk-wb-label-q")
+    assert queued["handoff_reason"] == "explicit_request"
+    assert queued["handoff_reason_label"] == "用户主动要求人工"
+    assert queued["last_message"] is None
+    closed = next(item for item in items if item["ticket_id"] == "tk-wb-label-x")
+    assert closed["handoff_reason"] is None
+    assert closed["handoff_reason_label"] is None
+
+    filtered = client.get(
+        "/api/b/tickets", params={"merchant_id": merchant, "status": "closed"}
+    ).json()
+    assert [item["ticket_id"] for item in filtered["items"]] == ["tk-wb-label-x"]
+    assert filtered["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 4-5. claim 成功 / 被抢
+# ---------------------------------------------------------------------------
+
+
+def test_claim_queued_ticket_returns_verified_receipt(client, engine):
+    _add_ticket(engine, "tk-wb-claim", merchant="m-wb-claim", status="queued")
+    resp = client.post(
+        "/api/b/tickets/tk-wb-claim/claim", json={"service_id": "seed-agent-1"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    receipt = body["receipt"]
+    assert receipt["ticket_id"] == "tk-wb-claim"
+    assert receipt["status"] == "claimed"
+    assert receipt["claimed_by"] == "seed-agent-1"
+    assert receipt["verified"] is True
+    assert receipt["occurred_at_utc"]
+
+    row = client.get(
+        "/api/b/tickets",
+        params={"merchant_id": "m-wb-claim", "status": "claimed"},
+    ).json()["items"]
+    assert [item["ticket_id"] for item in row] == ["tk-wb-claim"]
+    assert row[0]["claimed_by"] == "seed-agent-1"
+
+
+def test_claim_twice_second_gets_conflict(client, engine):
+    _add_ticket(engine, "tk-wb-race", merchant="m-wb-race", status="queued")
+    first = client.post(
+        "/api/b/tickets/tk-wb-race/claim", json={"service_id": "seed-agent-1"}
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/api/b/tickets/tk-wb-race/claim", json={"service_id": "seed-agent-2"}
+    )
+    assert second.status_code == 409, second.text
+    error = second.json()["error"]
+    assert error["code"] == "STATE_CONFLICT"
+    assert "已被他人领取" in error["message"]
+
+
+# ---------------------------------------------------------------------------
+# 6. 详情含转人工后追加的买家消息
+# ---------------------------------------------------------------------------
+
+
+def test_ticket_detail_contains_post_handoff_buyer_messages(client):
+    session_id, ticket_id = _handoff_and_confirm(client)
+    for text in ("转人工后第一条", "转人工后第二条"):
+        blocked = _chat(client, text, session_id=session_id)
+        assert blocked["ai_replied"] is False, "转人工后必须走 blocked 轮"
+
+    resp = client.get(f"/api/b/tickets/{ticket_id}")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["ticket"]["ticket_id"] == ticket_id
+    messages = body["messages"]
+    buyer = [item for item in messages if item["author_type"] == "user"]
+    assert [item["content"] for item in buyer] == ["转人工后第一条", "转人工后第二条"]
+    assert all(item["author_label"] == "买家" for item in buyer)
+    assert all(item["is_internal"] is False for item in buyer)
+    message_keys = {
+        "id", "author_type", "author_label", "content", "is_internal",
+        "created_at_utc",
+    }
+    for item in messages:
+        assert message_keys <= set(item)
+    times = [item["created_at_utc"] for item in messages]
+    assert times == sorted(times), "详情消息必须按 created_at asc"
+
+
+# ---------------------------------------------------------------------------
+# 7. 坐席回复:author=agent,买家 summary 可见
+# ---------------------------------------------------------------------------
+
+
+def test_agent_reply_visible_in_detail_and_buyer_summary(client):
+    session_id, ticket_id = _handoff_and_confirm(client)
+    claim = client.post(
+        f"/api/b/tickets/{ticket_id}/claim", json={"service_id": "seed-agent-1"}
+    )
+    assert claim.status_code == 200, claim.text
+
+    text = "您好,退款我来跟进,请稍候"
+    resp = client.post(
+        f"/api/b/tickets/{ticket_id}/messages",
+        json={"service_id": "seed-agent-1", "content": text},
+    )
+    assert resp.status_code == 200, resp.text
+    message = resp.json()["message"]
+    assert message["author_type"] == "agent"
+    assert message["author_label"] == "人工客服"
+    assert message["content"] == text
+    assert message["is_internal"] is False
+
+    detail = client.get(f"/api/b/tickets/{ticket_id}").json()
+    assert any(
+        item["author_type"] == "agent" and item["content"] == text
+        for item in detail["messages"]
+    )
+
+    summary = client.get(f"/api/c/handoff/sessions/{session_id}/summary").json()
+    assert summary["ticket_status"] == "claimed"
+    assert summary["ticket_closed"] is False
+    assert any(
+        item["author_type"] == "agent" and item["content"] == text
+        for item in summary["ticket_messages"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8-9. 关单后的守卫
+# ---------------------------------------------------------------------------
+
+
+def test_close_then_reply_and_close_again_conflict(client, engine):
+    _add_ticket(engine, "tk-wb-close", merchant="m-wb-close", status="queued")
+    closed = client.post(
+        "/api/b/tickets/tk-wb-close/close", json={"service_id": "seed-agent-1"}
+    )
+    assert closed.status_code == 200, closed.text
+    receipt = closed.json()["receipt"]
+    assert receipt["status"] == "closed"
+    assert receipt["verified"] is True
+
+    reply = client.post(
+        "/api/b/tickets/tk-wb-close/messages",
+        json={"service_id": "seed-agent-1", "content": "关单后还想回复"},
+    )
+    assert reply.status_code == 409, reply.text
+    error = reply.json()["error"]
+    assert error["code"] == "STATE_CONFLICT"
+    assert "已关闭" in error["message"]
+
+    again = client.post(
+        "/api/b/tickets/tk-wb-close/close", json={"service_id": "seed-agent-2"}
+    )
+    assert again.status_code == 409, again.text
+    assert again.json()["error"]["code"] == "STATE_CONFLICT"
+
+
+def test_claim_rejected_after_close(client, engine):
+    _add_ticket(
+        engine, "tk-wb-closed-claim", merchant="m-wb-claim-closed",
+        status="closed", claimed_by="seed-agent-1",
+    )
+    resp = client.post(
+        "/api/b/tickets/tk-wb-closed-claim/claim",
+        json={"service_id": "seed-agent-2"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "STATE_CONFLICT"
+
+
+# ---------------------------------------------------------------------------
+# 10. 全链路:转人工 → blocked 追加 → 坐席回复 → 关单 → 买家 summary
+# ---------------------------------------------------------------------------
+
+
+def test_full_loop_buyer_summary_after_close(client):
+    session_id, ticket_id = _handoff_and_confirm(client)
+
+    blocked = _chat(client, "帮我催一下进度", session_id=session_id)
+    assert blocked["ai_replied"] is False
+
+    claim = client.post(
+        f"/api/b/tickets/{ticket_id}/claim", json={"service_id": "seed-agent-1"}
+    )
+    assert claim.status_code == 200, claim.text
+    reply = client.post(
+        f"/api/b/tickets/{ticket_id}/messages",
+        json={"service_id": "seed-agent-1", "content": "已为您处理,工单即将关闭"},
+    )
+    assert reply.status_code == 200, reply.text
+
+    closed = client.post(
+        f"/api/b/tickets/{ticket_id}/close", json={"service_id": "seed-agent-1"}
+    )
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["receipt"]["status"] == "closed"
+
+    resp = client.get(f"/api/c/handoff/sessions/{session_id}/summary")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    for key in ("ticket", "ticket_link", "messages", "session_status"):
+        assert key in body, f"summary 原有键不得丢失: {key}"
+    assert body["ticket_closed"] is True
+    assert body["ticket_status"] == "closed"
+    messages = body["ticket_messages"]
+    contents = [(item["author_type"], item["content"]) for item in messages]
+    assert ("user", "帮我催一下进度") in contents
+    assert ("agent", "已为您处理,工单即将关闭") in contents
+    times = [item["created_at_utc"] for item in messages]
+    assert times == sorted(times), "ticket_messages 必须按 created_at asc"
+
+
+# ---------------------------------------------------------------------------
+# 11-12. 404 / 参数校验
+# ---------------------------------------------------------------------------
+
+
+def test_ticket_detail_unknown_404(client):
+    resp = client.get("/api/b/tickets/no-such-ticket")
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_reply_blank_content_rejected(client, engine):
+    _add_ticket(engine, "tk-wb-blank", merchant="m-wb-blank", status="queued")
+    resp = client.post(
+        "/api/b/tickets/tk-wb-blank/messages",
+        json={"service_id": "seed-agent-1", "content": "   "},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 13. 工作台前端:可打开 + 无 CDN / 构建工具
+# ---------------------------------------------------------------------------
+
+
+def test_agent_frontend_served_without_cdn(client):
+    page = client.get("/agent.html")
+    assert page.status_code == 200, page.text
+    assert "agent.js" in page.text
+    assert "演示环境" in page.text, "工作台必须声明演示环境无密码"
+
+    js = client.get("/agent.js")
+    assert js.status_code == 200, js.text
+    assert client.get("/style.css").status_code == 200
+
+    joined = (page.text + js.text + client.get("/style.css").text).lower()
+    for banned in ("cdn.", "unpkg", "jsdelivr", "webpack", "vite", "npm "):
+        assert banned not in joined, f"前端不得依赖 CDN/构建工具: {banned}"

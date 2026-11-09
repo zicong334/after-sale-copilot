@@ -15,9 +15,14 @@ StreamingResponse,不引入 sse-starlette),事件类型:
 - ``confirm_request``:待确认卡(pending_confirm 原样:what/impact/irreversibility/
   alternatives/confirm_token);
 - ``handoff_notice``:会话已转人工(handed_off),前端显示横幅;
+- ``append_ack``:W5 真静默轮的系统回执(买家消息已追加进工单,不是 AI 气泡);
 - ``usage``:本轮计量 ``{tokens_in, tokens_out, cost_usd, latency_ms, estimated:true}``
   (FakeLLM 口径:按字符数估算,MOCK 价目,非真实账单);
 - ``done``:本轮结束,带 session_id / trace_id / 完整结果摘要。
+
+W5 真静默(修正一):会话已 handed_off 的轮次**不产生任何 AI 文本**——不落
+assistant ``chat_message``、响应体整键不含 ``usage``;SSE 只发 ``append_ack`` +
+``done``;``handoff_notice`` 只在"转人工创建当轮"(仍有 AI 回复的那一轮)发一次。
 
 所有 DB 工作与图执行都在 ``_run_turn`` 内同步完成,生成器只 yield 已算好的帧,
 避免在流式响应里持有请求级 Session。
@@ -161,16 +166,20 @@ def _run_turn(db: Session, payload: ChatRequest) -> dict[str, Any]:
     latency_ms = int((time.monotonic() - started) * 1000)
 
     user_msg.intent = result.intent
-    db.add(
-        ChatMessage(
-            session_id=session_row.id,
-            role="assistant",
-            content=result.reply,
-            attachments=[],
-            trace_id=trace_id,
-            intent=result.intent,
+    # W5 真静默:blocked 轮 AI 零吐字(reply=""),不落空 assistant 消息;
+    # 买家这条文本已由 runner.build_blocked_turn 追加进该会话的未关闭工单。
+    blocked = not result.ai_replied
+    if not blocked:
+        db.add(
+            ChatMessage(
+                session_id=session_row.id,
+                role="assistant",
+                content=result.reply,
+                attachments=[],
+                trace_id=trace_id,
+                intent=result.intent,
+            )
         )
-    )
     db.commit()
 
     body = result.to_dict()
@@ -181,14 +190,16 @@ def _run_turn(db: Session, payload: ChatRequest) -> dict[str, Any]:
             "trace_id": trace_id,
             "truncated": percept.truncated,
             "original_length": percept.original_length,
-            "usage": _usage(
-                percept.text,
-                result.reply,
-                latency_ms,
-                llm=llm,
-            ),
         }
     )
+    if not blocked:
+        # 非 blocked 轮 usage 照旧;blocked 轮没有 AI 生成,整键不出现(不计费)
+        body["usage"] = _usage(
+            percept.text,
+            result.reply,
+            latency_ms,
+            llm=llm,
+        )
     return body
 
 
@@ -209,7 +220,39 @@ def _sse(event: str, data: dict[str, Any]) -> str:
 
 
 def _frames(body: dict[str, Any]) -> Iterator[str]:
-    """把一轮结果展开成 SSE 帧(全部在同步阶段算好,生成器零 IO)。"""
+    """把一轮结果展开成 SSE 帧(全部在同步阶段算好,生成器零 IO)。
+
+    W5 真静默:blocked 轮只发 ``append_ack`` + ``done``——没有 AI 文本可播,
+    也不发 ``usage`` / ``handoff_notice``(横幅只在转人工创建当轮发一次)。
+    """
+    if body.get("ai_replied") is False:
+        yield _sse(
+            "append_ack",
+            {
+                "ack": body.get("ack") or "",
+                "ticket_id": body.get("ack_ticket_id"),
+                "session_status": body.get("session_status") or "handed_off",
+            },
+        )
+        yield _sse(
+            "done",
+            {
+                "ok": True,
+                "session_id": body.get("session_id"),
+                "trace_id": body.get("trace_id"),
+                "intent": body.get("intent"),
+                "confidence": body.get("confidence"),
+                "classification_path": body.get("classification_path"),
+                "session_status": body.get("session_status"),
+                "ai_replied": False,
+                "tool_calls": body.get("tool_calls") or [],
+                "reply": "",
+                "ack": body.get("ack") or "",
+                "ack_ticket_id": body.get("ack_ticket_id"),
+            },
+        )
+        return
+
     reply = str(body.get("reply") or "")
     for delta in _chunks(reply):
         yield _sse("message", {"delta": delta})
@@ -219,12 +262,13 @@ def _frames(body: dict[str, Any]) -> Iterator[str]:
         card = dict(body["pending_confirm"])
         card.setdefault("thread_id", body.get("session_id"))
         yield _sse("confirm_request", card)
-    if body.get("session_status") == "handed_off":
+    if body.get("session_status") == "handed_off" and body.get("ai_replied") is True:
+        # 仅"转人工创建当轮"发一次;后续 blocked 轮在上面的早退分支不会走到这里
         yield _sse(
             "handoff_notice",
             {
                 "session_status": "handed_off",
-                "reply_stopped": not body.get("ai_replied", True),
+                "reply_stopped": False,
                 "message": "已转人工,AI 已停止自动回复,坐席会尽快跟进。",
             },
         )

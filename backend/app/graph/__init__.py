@@ -21,7 +21,6 @@ from app.graph.build import (
     open_checkpointer,
 )
 from app.graph.runner import (
-    HANDOFF_BLOCKED_REPLY,
     TurnResult,
     build_blocked_turn,
     handle_turn,
@@ -32,7 +31,6 @@ from app.graph.state import NODE_STEP_LIMIT, GraphState, initial_state
 
 __all__ = [
     "DEFAULT_CHECKPOINT_PATH",
-    "HANDOFF_BLOCKED_REPLY",
     "NODE_STEP_LIMIT",
     "RECURSION_LIMIT",
     "GraphState",

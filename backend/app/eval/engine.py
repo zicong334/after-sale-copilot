@@ -291,6 +291,9 @@ class EvalEngine:
                 "idempotency_writes": 0,
                 "toctou_error_code": None,
                 "followup_ai_replied": None,
+                # W5:blocked 轮 AI 真静默(零 AI 文本),这两个 flag 记录"空回复 + 系统回执"
+                "followup_reply_empty": None,
+                "followup_ack": None,
             },
             "latency_ms_total": 0,
             "usage": {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "estimated": True},
@@ -374,14 +377,16 @@ class EvalEngine:
                     )
                 latency_ms = int((time.monotonic() - started) * 1000)
                 session.refresh(session_row)
-                self._append_message(
-                    session,
-                    session_id=session_row.id,
-                    role="assistant",
-                    content=result.reply,
-                    trace_id=trace_id,
-                    intent=result.intent,
-                )
+                # W5 真静默:blocked 轮 reply 为空且 AI 没说话,不再补空 assistant 消息
+                if result.ai_replied:
+                    self._append_message(
+                        session,
+                        session_id=session_row.id,
+                        role="assistant",
+                        content=result.reply,
+                        trace_id=trace_id,
+                        intent=result.intent,
+                    )
                 session.commit()
                 usage_items.append(_usage(percept.text, result.reply))
                 artifact["replies"].append(
@@ -525,6 +530,13 @@ class EvalEngine:
                 after_counts = self._write_counts(session)
                 artifact["flags"]["followup_ai_replied"] = (
                     bool(_r.ai_replied) if _r is not None else None
+                )
+                # W5:blocked 轮的"零 AI 文本 + 有系统回执"证据(不参与硬断言,供诊断)
+                artifact["flags"]["followup_reply_empty"] = (
+                    not str(_r.reply or "").strip() if _r is not None else None
+                )
+                artifact["flags"]["followup_ack"] = (
+                    str(getattr(_r, "ack", "") or "") if _r is not None else None
                 )
                 artifact["flags"]["followup_writes"] = sum(
                     max(0, after_counts[k] - before_counts[k]) for k in before_counts
@@ -712,14 +724,16 @@ class EvalEngine:
             session.rollback()
             return None, str(getattr(exc, "code", "") or type(exc).__name__)
         session.refresh(session_row)
-        self._append_message(
-            session,
-            session_id=session_row.id,
-            role="assistant",
-            content=result.reply,
-            trace_id=trace_id,
-            intent=result.intent,
-        )
+        # W5 真静默:blocked 轮不补空 assistant 消息(见主循环同款处理)
+        if result.ai_replied:
+            self._append_message(
+                session,
+                session_id=session_row.id,
+                role="assistant",
+                content=result.reply,
+                trace_id=trace_id,
+                intent=result.intent,
+            )
         session.commit()
         return result, None
 

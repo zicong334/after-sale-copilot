@@ -51,15 +51,10 @@ from app.llm import (
     INTENT_POLICY_QA,
     LLMClient,
 )
-from app.models import ChatMessage, ChatSession
+from app.models import ChatMessage, ChatSession, Ticket
 from app.perception import Percept, normalize
+from app.services import tickets as ticket_service
 from app.trace import EVENT_ROUTE_BLOCKED, new_trace_id, record_event
-
-#: 会话已转人工后,后续消息的固定回复(W2-C 原文,测试侧依赖该字符串语义)。
-HANDOFF_BLOCKED_REPLY = (
-    "您的问题已转交人工客服处理,工单已进入人工队列,坐席会尽快回复。"
-    "为避免与人工重复,我先不再自动作答;如需补充信息请直接留言。"
-)
 
 #: 四类意图(仅用于兜底校验;分类结果由 classify 节点给出)。
 _INTENTS = (INTENT_POLICY_QA, INTENT_ORDER_JUDGE, INTENT_HANDOFF, INTENT_OTHER)
@@ -79,6 +74,10 @@ class TurnResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     session_status: str = "active"
     ai_replied: bool = True
+    #: W5 真静默:AI 不吐字时的"系统回执"文本(不是 AI 气泡),仅前端提示用。
+    ack: str = ""
+    #: W5:回执对应的工单 id(买家消息已追加进该工单);没关联到工单时为 None。
+    ack_ticket_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,6 +91,8 @@ class TurnResult:
             "tool_calls": list(self.tool_calls),
             "session_status": self.session_status,
             "ai_replied": self.ai_replied,
+            "ack": self.ack,
+            "ack_ticket_id": self.ack_ticket_id,
         }
 
 
@@ -332,6 +333,29 @@ def handle_turn(
     )
 
 
+def _latest_open_ticket(session: Session, session_row: ChatSession) -> Ticket | None:
+    """定位该会话对应的最近一个未关闭工单。
+
+    Ticket 无 session_id 列(W1-A 冻结),只能按 merchant_id + customer_id 关联;
+    "最近"= last_msg_at 降序(NULL 排最后),同值再按 created_at 降序。
+    """
+    return session.scalars(
+        select(Ticket)
+        .where(
+            Ticket.merchant_id == session_row.merchant_id,
+            Ticket.customer_id == session_row.customer_id,
+            Ticket.status != "closed",
+        )
+        .order_by(
+            # 非 NULL 优先(兼容不支持 "NULLS LAST" 的方言)
+            Ticket.last_msg_at.is_(None),
+            Ticket.last_msg_at.desc(),
+            Ticket.created_at.desc(),
+        )
+        .limit(1)
+    ).first()
+
+
 def build_blocked_turn(
     *,
     session: Session,
@@ -339,7 +363,22 @@ def build_blocked_turn(
     trace_id: str,
     text: str,
 ) -> TurnResult:
-    """会话已 handed_off 时的路由守卫:只记一条拦截事件,不跑图、不调工具。"""
+    """会话已 handed_off 时的路由守卫:AI 真静默,买家文本只追加到工单。
+
+    W5 修正一:不再回固定话术(``reply=""``、``ai_replied=False``),避免与人工重复;
+    买家这条消息照常落 ``chat_message``,并追加到该会话最近一个未关闭工单
+    (``ticket_message.author_type='user'``);返回轻量 ``ack`` 供前端提示。
+    全轮只写 1 条 ``EVENT_ROUTE_BLOCKED`` trace,不跑图、不调工具。
+    """
+    ack = "消息已记录,坐席会尽快跟进。"
+    ack_ticket_id: str | None = None
+    ticket = _latest_open_ticket(session, session_row)
+    if ticket is not None:
+        # 守卫式写入(关单后会被 tickets.add_message 拒绝),不在这里重写状态机
+        ticket_service.add_message(session, ticket.id, "user", text)
+        ack_ticket_id = ticket.id
+        ack = f"消息已追加到工单 #{ticket.id},坐席会尽快跟进。"
+
     record_event(
         session,
         trace_id=trace_id,
@@ -352,10 +391,12 @@ def build_blocked_turn(
         confidence=1.0,
         intent_reason="会话已转人工,不再自动作答",
         classification_path="route_guard",
-        reply=HANDOFF_BLOCKED_REPLY,
+        reply="",
         citations=[],
         pending_confirm=None,
         tool_calls=[],
         session_status=str(session_row.status or "active"),
         ai_replied=False,
+        ack=ack,
+        ack_ticket_id=ack_ticket_id,
     )

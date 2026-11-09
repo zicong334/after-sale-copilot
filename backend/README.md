@@ -60,6 +60,7 @@
 :: ① 一键起服务(迁移 → 空库自动 seed → uvicorn;Ctrl+C 停止)
 serve.bat
 :: 浏览器打开 http://127.0.0.1:8000/health 应返回 {"ok":true,"status":"healthy"};聊天页 http://127.0.0.1:8000/
+:: 客服工作台(演示环境无坐席登录/无密码,页面顶部已声明):http://127.0.0.1:8000/agent.html
 ```
 
 ```bat
@@ -79,10 +80,23 @@ run_eval.bat
 - 起服务的环境变量:`SERVE_HOST`(默认 `127.0.0.1`)、`SERVE_PORT`(默认 `8000`)、`DATABASE_URL`。
 - 评测参数见 `backend/scripts/run_eval.py --help`(默认 `--repeat 3`,报告落 `data/eval/reports/`)。
 
+### 4.1 前端两页(原生 HTML/CSS/JS,零 CDN、零构建)
+
+| 页面 | 路径 | 说明 |
+|---|---|---|
+| 买家聊天页 | `/` 或 `/chat.html` | 转人工后轮询会话摘要,展示「人工客服」气泡(不显示坐席内部备注);工单关闭后禁用输入 |
+| 客服工作台 | `/agent.html` | 工单队列(queued 优先 → `last_msg_at` 倒序)、领单、回复(可内部备注)、关单;**演示环境无坐席登录/无密码**,页面顶部已声明 |
+
+工作台 API 前缀 `/api/b`(W5 新增,实现在 `backend/app/api/agent.py`):`GET /services`、
+`GET /tickets`、`GET /tickets/{id}`、`POST /tickets/{id}/claim`、`POST /tickets/{id}/messages`、
+`POST /tickets/{id}/close`。状态机守卫直接复用 `backend/app/services/tickets.py`
+(claim/close/add_message),本模块只做投影与错误体翻译,不重写守卫;领单被抢 409、
+关单后再回复/再关单 409 的语义与 `/api/c/handoff` 一致。
+
 ## 5. 测试
 
 ```bat
-:: 全量测试(263 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(367 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
@@ -100,7 +114,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:351 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:367 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -121,7 +135,7 @@ set PYTHONPATH=%CD%\backend
 |---|---|---|
 | `backend/app/llm/base.py:115` | `FakeLLM`:关键词规则分类 + 模板回复,无网络、无模型 | 评测=Mock 基线,不是真模型能力;`model_name` 返回 `fake-rule-v1 (MOCK)` |
 | `backend/app/eval/judge.py:110` | `FakeJudge`:确定性规则打分,`scored_by=heuristic` | 裁判一致率只能证明判定链路自洽;W4-C 用真裁判 |
-| `backend/app/api/chat.py:78` | `usage` 计量:按字符数估 token × MOCK 价目,`estimated: true` | 前端显示的 token/成本是估算值,不是账单 |
+| `backend/app/api/chat.py:52` | `usage` 计量:按字符数估 token × MOCK 价目,`estimated: true` | 前端显示的 token/成本是估算值,不是账单 |
 | `backend/app/eval/engine.py:57` | 评测 `cost_per_case`:与 chat 完全一致的 MOCK 口径 | 报告 `cost_per_case_usd` 是估算 |
 | `backend/app/graph/nodes.py:101` | 无命中 query rewrite:关键词映射 | 检索改写能力弱于 LLM rewrite |
 | `backend/app/memory/store.py:176` | 任务结束记忆抽取:规则回退(FakeLLM 不支持抽取 schema) | 抽取出的是规则候选,不是模型抽取 |
@@ -218,10 +232,12 @@ set PYTHONPATH=%CD%\backend
 
 ```
 backend/
-├── app/            main.py / db.py / models/ / api/ / services/ / tools/ / graph/ /
-│                   memory/ / retrieval/ / eval/ / perception / schemas/ / trace
+├── app/            main.py / db.py / models/ / api/(含 agent.py:工作台 API) / services/ /
+│                   tools/ / graph/ / memory/ / retrieval/ / eval/ / perception / schemas/ / trace
 ├── alembic/        0001_initial → 0002_add_tool_events → 0003_ticket_summary → 0004_memory
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          263 个用例(含 test_delivery.py 交付验收)
+├── tests/          367 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
 └── README.md       本文件
+
+frontend/           chat.html / app.js / agent.html / agent.js / style.css(原生实现,零 CDN、零构建)
 ```

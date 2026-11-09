@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>售后 Copilot · 客服工作台</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="toast-wrap" id="toastWrap" aria-live="polite" aria-atomic="false"></div>
+
+  <div class="workbench">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">台</span>
+        <span>售后 Copilot</span>
+        <span class="brand-sub">客服工作台</span>
+      </div>
+      <div class="agent-picker">
+        <label for="agentSelect">当前坐席</label>
+        <select id="agentSelect" aria-label="选择当前坐席"></select>
+      </div>
+      <span class="demo-note">演示环境无密码</span>
+    </header>
+
+    <main class="wb-main">
+      <section class="panel queue-panel" aria-label="工单队列">
+        <div class="panel-head">
+          <span class="panel-title">工单队列<span class="count" id="queueCount">0</span></span>
+          <button class="btn btn-ghost btn-sm" id="refreshBtn" type="button">刷新</button>
+        </div>
+        <div class="queue-filters" id="queueFilters" role="group" aria-label="按状态筛选">
+          <button type="button" class="filter-chip active" data-status="">全部</button>
+          <button type="button" class="filter-chip" data-status="queued">待领取</button>
+          <button type="button" class="filter-chip" data-status="claimed">跟进中</button>
+          <button type="button" class="filter-chip" data-status="waiting_customer">待客户回复</button>
+          <button type="button" class="filter-chip" data-status="closed">已关闭</button>
+        </div>
+        <div class="queue-list" id="queueList" aria-live="polite">
+          <div class="panel-state" id="queueState">
+            <div class="state-icon" aria-hidden="true">…</div>
+            正在加载工单队列…
+          </div>
+        </div>
+      </section>
+
+      <section class="panel detail-panel" aria-label="工单详情">
+        <div class="detail-empty" id="detailEmpty">
+          <div class="state-icon" aria-hidden="true">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+                 stroke-linejoin="round">
+              <path d="M4 4h16v13H7l-3 3V4Z" />
+              <path d="M8 9h8M8 12.5h5" />
+            </svg>
+          </div>
+          <h3>选择左侧工单开始处理</h3>
+          <p>队列按「待领取优先 + 最近消息倒序」排列;领取后即可回复买家。</p>
+        </div>
+        <div class="detail-body hidden" id="detailBody" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <footer class="meta">
+      <span>本页为原生 HTML / CSS / JS,零第三方依赖、零构建工具。</span>
+      <span class="mock-line">MOCK 演示环境:无登录密码,数据来自 seed;不接真实支付与物流。</span>
+    </footer>
+  </div>
+
+  <script src="/agent.js"></script>
+</body>
+</html>

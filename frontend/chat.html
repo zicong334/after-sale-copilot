@@ -3,38 +3,64 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>售后 Copilot · 聊天</title>
+  <title>售后 Copilot · 在线客服</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
+  <div class="toast-wrap" id="toastWrap" aria-live="polite" aria-atomic="false"></div>
+
   <div class="app">
     <header class="topbar">
-      <div class="brand">售后 Copilot<span class="sub">W3-C 聊天壳 · 确认卡 · 转人工</span></div>
-      <div class="conn" id="conn">未连接</div>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">客</span>
+        <span>售后 Copilot</span>
+      </div>
+      <span class="status-badge" id="statusBadge" data-state="active">AI 接待中</span>
+      <span class="trace" id="trace">trace: -</span>
     </header>
 
-    <div class="banner hidden" id="handoffBanner">
-      <strong>已转人工</strong>
-      <span>AI 已停止自动回复,工单进入人工队列,坐席会尽快回复。</span>
-    </div>
-
     <main class="stream" id="stream" aria-live="polite">
-      <div class="hint" id="emptyHint">
-        输入问题开始对话。示例:订单 ORD-20240001 的衣服有线头,我要退货退款;
-        或直接说「转人工」。
-      </div>
+      <section class="empty" id="emptyState">
+        <div class="empty-icon" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+               stroke-linejoin="round">
+            <path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3 8.9 8.9 0 0 1-3.8-.8L3 21l1.9-4.6a8.1 8.1 0 0 1-1.4-4.6A8.4 8.4 0 0 1 12 3.3a8.4 8.4 0 0 1 9 8.2Z" />
+            <path d="M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01" />
+          </svg>
+        </div>
+        <h1>你好,我是售后 Copilot</h1>
+        <p>描述你的售后问题,我会依据店铺政策给出处理方案。需要人工介入时,随时说「转人工」。</p>
+        <div class="examples" id="examples">
+          <button type="button" class="example-chip" data-text="订单 seed-order-007 的商品有质量问题,我要退货退款">商品有质量问题,怎么退款?</button>
+          <button type="button" class="example-chip" data-text="订单 seed-order-001 的衣服有线头,我要退货退款">订单衣服有线头,想退货</button>
+          <button type="button" class="example-chip" data-text="转人工">我要转人工客服</button>
+        </div>
+      </section>
     </main>
 
+    <div class="closed-hint hidden" id="closedHint" role="status">工单已关闭,本次会话已结束。</div>
+
     <form class="composer" id="composer">
-      <input id="text" type="text" autocomplete="off"
-             placeholder="描述你的售后问题…" maxlength="2000" />
-      <button id="send" type="submit">发送</button>
+      <div class="composer-box">
+        <textarea id="text" rows="1" autocomplete="off" maxlength="2000"
+                  placeholder="描述你的售后问题…(Enter 发送,Shift+Enter 换行)"></textarea>
+        <button class="btn btn-primary btn-send" id="send" type="submit" aria-label="发送消息">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M22 2 11 13" />
+            <path d="M22 2 15 22l-4-9-9-4Z" />
+          </svg>
+        </button>
+      </div>
     </form>
-    <div class="meta">
-      <span id="trace">trace: -</span>
-      <span>本页为原生 HTML/CSS/JS,无 CDN、无构建工具;金额与用量为 MOCK 估算。</span>
-    </div>
+
+    <footer class="meta">
+      <span>本页为原生 HTML / CSS / JS,零第三方依赖、零构建工具。</span>
+      <span class="mock-line">MOCK 演示:金额与 token 用量为估算,非真实账单;不接真实支付与物流。</span>
+    </footer>
   </div>
+
   <script src="/app.js"></script>
 </body>
 </html>

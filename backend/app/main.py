@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.api import agent as agent_api
 from app.api import chat as chat_api
 from app.api import confirm as confirm_api
 from app.api import handoff as handoff_api
@@ -56,6 +57,7 @@ app.include_router(refunds_api.router)
 app.include_router(chat_api.router)
 app.include_router(confirm_api.router)
 app.include_router(handoff_api.router)
+app.include_router(agent_api.router)
 app.include_router(memory_maintenance_router)
 
 # 前端聊天壳(原生 HTML/CSS/JS,无构建工具、无 CDN):GET / 或 /chat.html → 200。

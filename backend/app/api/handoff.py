@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from app.api import get_db
 from app.db import utc_now
 from app.errors import NotFoundError, StateConflictError
-from app.models import ChatMessage, ChatSession, Ticket
+from app.models import ChatMessage, ChatSession, Ticket, TicketMessage
 from app.services import tickets as ticket_svc
 
 router = APIRouter(prefix="/api/c/handoff", tags=["handoff"])
@@ -154,6 +154,31 @@ def session_summary(session_id: str, db: Session = Depends(get_db)) -> dict[str,
             .limit(20)
         ).all()
     )
+    # W5:该会话关联工单的 ticket_message(转人工后买家追加 + 坐席回复),
+    # 让买家/摘要侧看到人工侧的工作记录(created_at asc)。
+    # 安全边界:is_internal=True 的坐席内部备注**不下发**买家侧接口
+    # (app.js 只是客户端过滤,不能当作保护;工作台 /api/b 详情仍返回内部备注)。
+    ticket_messages = (
+        [
+            {
+                "id": item.id,
+                "author_type": item.author_type,
+                "content": item.content,
+                "is_internal": bool(item.is_internal),
+                "created_at_utc": _iso(item.created_at),
+            }
+            for item in db.scalars(
+                select(TicketMessage)
+                .where(
+                    TicketMessage.ticket_id == ticket.id,
+                    TicketMessage.is_internal.is_(False),
+                )
+                .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
+            ).all()
+        ]
+        if ticket is not None
+        else []
+    )
     return {
         "ok": True,
         "session_id": row.id,
@@ -162,6 +187,9 @@ def session_summary(session_id: str, db: Session = Depends(get_db)) -> dict[str,
         "customer_id": row.customer_id,
         "ticket": _ticket_dict(ticket) if ticket is not None else None,
         "ticket_link": "merchant_id+customer_id(最近一张;Ticket 无 session_id 列)",
+        "ticket_status": ticket.status if ticket is not None else None,
+        "ticket_closed": bool(ticket is not None and ticket.status == "closed"),
+        "ticket_messages": ticket_messages,
         "messages": [
             {
                 "role": item.role,

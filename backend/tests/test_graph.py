@@ -516,7 +516,10 @@ def test_blocked_turn_does_not_run_graph(db, ckpt):
     assert result.ai_replied is False
     assert result.intent == "blocked"
     assert result.tool_calls == []
-    assert result.reply == runner.HANDOFF_BLOCKED_REPLY
+    # W5 修正一:真静默 —— 不再回固定话术,只给一条回执
+    assert result.reply == ""
+    assert result.ack == "消息已记录,坐席会尽快跟进。"
+    assert result.ack_ticket_id is None
     assert event_names(events_of(db, trace_id)) == [EVENT_ROUTE_BLOCKED]
 
 
