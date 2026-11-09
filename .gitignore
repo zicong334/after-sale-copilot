@@ -21,3 +21,6 @@ _draft_*.md
 pytest-cache-files-*/
 .w1a_tmp_*/
 .probe*/
+
+# UI 诊断工具venv(主会话验收用,非项目产物)
+.uitools/
