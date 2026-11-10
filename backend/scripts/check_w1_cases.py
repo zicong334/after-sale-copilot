@@ -25,11 +25,24 @@ W2-C 边界说明:写工具只到"确认卡",refund_request / ticket 落库由 W
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
+
+# ---------------------------------------------------------------------------
+# 评测 harness 内部模式,生产默认 enforce 不受影响。
+#
+# 本脚本用 TestClient 直连服务(等价于本地进程内调用,没有真实登录动作),
+# W8 鉴权中间件上线后默认 enforce 会让 /api/c/chat 直接 401。
+# 因此在**本进程内**把 AUTH_MODE 设为 internal:中间件放行,身份由请求体的
+# merchant_id / customer_id 内部兜底(与 W8 之前的行为一致)。
+# 该 env 只作用于本脚本进程,不写 .env、不改服务默认值——服务/生产默认仍是
+# enforce(缺 AUTH_MODE 即 enforce,见 app/security.py:auth_mode)。
+# ---------------------------------------------------------------------------
+os.environ.setdefault("AUTH_MODE", "internal")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")

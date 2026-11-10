@@ -53,6 +53,9 @@ class AuthUser(Base):
             " OR (role = 'agent' AND service_id IS NOT NULL AND customer_id IS NULL)",
             name="ck_auth_user_binding",
         ),
+        # 与迁移 0006 对齐(create_all 与 alembic 建出的 schema 完全一致):
+        # username 同时有具名唯一约束与唯一索引。
+        UniqueConstraint("username", name="uq_auth_user_username"),
     )
 
 

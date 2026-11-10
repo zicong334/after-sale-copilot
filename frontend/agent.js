@@ -94,6 +94,25 @@
   var MERCHANT_ID = ME.merchant_id || "";
   var SERVICE_ID = ME.service_id || "";
 
+  /* W8 收尾:启动时回读 /auth/me 校验登录态(token 可能已过期/被吊销)。
+   * - 401 → apiFetch 统一 gotoLogin() 清登录态并回 login.html
+   * - 服务端身份与本地缓存不一致 → 覆盖 localStorage 后 reload,重新派生 merchant/service
+   * - 网络异常 → 沿用本地缓存身份,后续业务请求的 401 仍会兜底跳转 */
+  (async function verifySession() {
+    if (!TOKEN) return;
+    try {
+      var resp = await apiFetch("/auth/me");
+      if (!resp.ok) { if (resp.status === 401) gotoLogin(); return; }
+      var data = await resp.json();
+      var user = data && data.user;
+      if (!user) return;
+      if (user.id !== ME.id || user.role !== ME.role) {
+        try { window.localStorage.setItem(USER_KEY, JSON.stringify(user)); } catch (err) { /* 隐私模式忽略 */ }
+        location.reload();
+      }
+    } catch (err) { /* 网络异常:保留缓存身份 */ }
+  })();
+
   var STATUS_LABELS = {
     queued: "待领取",
     claimed: "跟进中",

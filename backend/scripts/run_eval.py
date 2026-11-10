@@ -36,6 +36,18 @@ BACKEND = ROOT / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+# ---------------------------------------------------------------------------
+# 评测 harness 内部模式,生产默认 enforce 不受影响。
+#
+# 评测引擎(EvalEngine)走进程内 runner 直连,不经 HTTP 鉴权;但评测过程会
+# 装载 app.main 的服务层上下文,一旦进程环境里出现 AUTH_MODE=enforce 之类的
+# 外部设定,内部直连路径会被鉴权语义污染。故在**本进程内**把 AUTH_MODE 固定
+# 为 internal:内部调用链免鉴权,身份由评测用例的 customer_id/merchant_id 决定。
+# 只影响本脚本进程,不写 .env、不改服务默认值——服务/生产默认仍是 enforce
+# (缺 AUTH_MODE 即 enforce,见 app/security.py:auth_mode)。
+# ---------------------------------------------------------------------------
+os.environ.setdefault("AUTH_MODE", "internal")
+
 from app.eval.engine import EvalEngine  # noqa: E402
 from app.eval.hard_assert import evaluate as hard_evaluate  # noqa: E402
 from app.eval.judge import build_judge  # noqa: E402

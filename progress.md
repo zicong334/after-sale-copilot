@@ -35,4 +35,5 @@
 - 2026-11-09 工业化立项 | 用户批准第三轮真评(已开跑)+下达七层补齐清单;主会话出适配规划 docs/工业化路线图W8-W12_适配规划.md(本机无Docker/Redis/PG/WSL→每层"真跑替身+生产缝",禁假实现);W8 任务书已立 | 底座探针:无docker/redis/psql/wsl,16核 | 执行序:第三轮判定→W8→W9→W10→W11→W12
 - 2026-11-09 第三轮真评(终) | 用户批准执行:0.9653/critical 0/三层 1.0/agreement 0.9722,**D-11 终判=达到**;cost 1.169 元(三轮合计≈3.70 元) | 独立复算吻合 | 残余:MEMORY-001 簇待裁决;W8 解冻开派
 - 2026-11-09 二key与裁决 | 用户提供备胎模型 Minimax-M3.1-Flash(实测:api.minimaxi.com/v1+大写M ID+reasoning 模型),入 .env fallback 三件套(git 外);MEMORY-001 簇裁决=微修+单案真实复验(约0.03元,已授权),**排在 W8 验收后**(nodes.py 单写者纪律) | W8 已派(hrun-mw9diuvz) | 序:W8→MEMORY微修+复验→W9→W10(备胎真模型上线)→W11→W12
+- 2026-11-10 W8 | 接入安全+实时通讯验收通过:JWT+RBAC+限流+防重放+WS+CORS;453 测试;真截图四张;Minimax 首棒质量达标 | 452+1(我方);鉴权链/RBAC/check_w1/smoke 全过 | MEMORY 微修派发中(Minimax)
 - 
