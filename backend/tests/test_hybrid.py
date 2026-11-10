@@ -177,8 +177,8 @@ def test_fused_score_recomputable_from_details():
 
 
 def test_fusion_threshold_is_geometric_midpoint():
-    """0.005 = sqrt(0.008135 × 0.003070):覆盖下界与未覆盖上界的几何中点。"""
-    covered_floor, uncovered_ceil = 0.008135, 0.003070
+    """0.005 = sqrt(0.008135 × 0.003072):覆盖下界与未覆盖上界的几何中点。"""
+    covered_floor, uncovered_ceil = 0.008135, 0.003072
     midpoint = math.sqrt(covered_floor * uncovered_ceil)
     assert FUSION_THRESHOLD == pytest.approx(midpoint, abs=1e-4)
     assert covered_floor / FUSION_THRESHOLD > 1.3, "覆盖侧余量约 39%"
@@ -228,6 +228,9 @@ def test_stopwords_used_by_hybrid_but_bm25_default_unchanged():
     scored = backend.search(probe, threshold=0.0, clean=True)
     assert scored.results and scored.results[0].clause_id == "RP-07"
     assert len(STOPWORDS) >= 30
+    # 任务书逐字点名的停用词必须都在表里(含单字"帮",与"帮忙"互补)
+    assert {"怎么", "弄", "一下", "请问", "吗", "呢", "我", "想", "帮", "看看"} <= STOPWORDS
+    assert strip_stopwords("帮我看看这个怎么弄") == ""
 
 
 # ---------------------------------------------------------------------------

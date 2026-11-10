@@ -142,15 +142,17 @@ def main(argv: list[str]) -> int:
     engine = create_db_engine()
     with Session(engine) as session:
         stats = upsert_policies(session, chunks)
-
-    # 重建 BM25 索引(无条件全量重建;服务启动时检索层会再从表读并重建)
-    backend = BM25Backend()
-    backend.build(chunks)
+        # W9-1:向量索引与 BM25 同生命周期 —— load 时走同一条 rebuild_index 路径,
+        # 重建混合检索索引并 upsert 进 kb_vector(与 POST /api/kb/reload 一致)。
+        retriever = rebuild_index(session, POLICY_MERCHANT_ID, persist=True)
+        session.commit()
 
     print(
         f"装载完成: 条款数={len(chunks)} inserted={stats['inserted']} "
         f"updated={stats['updated']} knowledge_item 总行数={stats['total']} "
-        f"BM25 索引条数={len(chunks)}"
+        f"BM25 索引条数={retriever.clause_count} "
+        f"向量维数={retriever.vector_dim} "
+        f"kb_vector 行数={retriever.persisted_rows}"
     )
     return 0
 

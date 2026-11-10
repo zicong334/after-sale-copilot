@@ -254,6 +254,7 @@ def update_item(
     """更新条款;正文/标题/条款号变化 → ``version+1``(检索结果带新版本)。"""
     row = _get_item(db, identity.merchant_id, item_id)
     changed = payload.model_dump(exclude_unset=True)
+    content_dirty = False
 
     if "clause_id" in changed and changed["clause_id"] != row.clause_id:
         clash = _same_clause(
@@ -267,8 +268,9 @@ def update_item(
                 param="clause_id",
             )
         row.clause_id = changed["clause_id"]
+        # 条款号是检索结果的身份字段,变更同样视为内容变更并升版本
+        content_dirty = True
 
-    content_dirty = False
     if "title" in changed and changed["title"] != row.title:
         row.title = changed["title"]
         content_dirty = True

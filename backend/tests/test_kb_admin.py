@@ -143,6 +143,18 @@ def test_patch_content_bumps_version(client):
     assert again.json()["item"]["version"] == "2"
 
 
+def test_patch_clause_id_bumps_version(client):
+    """条款号是检索结果的身份字段,变更同样升版本(docstring 承诺)。"""
+    item = _create(client, "RP-34", "改号测试正文。").json()["item"]
+    resp = client.patch(
+        f"/api/kb/items/{item['id']}", json={"clause_id": "RP-35"}, headers=_auth(AGENT)
+    )
+    assert resp.status_code == 200
+    updated = resp.json()["item"]
+    assert updated["clause_id"] == "RP-35"
+    assert updated["version"] == "2"
+
+
 def test_patch_rejects_unknown_status_via_validation(client):
     item = _create(client, "RP-33", "测试正文。").json()["item"]
     resp = client.patch(
