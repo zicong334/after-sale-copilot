@@ -22,10 +22,15 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Callable, Iterator
 
 # 消息类型:OpenAI 风格
 Message = dict[str, str]
+
+#: 流式分块长度(与 SSE 通道的 ``_MESSAGE_CHUNK_CHARS`` 对齐)
+STREAM_CHUNK_CHARS = 12
 
 
 class LLMClient(ABC):
@@ -39,6 +44,68 @@ class LLMClient(ABC):
     @abstractmethod
     def complete(self, messages: list[Message], schema: dict[str, Any] | None = None) -> str:
         """返回模型输出;传入 schema 时返回 JSON 字符串。"""
+
+    def stream_text(
+        self,
+        messages: list[Message],
+        schema: dict[str, Any] | None = None,
+    ) -> Iterator[str]:
+        """真流式(W10):逐段吐出**给买家看的正文**(schema 的 ``reply`` 字段值)。
+
+        默认实现是"非流式降级":一次性 complete() 后整段吐出,保证旧客户端
+        (以及任何只实现 complete 的实现)都能直接用。真流式实现见
+        ``RealLLMClient.stream_text``(OpenAI 兼容 SSE)与
+        ``FakeLLM.stream_text``(分块模拟)。
+        """
+        raw = self.complete(messages, schema)
+        text = reply_text_from_raw(raw, schema)
+        if text:
+            yield text
+
+
+# ---------------------------------------------------------------------------
+# 流式 sink(W10):compose 节点把增量推给上层(SSE delta 事件)
+# ---------------------------------------------------------------------------
+
+#: 当前线程的流式 sink(接收正文增量);None 表示本轮不流式。
+_STREAM_SINK: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "llm_stream_sink", default=None
+)
+
+
+def current_stream_sink() -> Callable[[str], None] | None:
+    """取当前线程的流式 sink(没有则 None)。"""
+    return _STREAM_SINK.get()
+
+
+@contextmanager
+def stream_sink(sink: Callable[[str], None] | None) -> Iterator[None]:
+    """在当前上下文绑定流式 sink(退出时还原)。"""
+    token = _STREAM_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _STREAM_SINK.reset(token)
+
+
+def reply_text_from_raw(raw: str, schema: dict[str, Any] | None = None) -> str:
+    """从模型原始输出里取出"给买家看的正文"。
+
+    - 带 ``reply_text`` schema:解析 JSON 取 ``reply`` 字段(失败则回落为原串);
+    - 无 schema:原样返回。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if schema and str(schema.get("name") or "") == SCHEMA_REPLY["name"]:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+        if isinstance(data, dict):
+            return str(data.get("reply") or "")
+        return text
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +206,16 @@ class FakeLLM(LLMClient):
         if name == SCHEMA_REPLY["name"]:
             return json.dumps({"reply": self.compose(facts)}, ensure_ascii=False)
         return json.dumps({"reply": "", "note": "FakeLLM 未支持的 schema"}, ensure_ascii=False)
+
+    def stream_text(
+        self,
+        messages: list[Message],
+        schema: dict[str, Any] | None = None,
+    ) -> Iterator[str]:
+        """分块模拟真流式(W10):正文与 ``complete()`` 的 reply 字段逐字一致。"""
+        text = reply_text_from_raw(self.complete(messages, schema), schema)
+        for start in range(0, len(text), STREAM_CHUNK_CHARS):
+            yield text[start : start + STREAM_CHUNK_CHARS]
 
     # -- 意图分类 ---------------------------------------------------------
     def classify(self, text: str, facts: dict[str, Any] | None = None) -> dict[str, Any]:

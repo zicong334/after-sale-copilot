@@ -54,7 +54,7 @@ from app.llm import (
     LLMClient,
     build_facts_message,
 )
-from app.llm.base import RISK_HINTS
+from app.llm.base import RISK_HINTS, current_stream_sink
 from app.memory.injection import load_injection
 from app.memory.store import extract_and_write, extract_candidates
 from app.models import ChatMessage, ChatSession, KnowledgeItem
@@ -537,6 +537,23 @@ def make_nodes(
             messages.append(
                 {"role": "system", "content": UNTRUSTED_DATA_NOTICE + "\n" + "\n".join(untrusted)}
             )
+        sink = current_stream_sink()
+        if sink is not None:
+            # W10-4 真流式:边生成边把增量片段推给 sink(前端逐字渲染)。
+            # 轮结束后仍以最终守卫后的 draft 为准(前端完成时整卡重渲)。
+            chunks: list[str] = []
+            try:
+                for piece in llm.stream_text(messages, SCHEMA_REPLY):
+                    if not piece:
+                        continue
+                    chunks.append(piece)
+                    sink(piece)
+            except Exception:  # noqa: BLE001 - 流式不可用时退回一次性渲染
+                chunks = []
+            reply = "".join(chunks)
+            if reply:
+                return reply
+            # 流式没拿到正文:退回一次性调用(与旧路径同口径)
         try:
             raw = llm.complete(messages, SCHEMA_REPLY)
             reply = json.loads(raw).get("reply", "")

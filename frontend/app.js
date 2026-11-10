@@ -18,6 +18,11 @@
   var WS_RETRY_STEPS = [1000, 2000, 5000]; // 断线退避:1s → 2s → 5s(之后保持 5s)
   var WS_PING_MS = 25000;
 
+  /* W10:测试钩子模式(Node + 假 DOM 断言用)。
+   * 注入 window.__DSH_TEST_HOOKS__ 即视为测试模式:跳过登录守卫与 /auth/me 自检,
+   * 保证 DOM 残缺(假 DOM)时也能注册钩子。正常浏览器没有该变量,行为完全不变。 */
+  var TEST_MODE = !!(typeof window !== "undefined" && window.__DSH_TEST_HOOKS__);
+
   /* ------------------------- W8 登录态 / 统一请求封装 ------------------------ */
 
   function readToken() {
@@ -97,10 +102,12 @@
   /* 身份一律来自 token(不再读 URL ?merchant_id=&customer_id=) */
   var ME = readUser();
   var TOKEN = readToken();
-  if (!TOKEN || !ME || ME.role !== "buyer") {
+  if ((!TOKEN || !ME || ME.role !== "buyer") && !TEST_MODE) {
     gotoLogin();
     return;
   }
+  // 测试模式下可能没有登录态,补一个最小身份,避免后续取字段报错
+  if (!ME) ME = { id: "", username: "", role: "buyer", merchant_id: "", customer_id: "" };
   var MERCHANT_ID = ME.merchant_id || "";
   var CUSTOMER_ID = ME.customer_id || "";
   // 会话 id 按买家分开存:同一浏览器切换买家账号不会串会话
@@ -111,7 +118,7 @@
    * - 服务端身份与本地缓存不一致 → 覆盖 localStorage 后 reload,重新派生 merchant/customer/session
    * - 网络异常 → 沿用本地缓存身份,后续业务请求的 401 仍会兜底跳转 */
   (async function verifySession() {
-    if (!TOKEN) return;
+    if (!TOKEN || TEST_MODE) return;
     try {
       var resp = await apiFetch("/auth/me");
       if (!resp.ok) { if (resp.status === 401) gotoLogin(); return; }
@@ -794,14 +801,16 @@
     els.input.style.height = Math.max(next, 40) + "px";
   }
 
-  els.input.addEventListener("input", autoResize);
+  if (els.input) {
+    els.input.addEventListener("input", autoResize);
 
-  els.input.addEventListener("keydown", function (ev) {
-    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
-      ev.preventDefault();
-      els.form.requestSubmit ? els.form.requestSubmit() : els.form.dispatchEvent(new Event("submit", { cancelable: true }));
-    }
-  });
+    els.input.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        els.form.requestSubmit ? els.form.requestSubmit() : els.form.dispatchEvent(new Event("submit", { cancelable: true }));
+      }
+    });
+  }
 
   if (els.examples) {
     els.examples.addEventListener("click", function (ev) {
@@ -813,14 +822,16 @@
     });
   }
 
-  els.form.addEventListener("submit", function (ev) {
-    ev.preventDefault();
-    var text = els.input.value.trim();
-    if (!text || state.busy || state.closed) return;
-    els.input.value = "";
-    autoResize();
-    sendTurn(text);
-  });
+  if (els.form) {
+    els.form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var text = els.input.value.trim();
+      if (!text || state.busy || state.closed) return;
+      els.input.value = "";
+      autoResize();
+      sendTurn(text);
+    });
+  }
 
   /* ---------------------------------- SSE -------------------------------- */
 
@@ -842,12 +853,30 @@
   function handleFrame(frame, ui, meta) {
     var data = frame.data || {};
     switch (frame.event) {
+      case "delta":
+        // W10 真流式:模型吐字时实时下发,逐字追加渲染到 AI 气泡。
+        // 不支持流式的服务端不会发这一帧(0 帧),此时走 message 帧的旧追加路径。
+        meta.streamed = true;
+        if (ui.ensureAi) {
+          var streamAi = ui.ensureAi();
+          meta.reply += data.delta || "";
+          streamAi.bubble.textContent = meta.reply;
+          scrollBottom();
+        }
+        break;
       case "message":
         if (ui.ensureAi) {
-          var ai = ui.ensureAi();
-          meta.reply += data.delta || "";
-          ai.bubble.textContent = meta.reply;
-          scrollBottom();
+          if (meta.streamed) {
+            // 本轮已经收到过 delta 帧:正文已逐字渲染过一遍,
+            // message 帧只作最终一致性兜底(记进 meta.messageReply 供 done 校验),
+            // **不能**再追加到气泡,否则整段回复会重复显示。
+            meta.messageReply += data.delta || "";
+          } else {
+            var ai = ui.ensureAi();
+            meta.reply += data.delta || "";
+            ai.bubble.textContent = meta.reply;
+            scrollBottom();
+          }
         }
         break;
       case "citation":
@@ -873,6 +902,16 @@
         break;
       case "done":
         meta.done = data;
+        // W10:done.reply 是权威最终文案 → 覆盖 AI 气泡(完成后整卡重渲)。
+        // meta.reply 同步为最终文案,保证「本轮无自动回复」等收尾判断用的是权威文本。
+        if (typeof data.reply === "string" && data.reply.length) {
+          meta.reply = data.reply;
+          if (ui.ensureAi) {
+            var doneAi = ui.ensureAi();
+            doneAi.bubble.textContent = data.reply;
+            scrollBottom();
+          }
+        }
         if (data.session_id) {
           state.sessionId = data.session_id;
           saveSession();
@@ -900,6 +939,41 @@
     }
   }
 
+  /**
+   * 一轮对话的渲染状态(气泡承载 + 引用 + 用量)。
+   * 抽成工厂是为了让 sendTurn 与前端测试共用同一份状态结构,避免两边漂移。
+   * - reply:当前已渲染进气泡的正文
+   * - messageReply:message 帧的累计文本(流式时只作一致性校验,不进气泡)
+   * - streamed:本轮是否收到过 delta 帧
+   */
+  function createTurnMeta() {
+    return {
+      reply: "",
+      messageReply: "",
+      citations: [],
+      done: null,
+      usage: null,
+      acked: false,
+      streamed: false
+    };
+  }
+
+  /** 一轮对话的 DOM 句柄:loading 行 + 懒建的 AI 气泡。 */
+  function createTurnUi() {
+    var ui = { loading: null, ensureAi: null, getAi: null };
+    var ai = null;
+    ui.ensureAi = function () {
+      if (!ai) {
+        removeNode(ui.loading);
+        ui.loading = null;
+        ai = addBubble("ai", "");
+      }
+      return ai;
+    };
+    ui.getAi = function () { return ai; };
+    return ui;
+  }
+
   async function sendTurn(text) {
     text = String(text || "").trim();
     if (!text || state.busy || state.closed) return;
@@ -912,18 +986,9 @@
     els.send.disabled = true;
     els.input.focus();
 
-    var ui = { loading: showLoading(), ensureAi: null };
-    var meta = { reply: "", citations: [], done: null, usage: null, acked: false };
-    var ai = null;
-
-    ui.ensureAi = function () {
-      if (!ai) {
-        removeNode(ui.loading);
-        ui.loading = null;
-        ai = addBubble("ai", "");
-      }
-      return ai;
-    };
+    var ui = createTurnUi();
+    ui.loading = showLoading();
+    var meta = createTurnMeta();
 
     var body = {
       merchant_id: MERCHANT_ID,
@@ -966,6 +1031,7 @@
       removeNode(ui.loading);
       ui.loading = null;
 
+      var ai = ui.getAi();
       if (meta.citations.length && ai) renderCitations(ai.wrap, meta.citations);
       if (meta.usage && ai) renderUsage(ai.wrap, meta.usage);
       if (ai && !meta.reply.trim()) ai.bubble.textContent = "(本轮无自动回复)";
@@ -986,28 +1052,54 @@
 
   /* --------------------------------- 启动 -------------------------------- */
 
-  renderStatus();
-  autoResize();
-  els.input.focus();
+  function boot() {
+    renderStatus();
+    autoResize();
+    if (els.input) els.input.focus();
 
-  /* W8:退出登录(清 token/用户/本次会话 id 的登录态,回登录页) */
-  if (els.logoutBtn) {
-    els.logoutBtn.addEventListener("click", function () {
-      closeWs();
-      try {
-        window.localStorage.removeItem(TOKEN_KEY);
-        window.localStorage.removeItem(USER_KEY);
-      } catch (err) { /* 隐私模式忽略 */ }
-      location.replace("/login.html");
-    });
+    /* W8:退出登录(清 token/用户/本次会话 id 的登录态,回登录页) */
+    if (els.logoutBtn) {
+      els.logoutBtn.addEventListener("click", function () {
+        closeWs();
+        try {
+          window.localStorage.removeItem(TOKEN_KEY);
+          window.localStorage.removeItem(USER_KEY);
+        } catch (err) { /* 隐私模式忽略 */ }
+        location.replace("/login.html");
+      });
+    }
+
+    /* W8:恢复本买家上次的会话 id → 先跑旧轮询,再连 WS 主通道(WS 就绪后轮询自动暂停) */
+    (function bootSession() {
+      var saved = loadSession();
+      if (!saved) return;
+      state.sessionId = saved;
+      startPolling();
+      connectWs();
+    })();
   }
 
-  /* W8:恢复本买家上次的会话 id → 先跑旧轮询,再连 WS 主通道(WS 就绪后轮询自动暂停) */
-  (function bootSession() {
-    var saved = loadSession();
-    if (!saved) return;
-    state.sessionId = saved;
-    startPolling();
-    connectWs();
-  })();
+  try {
+    boot();
+  } catch (err) {
+    // 测试模式(假 DOM 场景)下,启动期异常不许阻断测试钩子注册;
+    // 正常浏览器保持原有行为:异常照常抛出。
+    if (!TEST_MODE) throw err;
+  }
+
+  /* W10:测试钩子(Node + 假 DOM 断言用)。
+   * 正常浏览器没有 window.__DSH_TEST_HOOKS__,这段不会执行。 */
+  if (typeof window !== "undefined" && window.__DSH_TEST_HOOKS__) {
+    window.__DSH_TEST_HOOKS__.app = {
+      parseFrame: parseFrame,
+      handleFrame: handleFrame,
+      addBubble: addBubble,
+      renderCitations: renderCitations,
+      renderUsage: renderUsage,
+      state: state,
+      // 以下两项是给测试用的工厂:与 sendTurn 共用同一份状态/句柄结构,避免测试与线上漂移
+      createTurnMeta: createTurnMeta,
+      createTurnUi: createTurnUi
+    };
+  }
 })();

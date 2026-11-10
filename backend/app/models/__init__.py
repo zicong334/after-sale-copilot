@@ -20,6 +20,7 @@ from app.models.catalog import Product, ProductMetric, ProductVariant, Review  #
 from app.models.chat import ChatMessage, ChatSession  # noqa: E402,F401
 from app.models.eval import EvalCase  # noqa: E402,F401
 from app.models.kb import KB_STATUS_ACTIVE, KbVector, KnowledgeItem  # noqa: E402,F401
+from app.models.jobs import Job, TurnAudit  # noqa: E402,F401
 from app.models.merchant import Merchant  # noqa: E402,F401
 from app.models.orders import Order, OrderItem, RefundRequest  # noqa: E402,F401
 from app.models.ticket import Ticket, TicketMessage  # noqa: E402,F401

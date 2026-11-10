@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
@@ -208,8 +209,119 @@ def _sanitize_error_body(body: str) -> str:
     return text[:300]
 
 
+#: 流式 JSON 里 reply 字段的定位正则(``"reply": "``)
+_REPLY_KEY_RE = re.compile(r'"reply"\s*:\s*"')
+
+_ESCAPES = {
+    "n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f",
+    '"': '"', "\\": "\\", "/": "/",
+}
+
+
+def _unescape_char(char: str) -> str:
+    return _ESCAPES.get(char, char)
+
+
+def _extract_delta_content(event: dict[str, Any]) -> str:
+    """从一条 SSE 事件里取 ``choices[0].delta.content``(兼容分段数组)。"""
+    choices = event.get("choices") or []
+    if not choices:
+        return ""
+    delta = dict(choices[0].get("delta") or {})
+    content = delta.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text") or "") for part in content if isinstance(part, dict)
+        )
+    return ""
+
+
+class _ReplyTextExtractor:
+    """从流式 JSON 正文里**增量**抽取 ``reply`` 字段的字符串值。
+
+    真流式下模型逐块吐 JSON 片段(``{"reply":"第一段`` / ``第二段"}``),
+    这里边收边抽,只把已闭合的正文增量吐给上层。
+    """
+
+    def __init__(self, schema: dict[str, Any] | None = None) -> None:
+        self._json_mode = bool(schema) and str(schema.get("name") or "") == "reply_text"
+        self._buf = ""
+        self._state = "seek"
+        self._finished = False
+
+    def feed(self, chunk: str) -> list[str]:
+        """喂入一段原始内容,返回可立即吐出的正文增量。"""
+        if self._finished or not chunk:
+            return []
+        if not self._json_mode:
+            return [chunk]
+        self._buf += chunk
+        out: list[str] = []
+        while True:
+            if self._state == "seek":
+                match = _REPLY_KEY_RE.search(self._buf)
+                if match is None:
+                    if len(self._buf) > 64:
+                        self._buf = self._buf[-64:]
+                    break
+                self._buf = self._buf[match.end() :]
+                self._state = "body"
+                continue
+            buf = self._buf
+            consumed = 0
+            piece: list[str] = []
+            while consumed < len(buf):
+                char = buf[consumed]
+                if char == "\\":
+                    if consumed + 1 >= len(buf):
+                        break
+                    nxt = buf[consumed + 1]
+                    if nxt == "u":
+                        if consumed + 6 > len(buf):
+                            break
+                        try:
+                            piece.append(chr(int(buf[consumed + 2 : consumed + 6], 16)))
+                        except ValueError:
+                            piece.append(nxt)
+                        consumed += 6
+                        continue
+                    piece.append(_unescape_char(nxt))
+                    consumed += 2
+                    continue
+                if char == '"':
+                    self._state = "done"
+                    self._finished = True
+                    consumed += 1
+                    break
+                piece.append(char)
+                consumed += 1
+            text = "".join(piece)
+            if text:
+                out.append(text)
+            self._buf = buf[consumed:]
+            if self._finished or consumed == 0:
+                break
+        return out
+
+    def close(self) -> list[str]:
+        """流结束:把未闭合的尾巴当作正文吐出(模型被截断时的兜底)。"""
+        if self._finished or not self._json_mode:
+            return []
+        rest = self._buf
+        self._buf = ""
+        self._finished = True
+        return [rest] if rest else []
+
+
 class RealLLMClient(LLMClient):
     """OpenAI 兼容 Chat Completions 客户端(DeepSeek / 同类网关)。"""
+
+    #: 部署档位(primary=主用,fallback=热备);由路由层(W10)读取。
+    tier: str = "primary"
+    #: 供应商标识(写入 trace / 回执)。
+    provider: str = "deepseek"
 
     def __init__(
         self,
@@ -356,6 +468,76 @@ class RealLLMClient(LLMClient):
             )
             return text
 
+    def stream_text(
+        self,
+        messages: list[Message],
+        schema: dict[str, Any] | None = None,
+        *,
+        temperature: float | None = None,
+    ) -> Iterator[str]:
+        """真流式(W10):OpenAI 兼容 SSE,逐段吐出 ``reply`` 字段的正文增量。
+
+        与 :meth:`complete` 的差异:
+        - 请求体 ``stream: True``;
+        - **不重试**(重试会把已吐出的正文重复一遍),失败直接抛;
+        - 空正文护栏与 complete() 同款:正文为空抛 :class:`LLMEmptyContentError`。
+        """
+        payload_messages = self._with_schema_instruction(messages, schema)
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": payload_messages,
+            "temperature": self.temperature if temperature is None else float(temperature),
+            "max_tokens": self.max_tokens,
+            "stream": True,
+        }
+        if schema is not None:
+            body["response_format"] = {"type": "json_object"}
+
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        extractor = _ReplyTextExtractor(schema)
+        emitted = False
+        try:
+            with self._http.stream("POST", url, headers=headers, json=body) as response:
+                if response.status_code != 200:
+                    response.read()
+                    self._raise_for_status(response, response.text)
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:") :].strip()
+                    if not payload:
+                        continue
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    content = _extract_delta_content(event)
+                    if not content:
+                        continue
+                    for piece in extractor.feed(content):
+                        emitted = True
+                        yield piece
+        except httpx.TimeoutException as exc:
+            raise LLMApiError("请求超时") from exc
+        except httpx.HTTPError as exc:
+            raise LLMApiError(f"网络错误:{type(exc).__name__}") from exc
+
+        for piece in extractor.close():
+            emitted = True
+            yield piece
+        if not emitted:
+            self._bump(empty_responses=1)
+            raise LLMEmptyContentError(
+                "模型流式返回空正文(reasoning 模型 max_tokens 不足或上游截断)"
+                f"model={self.model}"
+            )
+
     # -------------------------------------------------------------- 内部实现
     @staticmethod
     def _with_schema_instruction(
@@ -381,32 +563,37 @@ class RealLLMClient(LLMClient):
         except httpx.HTTPError as exc:
             raise LLMApiError(f"网络错误:{type(exc).__name__}") from exc
 
+        self._raise_for_status(response, response.text)
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise LLMApiError("响应不是合法 JSON") from exc
+
+    @staticmethod
+    def _raise_for_status(response: httpx.Response, body_text: str) -> None:
+        """按状态码分流错误(与流式/非流式共用,保证语义一致)。"""
         if response.status_code in (401, 402, 403, 429):
             raise LLMBatchAbort(
                 f"鉴权/余额/限流错误 {response.status_code},立即中止:"
-                f"{_sanitize_error_body(response.text)}",
+                f"{_sanitize_error_body(body_text)}",
                 status_code=response.status_code,
             )
         if response.status_code in (400, 404, 422):
             raise LLMConfigError(
                 f"请求被拒 {response.status_code}(检查模型名/schema 支持):"
-                f"{_sanitize_error_body(response.text)}"
+                f"{_sanitize_error_body(body_text)}"
             )
         if response.status_code >= 500:
             raise LLMBatchAbort(
                 f"上游 {response.status_code},立即中止本批:"
-                f"{_sanitize_error_body(response.text)}",
+                f"{_sanitize_error_body(body_text)}",
                 status_code=response.status_code,
             )
         if response.status_code != 200:
             raise LLMConfigError(
                 f"未预期状态码 {response.status_code}:"
-                f"{_sanitize_error_body(response.text)}"
+                f"{_sanitize_error_body(body_text)}"
             )
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise LLMApiError("响应不是合法 JSON") from exc
 
     @staticmethod
     def _extract_content(data: dict[str, Any]) -> str:

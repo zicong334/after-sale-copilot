@@ -416,11 +416,20 @@ def get_retriever(session: Session, merchant_id: str) -> HybridRetriever:
 
 
 def invalidate_cache(merchant_id: str | None = None) -> None:
-    """清缓存(``None`` 清全部);测试与 reload 用。"""
+    """清缓存(``None`` 清全部);测试与 reload 用。
+
+    W10-2:KB 热更新时**语义缓存**也要一起失效 —— 条款变了,缓存里的旧答案
+    不能继续命中。这里用模块级延迟 import 拿语义缓存单例,避免
+    ``app.cache`` 与 ``app.retrieval`` 之间形成循环依赖。
+    """
     if merchant_id is None:
         _CACHE.clear()
     else:
         _CACHE.pop(merchant_id, None)
+
+    from app.cache import semantic_cache  # 延迟 import:避免循环依赖
+
+    semantic_cache.clear()
 
 
 __all__ = [

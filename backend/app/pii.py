@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterator
 
 from app.guardrails import PII_PATTERNS, PII_PLACEHOLDER_RE
 from app.llm.base import LLMClient, Message
@@ -102,6 +102,40 @@ class MaskingLLM(LLMClient):
     def complete(self, messages: list[Message], schema: dict[str, Any] | None = None) -> str:
         masked = mask_messages(messages, self.masker)
         return self.masker.restore(self.inner.complete(masked, schema))
+
+    def stream_text(
+        self,
+        messages: list[Message],
+        schema: dict[str, Any] | None = None,
+    ) -> Iterator[str]:
+        """真流式(W10):出网前 mask,回包逐段 restore。
+
+        占位符可能被切在两块之间(如 ``[PHONE`` + ``_1]``),这里按"完整占位符"
+        边界切分:未闭合的 ``[`` 片段留到下一块再还原,避免吐出半个占位符。
+        """
+        masked = mask_messages(messages, self.masker)
+        pending = ""
+        for piece in self.inner.stream_text(masked, schema):
+            pending += piece
+            cut = self._safe_cut(pending)
+            if cut <= 0:
+                continue
+            text, pending = pending[:cut], pending[cut:]
+            if text:
+                yield self.masker.restore(text)
+        if pending:
+            yield self.masker.restore(pending)
+
+    @staticmethod
+    def _safe_cut(text: str) -> int:
+        """返回可安全吐出的前缀长度(不切断占位符)。"""
+        start = text.rfind("[")
+        if start == -1:
+            return len(text)
+        end = text.rfind("]")
+        if end == -1 or end < start:
+            return start
+        return end + 1
 
     def __getattr__(self, name: str) -> Any:
         # 未定义的属性(usage / last_usage / 价格表等)一律代理给内层客户端。

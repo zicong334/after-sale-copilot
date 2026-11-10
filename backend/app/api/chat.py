@@ -31,6 +31,8 @@ assistant ``chat_message``、响应体整键不含 ``usage``;SSE 只发 ``append
 from __future__ import annotations
 
 import json
+import queue
+import threading
 import time
 from typing import Any, Iterator
 
@@ -45,6 +47,7 @@ from app.errors import AppError, NotFoundError
 from app.models import ChatMessage, ChatSession, Ticket
 from app.graph import runner
 from app.llm import LLMError, build_llm
+from app.llm.base import stream_sink
 from app.perception import PerceptionError, normalize
 from app.pii import MaskingLLM, PIIMasker
 from app.trace import new_trace_id, record_event
@@ -432,16 +435,105 @@ def _frames(body: dict[str, Any]) -> Iterator[str]:
     yield _sse("done", done)
 
 
+#: W10-4 真流式:工作线程与 SSE 生成器之间的哨兵(表示"整轮已算完")
+_STREAM_DONE = object()
+
+
+def _stream_frames(
+    payload: ChatRequest, db: Session, identity: security.Identity
+) -> Iterator[str]:
+    """真流式(W10-4):工作线程跑整轮,SSE 生成器边收边吐 ``delta`` 增量。
+
+    契约(与旧 ``_frames`` 兼容,只多一个 ``delta`` 事件类型):
+
+    1. ``delta``:模型生成一段就吐一段(逐字增量),前端据此逐字渲染;
+    2. 整轮结束后仍按旧契约补发 ``message``(12 字分片,拼接 == done.reply)/
+       ``citation`` / ``confirm_request`` / ``handoff_notice`` / ``usage`` / ``done``;
+       前端收到 ``done`` 后整卡重渲,保证最终正文与守卫后的定稿一致;
+    3. 阻塞轮(blocked)没有 AI 正文:不产生 ``delta``,只发 ``append_ack`` + ``done``。
+
+    整轮在**工作线程**里跑(会话级 Session 不跨线程共享:worker 自开一个
+    Session 连同一个 engine),SSE 生成器只做"取增量 → yield"。
+    """
+    deltas: "queue.Queue[Any]" = queue.Queue()
+    outcome: dict[str, Any] = {}
+
+    def _push(piece: str) -> None:
+        deltas.put(piece)
+
+    def _worker() -> None:
+        try:
+            engine = db.get_bind()
+            # 会话级 Session 不跨线程共享:worker 自开一个 Session 连同一个 engine
+            with Session(engine) as worker_db:
+                with stream_sink(_push):
+                    outcome["body"] = _run_turn(worker_db, payload, identity)
+        except BaseException as exc:  # noqa: BLE001 - 异常统一转成降级帧
+            outcome["error"] = exc
+        finally:
+            deltas.put(_STREAM_DONE)
+
+    thread = threading.Thread(target=_worker, name="chat-stream", daemon=True)
+    thread.start()
+
+    while True:
+        item = deltas.get()
+        if item is _STREAM_DONE:
+            break
+        yield _sse("delta", {"delta": str(item)})
+
+    error = outcome.get("error")
+    if error is not None:
+        # 编排层异常(与同步路径同口径):固定降级话术 + done 帧,不裸断连接。
+        yield _sse(
+            "message", {"delta": DEGRADED_REPLY}
+        )
+        yield _sse("usage", {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0,
+                            "latency_ms": 0, "estimated": True})
+        yield _sse(
+            "done",
+            {
+                "ok": False,
+                "session_id": None,
+                "trace_id": None,
+                "intent": "degraded",
+                "confidence": 0.0,
+                "classification_path": "llm_degraded",
+                "session_status": "active",
+                "ai_replied": True,
+                "tool_calls": [],
+                "reply": DEGRADED_REPLY,
+                "usage": None,
+                "degraded": True,
+                "error": type(error).__name__,
+            },
+        )
+        return
+
+    yield from _frames(dict(outcome.get("body") or {}))
+
+
 @router.post("/chat/stream")
 def chat_stream(
     payload: ChatRequest,
     db: Session = Depends(get_db),
     identity: security.Identity = Depends(security.current_identity),
 ) -> StreamingResponse:
-    """一轮对话(SSE):同一套编排,按事件流返回。"""
-    frames = list(_frames(_run_turn(db, payload, identity)))
+    """一轮对话(SSE):同一套编排,按事件流返回(真流式:边生成边吐增量)。"""
+    # 预校验放在请求线程:非法输入仍走同步路径的 400 语义,不必等流开始。
+    try:
+        normalize(
+            payload.text,
+            attachments=payload.attachments,
+            locale=payload.locale,
+            channel=payload.channel,
+        )
+    except PerceptionError as exc:
+        raise AppError(
+            "VALIDATION_ERROR", str(exc), status_code=400, param=exc.field
+        ) from exc
     return StreamingResponse(
-        iter(frames),
+        _stream_frames(payload, db, identity),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
