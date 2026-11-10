@@ -37,4 +37,5 @@
 - 2026-11-09 二key与裁决 | 用户提供备胎模型 Minimax-M3.1-Flash(实测:api.minimaxi.com/v1+大写M ID+reasoning 模型),入 .env fallback 三件套(git 外);MEMORY-001 簇裁决=微修+单案真实复验(约0.03元,已授权),**排在 W8 验收后**(nodes.py 单写者纪律) | W8 已派(hrun-mw9diuvz) | 序:W8→MEMORY微修+复验→W9→W10(备胎真模型上线)→W11→W12
 - 2026-11-10 W8 | 接入安全+实时通讯验收通过:JWT+RBAC+限流+防重放+WS+CORS;453 测试;真截图四张;Minimax 首棒质量达标 | 452+1(我方);鉴权链/RBAC/check_w1/smoke 全过 | MEMORY 微修派发中(Minimax)
 - 2026-11-10 W8-FIX | MEMORY-001 微修(主会话自修,dsh host 不稳+卡死会话已 cancel,偏离留痕):真因=记录确认轮 must_contain 来自回声而非注入拼接→新增回声守卫(gate 与 intent 解耦+executable 偏好回声,隔离态不回声);run_eval 加 --case-id | 定向 8 绿;**单案真实复验 3/3 通过(failures 空,critical 0)**;验证花费两轮≈0.12 元(高峰,留痕) | 全量回归后台中;过后派 W9
+- 2026-11-10 探活协议 | 用户指令:派发前探 Minimax 5小时额度;.uitools/probe_minimax.py 首跑即 429 EXHAUSTED → W9 按协议回退 flash(high,空闲时段),下一棒重探 | — | 协议入 PRD D-13+记忆
 - 
