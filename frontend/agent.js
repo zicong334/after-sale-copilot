@@ -876,6 +876,291 @@
     });
   }
 
+  /* --------------------- W9-3 知识库管理(/api/kb,agent) --------------------- */
+
+  var KB_STATUS_LABELS = { draft: "草稿", active: "生效", retired: "退役" };
+  var kb = { items: [], editingId: null, loaded: false };
+  var kbEls = {
+    view: document.getElementById("kbView"),
+    toggle: document.getElementById("kbToggle"),
+    back: document.getElementById("kbBack"),
+    list: document.getElementById("kbList"),
+    stats: document.getElementById("kbStats"),
+    form: document.getElementById("kbEditor"),
+    editorTitle: document.getElementById("kbEditorTitle"),
+    clauseId: document.getElementById("kbClauseId"),
+    title: document.getElementById("kbTitle"),
+    status: document.getElementById("kbStatus"),
+    content: document.getElementById("kbContent"),
+    hint: document.getElementById("kbEditorHint"),
+    newBtn: document.getElementById("kbNew"),
+    cancel: document.getElementById("kbCancel"),
+    reloadBtn: document.getElementById("kbReload"),
+    upload: document.getElementById("kbUpload")
+  };
+
+  function kbShow() {
+    var main = document.querySelector(".wb-main");
+    if (main) main.classList.add("hidden");
+    if (kbEls.view) kbEls.view.classList.remove("hidden");
+    if (!kb.loaded) kbLoadAll();
+  }
+
+  function kbHide() {
+    var main = document.querySelector(".wb-main");
+    if (main) main.classList.remove("hidden");
+    if (kbEls.view) kbEls.view.classList.add("hidden");
+  }
+
+  function kbBadge(status) {
+    var span = document.createElement("span");
+    span.className = "kb-badge kb-badge-" + status;
+    span.textContent = KB_STATUS_LABELS[status] || status;
+    return span;
+  }
+
+  function kbRenderStats(stats) {
+    if (!kbEls.stats) return;
+    kbEls.stats.textContent = "";
+    var by = stats.by_status || {};
+    var parts = [
+      "共 " + stats.total + " 条",
+      "生效 " + (by.active || 0),
+      "草稿 " + (by.draft || 0),
+      "退役 " + (by.retired || 0),
+      "已索引 " + (stats.indexed_clauses || 0) + " 条 · 向量维 " + (stats.vector_dim || 0)
+    ];
+    parts.forEach(function (text, idx) {
+      if (idx) kbEls.stats.appendChild(document.createTextNode("  ·  "));
+      var span = document.createElement("span");
+      span.textContent = text;
+      kbEls.stats.appendChild(span);
+    });
+  }
+
+  function kbActionButton(label, action, item, cls) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-ghost btn-sm " + (cls || "");
+    btn.textContent = label;
+    btn.setAttribute("data-kb-action", action);
+    btn.setAttribute("data-kb-id", item.id);
+    return btn;
+  }
+
+  function kbRenderList() {
+    if (!kbEls.list) return;
+    kbEls.list.textContent = "";
+    if (!kb.items.length) {
+      var empty = document.createElement("div");
+      empty.className = "kb-empty";
+      empty.textContent = "还没有条款。可「新建条款」或「上传 MD」自动切片。";
+      kbEls.list.appendChild(empty);
+      return;
+    }
+    kb.items.forEach(function (item) {
+      var row = document.createElement("div");
+      row.className = "kb-item";
+      row.setAttribute("role", "listitem");
+      row.setAttribute("data-kb-id", item.id);
+
+      var head = document.createElement("div");
+      head.className = "kb-item-head";
+      var cid = document.createElement("span");
+      cid.className = "kb-clause-id";
+      cid.textContent = item.clause_id || "(无条款号)";
+      var title = document.createElement("span");
+      title.className = "kb-item-title";
+      title.textContent = item.title || "";
+      var ver = document.createElement("span");
+      ver.className = "kb-version";
+      ver.textContent = "v" + item.version;
+      head.appendChild(cid);
+      head.appendChild(title);
+      head.appendChild(ver);
+      head.appendChild(kbBadge(item.status));
+
+      var text = document.createElement("p");
+      text.className = "kb-item-text";
+      var raw = item.content || "";
+      text.textContent = raw.length > 90 ? raw.slice(0, 90) + "…" : raw;
+
+      var actions = document.createElement("div");
+      actions.className = "kb-item-actions";
+      actions.appendChild(kbActionButton("编辑", "edit", item));
+      if (item.status === "draft") {
+        actions.appendChild(kbActionButton("启用", "activate", item, "kb-activate"));
+      } else if (item.status === "active") {
+        actions.appendChild(kbActionButton("退役", "retire", item, "kb-danger"));
+      } else if (item.status === "retired") {
+        actions.appendChild(kbActionButton("恢复", "restore", item, "kb-activate"));
+      }
+
+      row.appendChild(head);
+      row.appendChild(text);
+      row.appendChild(actions);
+      kbEls.list.appendChild(row);
+    });
+  }
+
+  function kbResetForm() {
+    kb.editingId = null;
+    if (kbEls.editorTitle) kbEls.editorTitle.textContent = "新建条款";
+    if (kbEls.form) kbEls.form.reset();
+    if (kbEls.status) kbEls.status.value = "draft";
+    if (kbEls.hint) kbEls.hint.textContent = "";
+    if (kbEls.content) kbEls.content.focus();
+  }
+
+  function kbEditItem(item) {
+    kb.editingId = item.id;
+    if (kbEls.editorTitle) kbEls.editorTitle.textContent = "编辑 " + (item.clause_id || "");
+    if (kbEls.clauseId) kbEls.clauseId.value = item.clause_id || "";
+    if (kbEls.title) kbEls.title.value = item.title || "";
+    if (kbEls.status) kbEls.status.value = item.status || "draft";
+    if (kbEls.content) kbEls.content.value = item.content || "";
+    if (kbEls.hint) kbEls.hint.textContent = "当前 v" + item.version + ";改正文保存后版本自增。";
+  }
+
+  async function kbRefreshStats() {
+    try {
+      var stats = await api("/api/kb/stats");
+      kbRenderStats(stats);
+    } catch (err) { /* 徽标非关键,失败静默 */ }
+  }
+
+  async function kbLoadAll() {
+    try {
+      var data = await api("/api/kb/items");
+      kb.items = data.items || [];
+      kb.loaded = true;
+      kbRenderList();
+      await kbRefreshStats();
+    } catch (err) {
+      toast("知识库加载失败:" + errorMessage(err), "error");
+    }
+  }
+
+  async function kbSaveForm(ev) {
+    ev.preventDefault();
+    if (!kbEls.content || !kbEls.content.value.trim()) {
+      toast("正文不能为空", "error");
+      return;
+    }
+    var body = {
+      clause_id: (kbEls.clauseId.value || "").trim(),
+      title: (kbEls.title.value || "").trim(),
+      content: kbEls.content.value,
+      status: kbEls.status.value
+    };
+    if (!body.clause_id) { toast("条款号不能为空", "error"); return; }
+    try {
+      if (kb.editingId) {
+        var path = "/api/kb/items/" + encodeURIComponent(kb.editingId);
+        delete body.clause_id;
+        await api(path, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(body)
+        });
+        toast("已保存;改正文会自增版本,点「热更新」后检索生效", "success");
+      } else {
+        await postJSON("/api/kb/items", body);
+        toast("已创建(默认草稿);启用后点「热更新」参与检索", "success");
+      }
+      kbResetForm();
+      await kbLoadAll();
+    } catch (err) {
+      toast("保存失败:" + errorMessage(err), "error");
+    }
+  }
+
+  async function kbChangeStatus(item, action) {
+    var path = "/api/kb/items/" + encodeURIComponent(item.id);
+    try {
+      if (action === "retire") {
+        await api(path, { method: "DELETE" });
+        toast((item.clause_id || "") + " 已退役;热更新后检索不可见", "success");
+      } else if (action === "restore") {
+        await api(path + "/restore", { method: "POST" });
+        toast((item.clause_id || "") + " 已恢复为生效", "success");
+      } else if (action === "activate") {
+        await api(path, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ status: "active" })
+        });
+        toast((item.clause_id || "") + " 已启用", "success");
+      }
+      await kbLoadAll();
+    } catch (err) {
+      toast("状态切换失败:" + errorMessage(err), "error");
+    }
+  }
+
+  async function kbReloadIndex() {
+    if (kbEls.reloadBtn) kbEls.reloadBtn.disabled = true;
+    try {
+      var data = await postJSON("/api/kb/reload", {});
+      toast(
+        "热更新完成:生效条款 " + data.active_clauses + " 条 · 向量维 " + data.vector_dim +
+        " · BM25 top-" + data.bm25_route_top_k,
+        "success"
+      );
+      kb.loaded = false;
+      await kbLoadAll();
+    } catch (err) {
+      toast("热更新失败:" + errorMessage(err), "error");
+    } finally {
+      if (kbEls.reloadBtn) kbEls.reloadBtn.disabled = false;
+    }
+  }
+
+  async function kbUploadFile(file) {
+    if (!file) return;
+    try {
+      var text = await file.text();
+      var data = await postJSON("/api/kb/upload", { filename: file.name, content: text });
+      toast(
+        "已切片:新增 " + (data.created_count || 0) + " 条草稿、覆盖 " +
+        (data.updated_count || 0) + " 条;启用后热更新生效",
+        "success"
+      );
+      await kbLoadAll();
+    } catch (err) {
+      toast("上传失败:" + errorMessage(err), "error");
+    }
+  }
+
+  if (kbEls.toggle) kbEls.toggle.addEventListener("click", kbShow);
+  if (kbEls.back) kbEls.back.addEventListener("click", kbHide);
+  if (kbEls.newBtn) kbEls.newBtn.addEventListener("click", kbResetForm);
+  if (kbEls.cancel) kbEls.cancel.addEventListener("click", kbResetForm);
+  if (kbEls.form) kbEls.form.addEventListener("submit", kbSaveForm);
+  if (kbEls.reloadBtn) kbEls.reloadBtn.addEventListener("click", kbReloadIndex);
+  if (kbEls.upload) {
+    kbEls.upload.addEventListener("change", function () {
+      var file = kbEls.upload.files && kbEls.upload.files[0];
+      kbUploadFile(file);
+      kbEls.upload.value = "";
+    });
+  }
+  if (kbEls.list) {
+    kbEls.list.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("[data-kb-action]");
+      if (!btn) return;
+      var id = btn.getAttribute("data-kb-id");
+      var item = null;
+      for (var i = 0; i < kb.items.length; i += 1) {
+        if (kb.items[i].id === id) { item = kb.items[i]; break; }
+      }
+      if (!item) return;
+      var action = btn.getAttribute("data-kb-action");
+      if (action === "edit") kbEditItem(item);
+      else kbChangeStatus(item, action);
+    });
+  }
+
   /* --------------------------------- 启动 --------------------------------- */
 
   (async function boot() {

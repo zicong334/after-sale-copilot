@@ -153,6 +153,49 @@ QUERY_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# W9-2 电商口语停用词表(≥30 词)
+# ---------------------------------------------------------------------------
+# 用途:口语问句里大量"怎么/弄/一下/请问/吗/呢/我/想/帮/看看"等词没有检索价值,
+# 却会在 BM25 里制造假阳性、在向量里稀释主题。``strip_stopwords`` 在 **tokenize
+# 之前** 按词删除(长词优先,避免"怎么弄"被"弄"先拆坏),查询侧与索引侧同用同一
+# 函数 —— 因此两侧词表口径必然一致。
+#
+# 硬约束(回归红线):``BM25Backend`` / ``tokenize`` 的**默认行为保持不变**,
+# 停用词清洗只通过 ``build(..., clean=True)`` / ``search(..., clean=True)``
+# 显式开启,由 ``HybridRetriever`` 使用;W2-A/W7-3 的既有定标分数与
+# tests/test_aliases.py 的逐位断言因此零回归。
+STOPWORDS: frozenset[str] = frozenset(
+    {
+        # 疑问/客套(多字)
+        "怎么", "怎样", "如何", "怎么办", "一下", "请问", "麻烦", "帮忙", "看看",
+        "有没有", "还有", "是不是", "什么", "多少", "这个", "那个", "就是",
+        "但是", "然后", "到底", "究竟", "咨询", "问一下",
+        # 人称/语气(单字;只收在电商问句里几乎不构成复合词的字)
+        "我", "你", "您", "吗", "呢", "吧", "啊", "呀", "哦", "想", "弄",
+    }
+)
+"""停用词集合(34 词):多字词 23 个 + 单字 11 个。"""
+
+_STOPWORDS_BY_LENGTH: tuple[str, ...] = tuple(
+    sorted(STOPWORDS, key=lambda w: (-len(w), w))
+)
+"""按长度降序的替换顺序:保证"怎么弄"先删"怎么"再删"弄"。"""
+
+
+def strip_stopwords(text: str) -> str:
+    """按词删除停用词(中文无空格,用子串替换;长词优先)。
+
+    只删除 ``STOPWORDS`` 内的词,不做任何词形变换;返回文本可直接交给
+    ``tokenize``/``tokenize_query``。
+    """
+    cleaned = text
+    for word in _STOPWORDS_BY_LENGTH:
+        if word in cleaned:
+            cleaned = cleaned.replace(word, "")
+    return cleaned
+
+
 def tokenize(text: str) -> list[str]:
     """中文无依赖分词:ASCII 字母数字串 + 中文字符 unigram + 中文字符 bigram。
 
@@ -206,10 +249,19 @@ class BM25Backend:
         self._tokenized: list[list[str]] = []
         self._bm25: BM25Plus | None = None
 
-    def build(self, chunks: list[PolicyChunk]) -> None:
-        """无条件重建索引(每次全量,不增量;空列表清空索引)。"""
+    def build(self, chunks: list[PolicyChunk], *, clean: bool = False) -> None:
+        """无条件重建索引(每次全量,不增量;空列表清空索引)。
+
+        ``clean=True`` 时索引侧先 ``strip_stopwords`` 再 ``tokenize``(W9-2 混合
+        检索用);默认 ``False`` 保持 W2-A/W7-3 的既有索引行为。
+        """
         self._chunks = list(chunks)
-        self._tokenized = [tokenize(c.text) for c in self._chunks]
+        if clean:
+            self._tokenized = [
+                tokenize(strip_stopwords(c.text)) for c in self._chunks
+            ]
+        else:
+            self._tokenized = [tokenize(c.text) for c in self._chunks]
         if self._tokenized:
             self._bm25 = BM25Plus(self._tokenized)
         else:
@@ -222,6 +274,7 @@ class BM25Backend:
         threshold: float = DEFAULT_THRESHOLD,
         *,
         expand: bool = True,
+        clean: bool = False,
     ) -> SearchResult:
         """BM25 检索,返回 SearchResult(results + no_hit)。
 
@@ -231,11 +284,14 @@ class BM25Backend:
         - 分数低于 threshold 的命中被丢弃;最终 results 为空则 no_hit=True。
         - ``expand=True``(默认)走 ``tokenize_query``(W7-3 查询侧别名扩展);
           ``expand=False`` 只用 ``tokenize``,供测试复算"修复前"分数。
+        - ``clean=True`` 时查询侧同样先 ``strip_stopwords``(W9-2),与
+          ``build(..., clean=True)`` 的索引侧口径一致。
         """
         if self._bm25 is None or not query.strip():
             return SearchResult(results=[], no_hit=True)
 
-        q_tokens = tokenize_query(query, expand=expand)
+        text = strip_stopwords(query) if clean else query
+        q_tokens = tokenize_query(text, expand=expand)
         q_set = set(q_tokens)
         if not q_set:
             return SearchResult(results=[], no_hit=True)

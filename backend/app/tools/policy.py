@@ -1,7 +1,8 @@
 """政策工具(两个):policy__search(检索条款)+ policy__check_return(可退性判定)。
 
-- ``policy__search``:从 ``knowledge_item``(商户维度)重建 BM25 索引并检索,返回
-  条款号 + 版本 + 原文 + 分数;低于阈值显式 ``no_hit=True``(政策未覆盖,禁止硬凑)。
+- ``policy__search``:用 W9 混合检索(BM25 + 稠密向量 → RRF)在商户知识库上
+  检索 active 条款,返回条款号 + 版本 + 原文 + 融合分;低于融合分阈值显式
+  ``no_hit=True``(政策未覆盖,禁止硬凑)。
 - ``policy__check_return``:纯函数(不查库),按订单状态 / 退款原因 / 签收天数判定
   ``eligible`` 并给出条款号;规则数字从 data/policies/*.md 提取,不手写映射。
 """
@@ -11,9 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models import KnowledgeItem
-from app.retrieval.bm25_backend import BM25Backend, DEFAULT_THRESHOLD
-from app.retrieval.chunker import PolicyChunk
+from app.retrieval.hybrid import get_retriever
 from app.tools.registry import ToolSpec, clean_schema, register
 from app.tools.results import ToolContext
 
@@ -74,27 +73,14 @@ SEARCH_SPEC = ToolSpec(
 
 
 def search_handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """从商户知识库重建 BM25 索引并检索。"""
-    rows = ctx.session.execute(
-        KnowledgeItem.__table__.select().where(
-            KnowledgeItem.merchant_id == ctx.merchant_id,
-            KnowledgeItem.deleted_at.is_(None),
-            KnowledgeItem.clause_id.is_not(None),
-        )
-    ).mappings().all()
-    chunks = [
-        PolicyChunk(
-            clause_id=r["clause_id"],
-            version=r["version"],
-            title=r["title"] or "",
-            text=r["content"],
-            effective_date="",
-        )
-        for r in rows
-    ]
-    backend = BM25Backend()
-    backend.build(chunks)
-    result = backend.search(args["query"], top_k=args["top_k"], threshold=DEFAULT_THRESHOLD)
+    """混合检索(BM25 + 向量 RRF)商户知识库;只取 active 条款。
+
+    W9 变更(最小 diff):检索实现从 ``BM25Backend`` 换成 ``HybridRetriever``。
+    索引按"数据签名"进程内缓存,条款增删改后自动重建;``POST /api/kb/reload``
+    可显式强制重建。工具名/入参/返回结构保持不变。
+    """
+    retriever = get_retriever(ctx.session, ctx.merchant_id)
+    result = retriever.search(args["query"], top_k=args["top_k"])
     return {
         "results": [
             {

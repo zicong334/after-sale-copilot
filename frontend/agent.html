@@ -26,6 +26,7 @@
         <label>当前坐席</label>
         <span class="agent-name" id="agentChip">—</span>
       </div>
+      <button class="btn btn-ghost btn-sm" id="kbToggle" type="button">知识库</button>
       <button class="topbar-exit" id="logoutBtn" type="button">退出登录</button>
     </header>
 
@@ -85,6 +86,56 @@
         </div>
       </section>
     </main>
+
+    <!-- W9-3 知识库管理:条款 CRUD / 灰度 / 上传切片 / 热更新(agent 角色) -->
+    <section class="kb-view hidden" id="kbView" aria-label="知识库管理">
+      <div class="kb-head">
+        <div>
+          <h2 class="kb-title">知识库条款</h2>
+          <p class="kb-sub">灰度:draft 草稿不参与检索 · active 生效 · retired 退役可回滚。改完点「热更新」重建索引,立即生效。</p>
+        </div>
+        <div class="kb-actions">
+          <button class="btn btn-ghost btn-sm" id="kbBack" type="button">返回工单</button>
+          <button class="btn btn-ghost btn-sm" id="kbNew" type="button">新建条款</button>
+          <label class="btn btn-ghost btn-sm kb-upload-label" title="Markdown 按 ## 条款块自动切片成草稿">
+            上传 MD
+            <input type="file" id="kbUpload" accept=".md,.markdown,text/markdown" hidden />
+          </label>
+          <button class="btn btn-primary btn-sm" id="kbReload" type="button">热更新</button>
+        </div>
+      </div>
+
+      <div class="kb-badges" id="kbStats" aria-live="polite"></div>
+
+      <div class="kb-body">
+        <div class="kb-list" id="kbList" role="list" aria-live="polite"></div>
+
+        <form class="kb-editor" id="kbEditor" autocomplete="off">
+          <div class="kb-editor-head"><span id="kbEditorTitle">新建条款</span></div>
+          <label class="kb-field">条款号
+            <input id="kbClauseId" required maxlength="100" placeholder="RP-20" />
+          </label>
+          <label class="kb-field">标题
+            <input id="kbTitle" maxlength="200" placeholder="退款到账时效" />
+          </label>
+          <label class="kb-field">状态
+            <select id="kbStatus">
+              <option value="draft">draft · 草稿(不参与检索)</option>
+              <option value="active">active · 生效</option>
+              <option value="retired">retired · 退役</option>
+            </select>
+          </label>
+          <label class="kb-field">正文
+            <textarea id="kbContent" rows="9" required placeholder="条款正文,例如:退款将在 48 小时内原路退回…"></textarea>
+          </label>
+          <div class="kb-editor-foot">
+            <button class="btn btn-primary btn-sm" type="submit" id="kbSave">保存</button>
+            <button class="btn btn-ghost btn-sm" type="button" id="kbCancel">清空</button>
+            <span class="kb-hint" id="kbEditorHint"></span>
+          </div>
+        </form>
+      </div>
+    </section>
 
     <footer class="meta">
       <span>本页为原生 HTML / CSS / JS,零第三方依赖、零构建工具。</span>

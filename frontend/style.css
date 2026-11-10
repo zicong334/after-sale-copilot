@@ -1433,3 +1433,168 @@ textarea:focus-visible,
   .login-demo-list { grid-template-columns: 1fr; }
   .conn-badge { order: 6; }
 }
+
+/* --------------------- W9-3 知识库管理视图(agent) --------------------- */
+
+.kb-view {
+  flex: 1;
+  padding: 18px 22px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+}
+
+.kb-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.kb-title { margin: 0 0 4px; font-size: 17px; color: var(--ink); }
+
+.kb-sub {
+  margin: 0;
+  max-width: 640px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.kb-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.kb-upload-label { cursor: pointer; }
+
+.kb-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: var(--muted);
+  background: var(--card);
+  border: 1px solid rgba(120, 80, 40, .10);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+
+.kb-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.kb-list { display: flex; flex-direction: column; gap: 10px; }
+
+.kb-empty {
+  padding: 36px 18px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--muted);
+  background: var(--card);
+  border: 1px dashed rgba(120, 80, 40, .22);
+  border-radius: var(--radius);
+}
+
+.kb-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--card);
+  border: 1px solid rgba(120, 80, 40, .10);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.kb-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.kb-clause-id {
+  padding: 2px 7px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--accent);
+  background: rgba(192, 86, 33, .08);
+  border-radius: 6px;
+}
+
+.kb-item-title { font-size: 13.5px; font-weight: 600; color: var(--ink); }
+.kb-version { font-size: 11.5px; color: var(--muted); }
+.kb-item-text { margin: 0; font-size: 12.5px; line-height: 1.7; color: var(--muted); }
+.kb-item-actions { display: flex; gap: 6px; }
+
+.kb-badge {
+  margin-left: auto;
+  padding: 2px 9px;
+  font-size: 11.5px;
+  white-space: nowrap;
+  border-radius: 999px;
+}
+
+.kb-badge-draft { background: #FEF3C7; color: #8A5A10; }
+.kb-badge-active { background: #E6F4EA; color: var(--success); }
+.kb-badge-retired { background: rgba(107, 101, 96, .13); color: var(--muted); }
+
+.kb-danger { color: var(--danger); }
+.kb-danger:hover:not(:disabled) { background: #FFF6F6; border-color: var(--danger); }
+.kb-activate { color: var(--success); }
+.kb-activate:hover:not(:disabled) { background: #F2FBF5; border-color: var(--success); }
+
+.kb-editor {
+  position: sticky;
+  top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 16px;
+  background: var(--card);
+  border: 1px solid rgba(120, 80, 40, .10);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.kb-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.kb-field { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
+
+.kb-field input,
+.kb-field select,
+.kb-field textarea {
+  width: 100%;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: #FFFDF9;
+  border: 1px solid rgba(120, 80, 40, .18);
+  border-radius: 9px;
+  outline: none;
+}
+
+.kb-field textarea { resize: vertical; line-height: 1.7; }
+
+.kb-field input:focus,
+.kb-field select:focus,
+.kb-field textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(192, 86, 33, .12);
+}
+
+.kb-editor-foot { display: flex; align-items: center; gap: 8px; }
+.kb-hint { font-size: 11.5px; color: var(--muted); }
+
+@media (max-width: 900px) {
+  .kb-body { grid-template-columns: 1fr; }
+  .kb-editor { position: static; }
+  .kb-head { flex-direction: column; }
+}

@@ -6,5 +6,6 @@ pydantic
 pytest
 rank-bm25
 langgraph
+scikit-learn
 uvicorn
 python-dotenv

@@ -1,4 +1,4 @@
-"""load_policies.py — 解析 data/policies/*.md → upsert knowledge_item + 重建 BM25 索引。
+"""load_policies.py — 解析 data/policies/*.md → upsert knowledge_item + 重建混合检索索引。
 
 用法:
     python backend/scripts/load_policies.py [data/policies]
@@ -20,8 +20,10 @@
   与"跑两遍行数不变"的幂等验收冲突,也让"检索结果带稳定 version 供引用"失去意义。
 - 同一 clause_id 只保留一行(单版本活跃),旧版本不堆积,避免检索到过期条款。
 
-BM25 索引重建:
-- load 同时用解析出的 chunks 调 BM25Backend.build() 无条件重建内存索引并打印条数;
+索引重建:
+- load 完成后调用 ``app.retrieval.hybrid.rebuild_index(persist=True)`` 无条件重建
+  **混合索引(BM25 + 稠密向量)** 并把向量 upsert 进 ``kb_vector`` 表 —— 与
+  ``POST /api/kb/reload`` 同一条代码路径(W9-1:向量重建与 BM25 同生命周期)。
   实际服务启动时检索层会再从 knowledge_item 读表重建(启动无条件重建)。
 """
 from __future__ import annotations
@@ -41,8 +43,8 @@ from sqlalchemy.orm import Session
 
 from app.db import create_db_engine
 from app.models import KnowledgeItem, Merchant
-from app.retrieval.bm25_backend import BM25Backend
 from app.retrieval.chunker import PolicyChunk, PolicyChunker
+from app.retrieval.hybrid import rebuild_index
 
 POLICY_MERCHANT_ID = "seed-merchant-1"
 DEFAULT_POLICIES_DIR = Path("data/policies")

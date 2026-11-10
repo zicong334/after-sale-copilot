@@ -195,11 +195,14 @@ def test_vector_backend_is_abstract():
     )
 
 
-def test_vector_backend_raises_not_implemented():
-    with pytest.raises(NotImplementedError):
-        VectorBackend.index(None, [])
-    with pytest.raises(NotImplementedError):
-        VectorBackend.search(None, "query")
+def test_vector_backend_has_concrete_implementation():
+    """W9-1:扩展点被真实现 fulfill,ABC 本身仍保留(生产缝 pgvector/Milvus)。"""
+    from app.retrieval.vector_backend import TfidfSvdVectorBackend
+
+    assert not inspect.isabstract(TfidfSvdVectorBackend)
+    backend = TfidfSvdVectorBackend()
+    backend.index([])  # 不再抛 NotImplementedError
+    assert backend.search("退款").no_hit is True
 
 
 # ---------------------------------------------------------------------------

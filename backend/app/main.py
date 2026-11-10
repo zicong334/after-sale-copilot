@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app import security
 from app.api import agent as agent_api
+from app.api import kb as kb_api
 from app.api import auth as auth_api
 from app.api import chat as chat_api
 from app.api import confirm as confirm_api
@@ -180,6 +181,7 @@ app.include_router(chat_api.router)
 app.include_router(confirm_api.router)
 app.include_router(handoff_api.router)
 app.include_router(agent_api.router)
+app.include_router(kb_api.router)
 app.include_router(memory_maintenance_router)
 
 

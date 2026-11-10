@@ -158,19 +158,24 @@ def test_policy_qa_returns_real_clause_citations(client, engine):
         assert phrase not in data["reply"]
 
 
-def test_policy_qa_no_hit_triggers_deterministic_rewrite(client, engine):
-    """检索无命中 → 确定性改写再查(MOCK),并写 query_rewrite trace 事件。"""
+def test_policy_qa_shipping_question_hits_without_rewrite(client, engine):
+    """W9 混合检索下运费问题首轮即命中 RP-02,不再触发确定性改写。
+
+    修复前(BM25 单路)该句 no_hit → retrieve 走一次 _rewrite_query 再查;
+    W9 的 RRF 融合 + 查询别名扩展让它首轮命中(fused≈0.0095),
+    改写链路本身保留(nodes.retrieve 原样),只是这条 query 不再触发它。
+    """
     r = post_chat(client, "退货的话，来回运费是谁出？")
     data = r.json()
     assert data["intent"] == "policy_qa"
     names = tool_names(r)
-    assert names.count("policy__search") == 2, "首次无命中后应改写并二次检索"
-    assert data["citations"], "改写后必须命中政策条款"
+    assert names.count("policy__search") == 1, "混合检索首轮即命中,不应二次检索"
+    assert data["citations"], "必须命中政策条款"
+    assert data["citations"][0]["clause_id"] == "RP-02"
     assert "运费" in data["reply"] and "商家" in data["reply"]
     assert "全部由商家承担" not in data["reply"]
     rewrites = [e for e in events_of(engine, data["trace_id"]) if e.tool_name == EVENT_QUERY_REWRITE]
-    assert len(rewrites) == 1
-    assert json.loads(rewrites[0].payload)["rewritten"]
+    assert len(rewrites) == 0, "首轮命中时不应写改写事件"
 
 
 def test_policy_qa_size_question_rewrites_to_size_clause(client):

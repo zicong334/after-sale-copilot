@@ -37,29 +37,30 @@ class SearchResult:
 
 
 class VectorBackend(ABC):
-    """向量检索后端抽象接口 —— 声明的扩展点,不是假实现。
+    """向量检索后端抽象接口。
 
-    W2-A 不实现向量检索(D-02 禁 faiss/chromadb)。下面两个方法是将来
-    FAISS / chromadb 后端的契约,当前项目里没有实现类,调用即抛
-    ``NotImplementedError``。这是任务书明确允许的"扩展点",回执亦单独标注。
+    W9-1 起由 :class:`app.retrieval.vector_backend.TfidfSvdVectorBackend`
+    实现(本机形态:sklearn TF-IDF + TruncatedSVD,无需 faiss/chromadb)。
+    本 ABC 保留,作为生产缝:pgvector / Milvus 后端实现同一契约即可替换,
+    上层 ``HybridRetriever`` 无需改动(见 W9 任务书 §2 与
+    ``vector_backend.py`` 模块 docstring)。
 
-    契约(与 BM25Backend 对齐,保证未来可无缝替换):
-    - ``index(chunks)``:把分块写入向量索引,并落 ``embedding_model`` / ``dim``。
+    W2-A 的"扩展点"语义已被真实实现取代:下面两个方法不再自带
+    ``NotImplementedError`` 桩体,由具体子类强制实现。
+
+    契约(与 BM25Backend 对齐):
+    - ``index(chunks)``:把分块写入向量索引,并记录 ``model`` / ``dim``。
     - ``search(query, top_k, threshold)``:向量检索,返回 ``SearchResult``。
     """
 
     @abstractmethod
     def index(self, chunks: list) -> None:
-        """构建向量索引。扩展点,未实现。"""
-        raise NotImplementedError(
-            "VectorBackend 是扩展点:W2-A 只做 BM25,未实现向量检索;请用 BM25Backend"
-        )
+        """构建向量索引(全量重建;空列表 = 清空)。"""
+        ...
 
     @abstractmethod
     def search(
         self, query: str, top_k: int = 5, threshold: float = 0.0
     ) -> SearchResult:
-        """向量检索。扩展点,未实现。"""
-        raise NotImplementedError(
-            "VectorBackend 是扩展点:W2-A 只做 BM25,未实现向量检索;请用 BM25Backend"
-        )
+        """向量检索,按相似度降序返回 ``SearchResult``。"""
+        ...

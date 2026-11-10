@@ -40,7 +40,7 @@ from app.guardrails import (
     has_commitment_claim,
     strip_commitment_sentences,
 )
-from app.models import KnowledgeItem, Ticket, TicketMessage
+from app.models import KB_STATUS_ACTIVE, KnowledgeItem, Ticket, TicketMessage
 from app.retrieval.base import RetrievedChunk
 from app.retrieval.bm25_backend import DEFAULT_THRESHOLD, BM25Backend
 from app.retrieval.chunker import PolicyChunk
@@ -484,6 +484,7 @@ def _suggest_citations(
             KnowledgeItem.merchant_id == merchant_id,
             KnowledgeItem.deleted_at.is_(None),
             KnowledgeItem.clause_id.is_not(None),
+            KnowledgeItem.status == KB_STATUS_ACTIVE,
         )
     ).scalars().all()
     chunks = [
