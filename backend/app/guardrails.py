@@ -640,6 +640,9 @@ MEMORY_REFERENCE_SCOPES = frozenset({"size_recommendation"})
 #: 确定性引用前缀。
 MEMORY_REFERENCE_PREFIX = "根据您的偏好记录:"
 
+#: W8-FIX:记录偏好轮的确认回执前缀(回声守卫)。
+RECORDED_PREF_PREFIX = "已记录您的偏好:"
+
 #: 本轮文本必须真的在问尺码/选购,才算"意图与 scope 相关";
 #: 避免问候等无关 other 轮也被拼上一句偏好引用。
 MEMORY_REFERENCE_HINTS: tuple[str, ...] = (
@@ -675,14 +678,19 @@ def memory_reference_phrase(memory_text: str) -> str | None:
 
 def needs_memory_reference(
     memory: Mapping[str, Any] | None,
-    intent_name: str | None,
+    intent_name: str | None = None,  # noqa: ARG001 — W8-FIX 起弃用:真实模型意图漂移,gate 与 intent 解耦
     text: str = "",
 ) -> bool:
-    """有偏好注入、意图相关、文本确实在问相关话题、且 scope 命中时才要求引用。"""
+    """有偏好注入、scope 命中、且本轮文本确实在问相关话题时才要求引用。
+
+    W8-FIX(2026-11-10 主会话微修):原先额外要求 ``intent_name`` 属于
+    ``MEMORY_REFERENCE_INTENTS``,真实模型把尺码偏好轮漂移到 policy_qa 等
+    意图时 gate 关闭,导致 CS-MEMORY-001 三轮未逐字引用。现改为
+    scope+文本双命中即触发,与 intent 标签解耦;无关文本(问运费等)
+    因 hints 不命中仍不会拼接。
+    """
     data = memory or {}
     if int(data.get("count") or 0) <= 0:
-        return False
-    if str(intent_name or "") not in MEMORY_REFERENCE_INTENTS:
         return False
     scopes = {str(scope) for scope in (data.get("scopes") or ())}
     if not (scopes & MEMORY_REFERENCE_SCOPES):
@@ -700,6 +708,21 @@ def ensure_memory_reference(reply: str, memory: Mapping[str, Any] | None) -> str
     if not body:
         return MEMORY_REFERENCE_PREFIX + phrase + "。"
     return body + MEMORY_REFERENCE_PREFIX + phrase + "。"
+
+
+def ensure_recorded_preference_echo(reply: str, phrase: str) -> str:
+    """W8-FIX 回声守卫:本轮新记录了一条可执行偏好时,确认回复必须逐字回声偏好正文。
+
+    CS-MEMORY-001 真因:must_contain 的关键词来自"记录确认轮"的回复,而该轮
+    记忆尚未注入(注入发生在任务开始),注入拼接 gate 永不触发;故对**抽取写入**
+    的偏好做回声保证。隔离态(定价指令等)不回声。
+    """
+    body = str(reply or "").strip()
+    phrase = str(phrase or "").strip()
+    if not phrase or phrase in body:
+        return body
+    line = RECORDED_PREF_PREFIX + phrase + "。"
+    return (body + " " + line).strip() if body else line
 
 
 # ---------------------------------------------------------------------------

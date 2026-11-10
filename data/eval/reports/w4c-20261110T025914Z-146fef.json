@@ -1,0 +1,198 @@
+{
+  "run_id": "w4c-20261110T025914Z-146fef",
+  "generated_at": "2026-11-10T02:59:48.613973+00:00",
+  "meta": {
+    "mode": "real",
+    "assumptions": "真实模型 + 真实 LLM 裁判(与被执行模型同源,agreement 存在自偏好偏差风险);latency 仅统计对话轮/确认,不含裁判耗时",
+    "cases_file": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\data\\eval\\cases_v1.json",
+    "eval_set_version": "cs-eval-v1-20261108b",
+    "rubric_version": "cs-v2",
+    "repeat": 3,
+    "cases_selected": 1,
+    "quotas": {
+      "golden": 19,
+      "adversarial": 14,
+      "edge": 10,
+      "regression": 5
+    },
+    "llm": "deepseek-flash",
+    "judge": "deepseek-flash",
+    "scored_by": "llm",
+    "command": "run_eval.py --real --case-id CS-MEMORY-001 --repeat 3",
+    "model_base_url": "https://api.deepseek.com/v1",
+    "temperatures": {
+      "agent": 0.2,
+      "judge": 0.1
+    },
+    "max_tokens": 2048,
+    "pricing": {
+      "input_per_mtok_usd": null,
+      "output_per_mtok_usd": null,
+      "status": "TBD",
+      "note": "单价未经官方确认时成本按 0 占位;token 用量为真实 API usage,见 meta.tokens"
+    },
+    "tokens": {
+      "prompt_tokens": 12812,
+      "completion_tokens": 2847,
+      "reasoning_tokens": 1987,
+      "total_tokens": 15659,
+      "requests": 12,
+      "retries": 0,
+      "empty_responses": 0,
+      "api_errors": 0
+    },
+    "tokens_by_role": {
+      "agent": {
+        "prompt_tokens": 3390,
+        "completion_tokens": 1079,
+        "reasoning_tokens": 589,
+        "total_tokens": 4469,
+        "requests": 9,
+        "retries": 0,
+        "empty_responses": 0,
+        "api_errors": 0
+      },
+      "judge": {
+        "prompt_tokens": 9422,
+        "completion_tokens": 1768,
+        "reasoning_tokens": 1398,
+        "total_tokens": 11190,
+        "requests": 3,
+        "retries": 0,
+        "empty_responses": 0,
+        "api_errors": 0
+      }
+    },
+    "judge_fallback_count": 0,
+    "judge_same_source_risk": true,
+    "capture": "D:\\科研工作台\\10_归档封存\\点头直通车项目\\售后 Copilot\\.tmp\\w4c_capture\\w4c-20261110T025914Z-146fef.jsonl"
+  },
+  "eval_set_version": "cs-eval-v1-20261108b",
+  "rubric_version": "cs-v2",
+  "metrics": {
+    "pass_rate": {
+      "value": 0.0,
+      "passed": 0,
+      "denominator": 3,
+      "n": 3,
+      "cases_passed": 0,
+      "cases_total": 1
+    },
+    "by_layer": {
+      "golden": {
+        "cases": 1,
+        "attempts": 3,
+        "passed_attempts": 0,
+        "pass_rate": 0.0,
+        "critical_fail_count": 0
+      },
+      "adversarial": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      },
+      "edge": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      },
+      "regression": {
+        "cases": 0,
+        "attempts": 0,
+        "passed_attempts": 0,
+        "pass_rate": null,
+        "critical_fail_count": 0
+      }
+    },
+    "critical_fail_count": 0,
+    "judge_agreement": {
+      "value": 0.6667,
+      "agreed": 2,
+      "judged": 3
+    },
+    "cost_per_case_usd": {
+      "mean": 0.0,
+      "total": 0.0,
+      "n": 3
+    },
+    "p95_latency_ms": {
+      "value": 5824.0,
+      "n": 3,
+      "scope": "user_wait_only(对话轮+确认,不含裁判)"
+    }
+  },
+  "failures": [
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 1,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 61.5,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 4953.0
+    },
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 2,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": true,
+      "judge_score": 73.0,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 4581.0
+    },
+    {
+      "case_id": "CS-MEMORY-001",
+      "layer": "golden",
+      "attempt": 3,
+      "type": "fact_mismatch",
+      "critical": false,
+      "task_success": false,
+      "judge_passed": false,
+      "judge_score": 69.8,
+      "detail": [
+        {
+          "check": "must_contain",
+          "detail": "回复缺少必含内容 '尺码'",
+          "severity": "FAIL_HARD"
+        }
+      ],
+      "latency_ms": 5824.0
+    }
+  ],
+  "clusters": [
+    {
+      "type": "fact_mismatch",
+      "count": 3,
+      "case_ids": [
+        "CS-MEMORY-001"
+      ],
+      "systematic": true
+    }
+  ],
+  "counts": {
+    "attempts_failed": 3,
+    "critical_failures": 0
+  }
+}

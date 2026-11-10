@@ -76,6 +76,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--layer", default=None, help="只跑某一层")
     parser.add_argument(
+        "--case-id",
+        default=None,
+        help="只跑指定 case_id(逗号分隔;W8-FIX 单案复验用)",
+    )
+    parser.add_argument(
         "--smoke", action="store_true", help="冒烟:只跑 golden 前 5 条"
     )
     parser.add_argument("--limit", type=int, default=None, help="最多跑多少条用例")
@@ -136,6 +141,9 @@ def _select(cases: list[dict], args: argparse.Namespace) -> list[dict]:
     selected = cases
     if args.layer:
         selected = [c for c in selected if c.get("layer") == args.layer]
+    if getattr(args, "case_id", None):
+        ids = {x.strip() for x in str(args.case_id).split(",") if x.strip()}
+        selected = [c for c in selected if c.get("case_id") in ids]
     if args.smoke:
         selected = [c for c in selected if c.get("layer") == "golden"][:5]
     if args.limit is not None:

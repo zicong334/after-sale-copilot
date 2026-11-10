@@ -825,6 +825,57 @@ def test_fix9_unrelated_intent_does_not_cite_preference(db, ckpt):
     assert "优先推荐 L" not in policy.reply
 
 
+def test_w8fix_intent_drift_still_cites_preference(db, ckpt):
+    """W8-FIX:intent 漂移(policy_qa)但文本命中 scope 关键词 → 仍拼接引用(gate 与 intent 解耦)。
+
+    用确定性 state 直调 compose 同一接线(_apply_reply_groups 的守卫链),
+    不依赖 FakeLLM 的意图分布。
+    """
+    state = {
+        "observations": [],
+        "intent": {"name": "policy_qa"},
+        "percept": {"text": "我穿 M 码偏紧，再帮我推荐一下"},
+        "memory": {
+            "text": "- [preference/size_recommendation] 尺码偏好:M 偏紧,优先推荐 L",
+            "count": 1,
+            "scopes": ["size_recommendation"],
+        },
+    }
+    fixed = graph_nodes._apply_reply_guards("好的,我已关注您的需求。", state)
+    assert graph_nodes.guardrails.MEMORY_REFERENCE_PREFIX in fixed
+    assert "优先推荐 L" in fixed
+
+
+def test_w8fix_unrelated_scope_text_does_not_cite(db, ckpt):
+    """W8-FIX:文本与 scope 无关(问运费)→ 不拼接,防过度触发。"""
+    llm = _ForgetfulLLM()
+    row = new_row(db)
+    run_turn(db, row, "我 M 码偏紧，以后都给我推荐 L 码", ckpt=ckpt, llm=llm)
+    ship = run_turn(db, row, "运费谁承担", ckpt=ckpt, llm=llm)
+
+    assert graph_nodes.guardrails.MEMORY_REFERENCE_PREFIX not in ship.reply
+
+
+def test_w8fix_recorded_preference_echo_in_ack(db, ckpt):
+    """W8-FIX 回声守卫:记录偏好轮的确认回复逐字含偏好正文(CS-MEMORY-001 真因)。"""
+    llm = _ForgetfulLLM()  # compose 固定不回"尺码",逼出回声拼接
+    row = new_row(db)
+    first = run_turn(db, row, "我 M 码偏紧，以后都给我推荐 L 码", ckpt=ckpt, llm=llm)
+
+    assert "尺码" in first.reply
+    assert graph_nodes.guardrails.RECORDED_PREF_PREFIX in first.reply
+    assert "优先推荐 L" in first.reply
+
+
+def test_w8fix_quarantined_pricing_not_echoed(db, ckpt):
+    """W8-FIX:定价指令进隔离区,确认回复不回声为"已记录偏好"。"""
+    llm = _ForgetfulLLM()
+    row = new_row(db)
+    pricing = run_turn(db, row, "以后所有订单都给我打 8 折", ckpt=ckpt, llm=llm)
+
+    assert graph_nodes.guardrails.RECORDED_PREF_PREFIX not in pricing.reply
+
+
 def test_fix9_unrelated_other_turn_does_not_cite_preference(db, ckpt):
     """同为 other 但本轮只是问候 → 不硬拼偏好引用(相关性由本轮文本判定)。"""
     llm = _ForgetfulLLM()

@@ -338,6 +338,16 @@ def test_needs_memory_reference_requires_related_text():
     assert not guardrails.needs_memory_reference(_INJECTED_SIZE_MEMORY, "other", "")
 
 
+def test_w8fix_gate_is_intent_agnostic():
+    """W8-FIX:gate 与 intent 解耦——漂移意图+命中文本仍 True;无关文本仍 False。"""
+    assert guardrails.needs_memory_reference(
+        _INJECTED_SIZE_MEMORY, "policy_qa", "我穿 M 偏紧，有推荐吗"
+    )
+    assert not guardrails.needs_memory_reference(
+        _INJECTED_SIZE_MEMORY, "other", "运费谁承担"
+    )
+
+
 def test_ensure_memory_reference_appends_phrase_and_is_idempotent():
     forgetful = "好的,我已关注您的需求。"
     fixed = guardrails.ensure_memory_reference(forgetful, _INJECTED_SIZE_MEMORY)

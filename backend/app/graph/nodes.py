@@ -56,7 +56,7 @@ from app.llm import (
 )
 from app.llm.base import RISK_HINTS
 from app.memory.injection import load_injection
-from app.memory.store import extract_and_write
+from app.memory.store import extract_and_write, extract_candidates
 from app.models import ChatMessage, ChatSession, KnowledgeItem
 from app.perception import normalize
 from app.tools import ToolContext, get_confirm, invoke
@@ -1152,6 +1152,21 @@ def make_nodes(
                 draft = guardrails.ensure_policy_word(draft)
             # FIX-8/9:越权查单标准句 + 偏好逐字引用,由确定性后置保证。
             draft = _apply_reply_guards(draft, state)
+            # W8-FIX 回声守卫:本轮将写入可执行偏好时,确认回复逐字回声偏好正文
+            # (CS-MEMORY-001 真因:关键词来自记录确认轮,该轮记忆尚未注入);
+            #  eligibility 与任务末抽取同条件(拦截轮/隔离态不回声)。
+            if not (confirm and not confirm.get("decided")):
+                _eg = _text_guard(text_of(state), dict(state.get("context") or {}))
+                _ep = guardrails.detect_prompt_probe(text_of(state))["probe"]
+                if not (_eg["hard"] or _eg["privacy"] or _ep):
+                    for _cand in extract_candidates(
+                        guardrails.strip_injection(text_of(state)), None
+                    ):
+                        # 只回声可执行偏好;隔离态(定价/注入,executable=False)不回声
+                        if _cand.get("executable", True) and _cand.get("text"):
+                            draft = guardrails.ensure_recorded_preference_echo(
+                                draft, str(_cand["text"])
+                            )
             # FIX-4:转人工确认卡未确认前,统一"将为您转接人工(待确认)"口径。
             if confirm and not confirm.get("decided") and confirm.get("tool") == TOOL_HANDOFF:
                 reason_label = str(verdict.get("reason") or "用户主动要求人工")
