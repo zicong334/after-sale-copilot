@@ -271,7 +271,9 @@ async def _serve_websocket(websocket: WebSocket, *, role: str, target: str | Non
                 for task in (sender, receiver):
                     task.cancel()
                 await asyncio.gather(sender, receiver, return_exceptions=True)
-    except WebSocketDisconnect:  # pragma: no cover - 客户端直接断
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        # 客户端断开时 Starlette/TestClient 可能先取消任务再投递 disconnect 帧,
+        # 两种收尾都算正常关闭,不向上抛(否则 uvicorn 会记一条无意义 traceback)。
         pass
 
 

@@ -17,11 +17,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
+from app import security
 from app.api import get_db
 from app.db import utc_now
 from app.errors import AppError, NotFoundError, StateConflictError
@@ -34,12 +35,23 @@ _STATUSES = ("queued", "claimed", "waiting_customer", "closed")
 
 
 class ClaimIn(BaseModel):
+    """领单请求。
+
+    ⚠️ ``service_id`` 仅 AUTH_MODE=internal 回归兜底;enforce 下无身份效力
+    (坐席身份取自 token,见 ``security.effective_identity``)。
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    service_id: str
+    service_id: str | None = None
 
 
 class CloseIn(BaseModel):
+    """关单请求(可选 body)。
+
+    ⚠️ ``service_id`` 仅 AUTH_MODE=internal 回归兜底;enforce 下无身份效力。
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     service_id: str | None = None
@@ -78,16 +90,85 @@ def _receipt(ticket: Ticket) -> dict[str, Any]:
     }
 
 
+def _scope_ticket(
+    db: Session, ticket_id: str, identity: security.Identity, ident: security.Identity
+) -> Ticket:
+    """enforce 下校验工单归属:买家只能碰自己 merchant+customer 的工单。
+
+    internal 模式跳过这条新过滤(回归脚本不带 token,靠请求体兜底),
+    响应仍与旧版一致(不存在统一 404)。
+    """
+    ticket = db.get(Ticket, ticket_id)
+    if ticket is None:
+        raise NotFoundError(f"工单不存在: {ticket_id}")
+    if not identity.is_internal and (
+        ticket.merchant_id != ident.merchant_id
+        or ticket.customer_id != ident.customer_id
+    ):
+        raise NotFoundError(f"工单不存在: {ticket_id}")
+    return ticket
+
+
+def _scope_session(
+    row: ChatSession, identity: security.Identity, ident: security.Identity
+) -> None:
+    """enforce 下校验会话归属:买家只能看自己的会话;internal 跳过。"""
+    if not identity.is_internal and (
+        row.merchant_id != ident.merchant_id or row.customer_id != ident.customer_id
+    ):
+        raise NotFoundError(f"会话不存在: {row.id}")
+
+
+def _publish_ticket_events(
+    ticket: Ticket, *, claimed_by: str | None = None, closed_by: str | None = None
+) -> None:
+    """写库 commit 之后广播工单事件(ticket_status → buyer;ticket_update → queue)。
+
+    buyer 频道需要 session_id,拿不到时跳过买家侧(库内历史工单可能没有)。
+    """
+    buyer_payload: dict[str, Any] = {
+        "ticket_id": ticket.id,
+        "session_id": ticket.session_id,
+        "status": ticket.status,
+    }
+    if claimed_by:
+        buyer_payload["claimed_by"] = claimed_by
+    if closed_by:
+        buyer_payload["closed_by"] = closed_by
+    if ticket.session_id:
+        security.publish_event(
+            security.channel_buyer(ticket.session_id), "ticket_status", **buyer_payload
+        )
+    queue_payload: dict[str, Any] = {"ticket_id": ticket.id, "status": ticket.status}
+    if claimed_by:
+        queue_payload["claimed_by"] = claimed_by
+    if closed_by:
+        queue_payload["closed_by"] = closed_by
+    security.publish_event(
+        security.channel_queue(ticket.merchant_id), "ticket_update", **queue_payload
+    )
+
+
 @router.get("/tickets")
 def list_tickets(
+    request: Request,
     merchant_id: str | None = Query(default=None),
     status: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
-    """工单队列:queued 优先,同状态内按创建时间先后。"""
+    """工单队列:queued 优先,同状态内按创建时间先后。
+
+    enforce 下强制按 token 的 merchant_id 过滤(query 的同名字段无身份效力);
+    internal 保持旧行为。
+    """
+    ident = security.effective_identity(
+        identity, "buyer", fallback=dict(request.query_params)
+    )
     stmt = select(Ticket)
-    if merchant_id:
-        stmt = stmt.where(Ticket.merchant_id == merchant_id)
+    scope_merchant = merchant_id if identity.is_internal else ident.merchant_id
+    if scope_merchant:
+        stmt = stmt.where(Ticket.merchant_id == scope_merchant)
     if status:
         if status not in _STATUSES:
             raise StateConflictError(f"未知工单状态: {status}", None, param="status")
@@ -102,23 +183,61 @@ def list_tickets(
     }
 
 
-@router.post("/tickets/{ticket_id}/claim")
-def claim(ticket_id: str, payload: ClaimIn, db: Session = Depends(get_db)) -> dict[str, Any]:
+@router.post(
+    "/tickets/{ticket_id}/claim",
+    dependencies=[Depends(security.require_replay_guard)],
+)
+def claim(
+    ticket_id: str,
+    payload: ClaimIn,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
     """守卫式领单:并发只有一个成功,被抢返回 409「已被他人领取」。"""
+    ident = security.effective_identity(identity, "buyer", payload=payload)
+    # internal 回归兜底才读 body;enforce 下坐席身份只认 token,防止借 body 冒领。
+    service_id = (
+        (ident.service_id or payload.service_id)
+        if identity.is_internal
+        else ident.service_id
+    )
+    if not service_id:
+        raise AppError(
+            "VALIDATION_ERROR", "缺少坐席身份 service_id", 400, param="service_id"
+        )
+    _scope_ticket(db, ticket_id, identity, ident)
     try:
-        ticket = ticket_svc.claim(db, ticket_id, payload.service_id)
+        ticket = ticket_svc.claim(db, ticket_id, service_id)
     except StateConflictError as exc:
         raise StateConflictError(
             f"工单已被他人领取或不可领取(当前状态:{exc.param})",
             exc.param,
             param="status",
         ) from exc
+    # commit 已由 ticket_svc 完成,这里才发布事件。
+    _publish_ticket_events(ticket, claimed_by=service_id)
     return {"ok": True, "receipt": _receipt(ticket)}
 
 
-@router.post("/tickets/{ticket_id}/close")
-def close(ticket_id: str, payload: CloseIn | None = None, db: Session = Depends(get_db)) -> dict[str, Any]:
+@router.post(
+    "/tickets/{ticket_id}/close",
+    dependencies=[Depends(security.require_replay_guard)],
+)
+def close(
+    ticket_id: str,
+    payload: CloseIn | None = None,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
     """关单:queued/claimed/waiting_customer → closed;重复关单 409。"""
+    ident = security.effective_identity(identity, "buyer", payload=payload)
+    _scope_ticket(db, ticket_id, identity, ident)
+    # internal 回归兜底才读 body;enforce 下关单人只认 token。
+    closed_by = (
+        (ident.service_id or (payload.service_id if payload is not None else None))
+        if identity.is_internal
+        else ident.service_id
+    )
     try:
         ticket = ticket_svc.close(db, ticket_id)
     except StateConflictError as exc:
@@ -128,22 +247,31 @@ def close(ticket_id: str, payload: CloseIn | None = None, db: Session = Depends(
             param="status",
         ) from exc
     body = {"ok": True, "receipt": _receipt(ticket)}
-    if payload is not None and payload.service_id:
-        body["closed_by"] = payload.service_id
+    if closed_by:
+        body["closed_by"] = closed_by
+    # commit 已由 ticket_svc 完成。
+    _publish_ticket_events(ticket, closed_by=closed_by)
     return body
 
 
 @router.get("/sessions/{session_id}/summary")
-def session_summary(session_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def session_summary(
+    session_id: str,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
     """会话摘要:会话状态 + 本会话工单 + 最近消息(坐席接手用)。
 
     W5-FIX R1:工单按 ``ticket.session_id`` **精确归属**本会话;
     历史工单没有 session_id 时返回 ticket=None,绝不回退到
     「按客户取最近一张」的启发式(那会把同客户历史 closed 工单误当成当前会话)。
+    enforce 下买家只能看自己的会话(internal 跳过)。
     """
+    ident = security.effective_identity(identity, "buyer")
     row = db.get(ChatSession, session_id)
     if row is None:
         raise NotFoundError(f"会话不存在: {session_id}")
+    _scope_session(row, identity, ident)
     ticket = _session_ticket(db, session_id)
     return _summary_body(db, row, ticket, link="session_id(精确归属)")
 
@@ -223,17 +351,25 @@ def summary(
     merchant_id: str | None = Query(default=None),
     customer_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
     """会话摘要兼容入口(买家页轮询用 ``?session_id=...``)。
 
     - 传 ``session_id``:与本会话摘要完全一致,只返回该会话的工单;
     - 不传 ``session_id``:保持旧行为——按 ``merchant_id+customer_id``
       取该客户最近一张工单(兼容既有调用方,新前端不再使用)。
+    enforce 下 query 里的 merchant_id/customer_id 无身份效力,一律取 token 身份;
+    internal 保持旧行为。
     """
+    ident = security.effective_identity(identity, "buyer")
+    if not identity.is_internal:
+        merchant_id = ident.merchant_id
+        customer_id = ident.customer_id
     if session_id:
         row = db.get(ChatSession, session_id)
         if row is None:
             raise NotFoundError(f"会话不存在: {session_id}")
+        _scope_session(row, identity, ident)
         return _summary_body(
             db, row, _session_ticket(db, session_id), link="session_id(精确归属)",
         )

@@ -1242,3 +1242,194 @@ textarea:focus-visible,
   .detail-body { padding: 14px 14px 16px; }
   .detail-actions { margin-left: 0; width: 100%; }
 }
+
+/* ==========================================================================
+   W8 增量:登录页 + 实时连接状态徽标
+   只复用上方既有令牌(--bg/--card/--primary/--ink/--muted/--radius/--shadow),
+   不新增色板与字号体系;三页(login/chat/agent)共用。
+   ========================================================================== */
+
+/* 登录页(login.html) ------------------------------------------------------ */
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 18px;
+}
+
+.login-card {
+  width: min(430px, 100%);
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  border: 1px solid rgba(120, 80, 40, .10);
+  padding: 28px 26px 24px;
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.login-title {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: .2px;
+}
+
+.login-sub {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.login-hint {
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #FEF3C7;
+  border: 1px solid rgba(183, 121, 31, .28);
+  color: #8A5A10;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.login-hint-link {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.login-hint-link:hover { text-decoration: underline; }
+
+.login-hint-btn {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 13px;
+}
+
+.login-field label {
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.login-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(120, 80, 40, .22);
+  border-radius: 10px;
+  background: #FFFDF9;
+  font-size: 14px;
+  outline: none;
+  transition: border-color .16s ease, box-shadow .16s ease;
+}
+
+.login-input::placeholder { color: #A79E93; }
+
+.login-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(192, 86, 33, .12);
+}
+
+.login-error {
+  min-height: 20px;
+  margin: 2px 0 8px;
+  font-size: 13px;
+  color: var(--danger);
+  line-height: 1.5;
+}
+
+.login-submit {
+  width: 100%;
+  justify-content: center;
+}
+
+.login-demo {
+  margin-top: 20px;
+  padding-top: 15px;
+  border-top: 1px dashed rgba(120, 80, 40, .18);
+}
+
+.login-demo-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 9px;
+}
+
+.login-demo-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.login-demo-btn { justify-content: flex-start; }
+
+/* 实时连接状态徽标(chat.html / agent.html 顶栏) -------------------------- */
+.conn-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: #F1EDE7;
+  color: var(--muted);
+  transition: background .2s, color .2s;
+}
+
+.conn-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.conn-badge[data-state="online"] { background: #E6F4EA; color: var(--success); }
+.conn-badge[data-state="connecting"] { background: #FEF3C7; color: var(--warn); }
+.conn-badge[data-state="offline"] { background: #F1EDE7; color: var(--muted); }
+
+/* 顶栏退出按钮:文字链接观感,不抢主操作 */
+.topbar-exit {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  cursor: pointer;
+  padding: 4px 2px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.topbar-exit:hover { color: var(--accent); }
+
+/* 顶栏当前坐席(替代 W5 的可切换下拉,身份来自 token,不可手填) */
+.agent-picker .agent-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .login-demo-list { grid-template-columns: 1fr; }
+  .conn-badge { order: 6; }
+}

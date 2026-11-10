@@ -59,8 +59,9 @@
 ```bat
 :: ① 一键起服务(迁移 → 空库自动 seed → uvicorn;Ctrl+C 停止)
 serve.bat
-:: 浏览器打开 http://127.0.0.1:8000/health 应返回 {"ok":true,"status":"healthy"};聊天页 http://127.0.0.1:8000/
-:: 客服工作台(演示环境无坐席登录/无密码,页面顶部已声明):http://127.0.0.1:8000/agent.html
+:: 浏览器打开 http://127.0.0.1:8000/health 应返回 {"ok":true,"status":"healthy"};
+:: 登录页 http://127.0.0.1:8000/login.html(演示账号见 §4.2),登录后进聊天页/工作台
+:: 客服工作台:http://127.0.0.1:8000/agent.html(需坐席演示账号登录)
 ```
 
 ```bat
@@ -80,12 +81,48 @@ run_eval.bat
 - 起服务的环境变量:`SERVE_HOST`(默认 `127.0.0.1`)、`SERVE_PORT`(默认 `8000`)、`DATABASE_URL`。
 - 评测参数见 `backend/scripts/run_eval.py --help`(默认 `--repeat 3`,报告落 `data/eval/reports/`)。
 
-### 4.1 前端两页(原生 HTML/CSS/JS,零 CDN、零构建)
+### 4.1 前端三页(原生 HTML/CSS/JS,零 CDN、零构建)
 
 | 页面 | 路径 | 说明 |
 |---|---|---|
-| 买家聊天页 | `/` 或 `/chat.html` | 转人工后轮询会话摘要,展示「人工客服」气泡(不显示坐席内部备注);工单关闭后禁用输入 |
-| 客服工作台 | `/agent.html` | 工单队列(queued 优先 → `last_msg_at` 倒序)、领单、回复(可内部备注)、关单;**演示环境无坐席登录/无密码**,页面顶部已声明 |
+| 登录页 | `/login.html` | 账号口令登录(W8);4 个演示账号一键填入;按角色跳聊天页/工作台;token 存 `localStorage["sc_token"]` |
+| 买家聊天页 | `/` 或 `/chat.html` | 身份来自登录 token;转人工后 WS 实时收坐席回复(断线自动退回轮询摘要),不显示坐席内部备注;工单关闭后禁用输入 |
+| 客服工作台 | `/agent.html` | 工单队列(queued 优先 → `last_msg_at` 倒序)、领单、回复(可内部备注)、关单;队列经 WS 实时刷新(断线退回轮询);身份来自坐席 token |
+
+### 4.2 登录与演示账号(W8 接入安全)
+
+**启动后必须先登录**:`/api/c/*` 需要 buyer token,`/api/b/*` 需要 agent token,`/health`、
+`/auth/*`、静态页与 `/ws/*`(WS 在端点内鉴权)放行。账号由 `backend/scripts/seed.py` 幂等写入,
+口令只存 pbkdf2 哈希;明文口令仅本表:
+
+| 账号 | 口令 | 角色 | 绑定身份 | 用途 |
+|---|---|---|---|---|
+| `buyer_demo` | `demo1234` | buyer | `seed-cust-001` | 买家聊天(与 30 单 seed 数据同租户) |
+| `buyer_demo2` | `demo1234` | buyer | `seed-cust-002` | 第二个买家,验证数据隔离 |
+| `agent_demo` | `demo1234` | agent | `seed-agent-1` | 客服工作台 |
+| `agent_demo2` | `demo1234` | agent | `seed-agent-2` | 第二个坐席,验证抢单冲突 |
+
+```bat
+:: 取 token(powershell 不便时的等价 curl;登录响应体里的 token 字段)
+curl -s -X POST http://127.0.0.1:8000/auth/login ^
+  -H "Content-Type: application/json" ^
+  -d "{\"username\":\"buyer_demo\",\"password\":\"demo1234\"}"
+```
+
+- **JWT**:HS256,2 小时过期,secret 取环境变量 `JWT_SECRET`;未配置时用开发缺省值并打
+  `MOCK` 级警告日志(**生产必须注入**)。payload 含 `sub/role/merchant_id/customer_id|service_id/exp`。
+- **RBAC**:`/api/c/*` 只认 buyer、`/api/b/*` 只认 agent;角色不符 403 `FORBIDDEN`。
+  路由身份一律从 token 取,请求体/query 里的 `customer_id`/`service_id` 在 enforce 模式下
+  **没有身份效力**(仅为回归脚本保留内部兜底字段)。
+- **限流**:用户级令牌桶 5 QPS(突发 10)+ 租户级 50 QPS;chat 另有日 20 万 token 配额
+  (按 `token_usage` 表聚合)。超限返回 429 + `Retry-After` 头;配额超限 429 `TOKEN_QUOTA_EXCEEDED`。
+- **防重放**:5 个写接口(确认/拒绝/领单/关单/坐席回复)必须带 `X-Timestamp`(Unix 秒)与
+  `X-Nonce`(8–128 字符),窗口 ±5 分钟,同 `(subject, nonce)` 二次出现 409 `REPLAY_DETECTED`。
+- **WebSocket**:`/ws/buyer/{session_id}?token=...`、`/ws/agent/{service_id}?token=...`
+  (或连接后首帧 `{"type":"auth","token":...}`);事件见 §7.3。旧轮询接口保留为断线降级。
+- **CORS**:白名单来自环境变量 `CORS_ORIGINS`(逗号分隔),任何 `*` 都会被剔除。
+- **回归脚本内部模式**:`check_w1_cases.py` / `demo_w2.py` 不带 token,收尾验证时用
+  `AUTH_MODE=internal` 启动,身份由请求体内部兜底并打 WARN;对外服务保持默认 `enforce`。
 
 工作台 API 前缀 `/api/b`(W5 新增,实现在 `backend/app/api/agent.py`):`GET /services`、
 `GET /tickets`、`GET /tickets/{id}`、`POST /tickets/{id}/claim`、`POST /tickets/{id}/messages`、
@@ -96,7 +133,7 @@ run_eval.bat
 ## 5. 测试
 
 ```bat
-:: 全量测试(434 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(453 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
@@ -114,7 +151,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:434 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:453 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -182,6 +219,40 @@ set PYTHONPATH=%CD%\backend
 W7-2 回滚边界:SAVEPOINT 只能回滚本轮**未提交**写入;若某工具已自行 `commit` 之后才发生 LLM 故障,
 已提交的工具写无法回收(降级仍返回 200 + 固定话术并记 `llm_degraded`);单测覆盖的是 LLM 首调失败这一「零写」路径。
 
+### 7.3 接入安全与实时通讯清单(W8)
+
+> 原则:每项都是「可替换接口(生产缝)+ 本机真跑实现」,鉴权/WS 全离线可测,不读 `.env`、不调真实 LLM。
+> 单测:`tests/test_auth.py`、`tests/test_ratelimit.py`、`tests/test_replay.py`、`tests/test_ws.py`。
+
+| 项 | 实现位置 | 本机实现 / 生产缝 | 单测 |
+|---|---|---|---|
+| JWT + 密码哈希 | `app/security.py`(`create_token`/`decode_token`/`hash_password`/`verify_password`) | 标准库 hmac/hashlib 手写 HS256 + pbkdf2(20 万轮);生产缝换 IdP/OAuth2 | `tests/test_auth.py` |
+| RBAC 中间件 | `app/main.py`(`AuthMiddleware`,纯 ASGI) | `/api/c/*`=buyer、`/api/b/*`=agent;401/403 统一错误体 | `tests/test_auth.py` |
+| 身份注入 | `app/security.py`(`current_identity`/`effective_identity`)+ 4 个 api 模块 | 路由身份只从 token 取,请求体身份字段仅 internal 兜底 | `tests/test_auth.py` |
+| 限流 | `app/security.py`(`RateLimiter` ABC + `MemoryRateLimiter`) | 令牌桶 5 QPS/突发 10 + 租户 50 QPS;生产缝换 Redis INCR+EXPIRE | `tests/test_ratelimit.py` |
+| 日 token 配额 | `app/security.py`(`enforce_token_quota`/`record_token_usage`)+ `token_usage` 表 | SQL 聚合,不写 `tool_events`(避免破坏既有事件数断言) | `tests/test_ratelimit.py` |
+| 防重放 | `app/security.py`(`require_replay_guard`)+ `request_nonce` 表 | ±5 分钟 + UNIQUE(subject,nonce);生产缝换 Redis SETNX+TTL | `tests/test_replay.py` |
+| PubSub | `app/security.py`(`PubSubBroker` ABC + `InMemoryBroker`) | asyncio 队列 + `call_soon_threadsafe`;生产缝换 Redis pub/sub | `tests/test_ws.py` |
+| WebSocket | `app/main.py`(`/ws/buyer`、`/ws/agent`) | 查询参数或首帧鉴权;ready/ping-pong;关闭码 4400/4401/4403 | `tests/test_ws.py` |
+| CORS 收敛 | `app/main.py`(`CORSMiddleware` + `CORS_ORIGINS`) | 白名单默认本地三端口,任何 `*` 被剔除 | `tests/test_auth.py` |
+
+WS 事件契约(路由写库 commit 之后发布;事件体带 `type` + UTC `ts`):
+
+| type | 频道 | 触发 |
+|---|---|---|
+| `agent_message` | `buyer:<session_id>` | 坐席回复 |
+| `ticket_status` | `buyer:<session_id>` | 领单 / 关单 |
+| `ticket_update` | `queue:<merchant_id>` | 领单 / 关单 / 新工单 |
+| `queue_new` | `queue:<merchant_id>` | chat 轮新建转人工工单 |
+| `confirm_status` | `buyer:<session_id>` | 确认 / 拒绝确认卡 |
+| `assistant_message` | `buyer:<session_id>` | AI 落 assistant 消息(多标签同步) |
+
+MOCK 边界:未注入 `JWT_SECRET` 时使用开发缺省 secret(告警日志);限流/防重放/nonce 存储与
+PubSub 都是**进程内内存实现**,单进程本机形态成立,多 worker 部署前必须换 Redis(接口已留)。
+回归脚本兼容:`AUTH_MODE=internal` 时中间件跳过鉴权、身份由请求体/query 内部兜底并打 WARN,
+仅用于 `check_w1_cases.py` / `demo_w2.py`;既有 434 测试由 `tests/conftest.py` 的 autouse
+fixture 固定为 internal 且关闭限流/防重放(测试毫秒级连发,不带重放头)。
+
 ## 8. 已知声明(交接必读)
 
 1. **Ticket 已有 session_id(W5-FIX 后)**:`ticket` 表新增可空 `session_id` 列(迁移 `0005_ticket_session_id`,索引 `ix_ticket_session_id`);
@@ -225,7 +296,8 @@ W7-2 回滚边界:SAVEPOINT 只能回滚本轮**未提交**写入;若某工具�
 
 | 扩展点 | 现状(已预留的东西) | 接法 |
 |---|---|---|
-| 多租户 | 所有业务表 `merchant_id` + 查询带租户条件 | 接入鉴权后把「当前 merchant」从请求上下文注入,不改表 |
+| 多租户 | 所有业务表 `merchant_id` + 查询带租户条件;**W8 已把「当前 merchant/身份」从 JWT 注入请求上下文** | 改接 IdP 时只换 `security.create_token/decode_token` 与 `api/auth.py`,路由不动 |
+| 接入安全外置 | `security.py` 的 ABC/函数边界(JWT 签发校验、RateLimiter、nonce 表、PubSubBroker) | JWT 换 IdP/OAuth2;限流与 nonce 换 Redis;PubSub 换 Redis pub/sub(多 worker) |
 | 向量检索 | `retrieval` 模块接口 + `knowledge_item.embedding_model/dim` 列 | 在 `policy__search` 里换/加一个 retriever 实现,BM25 保留为兜底 |
 | 新工具 | 九字段注册表(`backend/app/tools/registry.py:101`)+ `pricing.*`/`coupon.*` 命名空间 | 新增 `ToolSpec` + handler 并 `register()`,写工具必须 `requires_confirm=True` + `idempotency_key` |
 | 多币种 / i18n | `currency` 列 + 话术资源文件 | 金额仍存整数分,展示层换算;文案从资源文件取 |
@@ -259,7 +331,7 @@ backend/
 │                   tools/ / graph/ / memory/ / retrieval/ / eval/ / perception / schemas/ / trace
 ├── alembic/        0001_initial → 0002_add_tool_events → 0003_ticket_summary → 0004_memory → 0005_ticket_session_id
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          434 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
+├── tests/          453 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
 └── README.md       本文件
 
 frontend/           chat.html / app.js / agent.html / agent.js / style.css(原生实现,零 CDN、零构建)

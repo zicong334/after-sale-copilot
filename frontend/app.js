@@ -11,11 +11,100 @@
 (function () {
   "use strict";
 
-  var params = new URLSearchParams(location.search);
-  var MERCHANT_ID = params.get("merchant_id") || "seed-merchant-1";
-  var CUSTOMER_ID = params.get("customer_id") || "seed-cust-009";
+  var TOKEN_KEY = "sc_token";
+  var USER_KEY = "sc_user";
   var POLL_MS = 3000;
   var TOAST_MS = 3500;
+  var WS_RETRY_STEPS = [1000, 2000, 5000]; // 断线退避:1s → 2s → 5s(之后保持 5s)
+  var WS_PING_MS = 25000;
+
+  /* ------------------------- W8 登录态 / 统一请求封装 ------------------------ */
+
+  function readToken() {
+    try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (err) { return ""; }
+  }
+
+  function readUser() {
+    try {
+      var raw = window.localStorage.getItem(USER_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function gotoLogin() {
+    try {
+      window.localStorage.removeItem(TOKEN_KEY);
+      window.localStorage.removeItem(USER_KEY);
+    } catch (err) { /* 隐私模式忽略 */ }
+    if (location.pathname.indexOf("login.html") < 0) location.replace("/login.html");
+  }
+
+  /* 16 字节随机 hex(crypto.getRandomValues;旧浏览器退回 Math.random 兜底) */
+  function randomHex(byteLen) {
+    var buf = new Uint8Array(byteLen);
+    if (window.crypto && window.crypto.getRandomValues) {
+      window.crypto.getRandomValues(buf);
+    } else {
+      for (var i = 0; i < byteLen; i += 1) buf[i] = Math.floor(Math.random() * 256);
+    }
+    var out = "";
+    for (var j = 0; j < buf.length; j += 1) out += ("0" + buf[j].toString(16)).slice(-2);
+    return out;
+  }
+
+  var WRITE_METHODS = { POST: true, PUT: true, PATCH: true, DELETE: true };
+
+  /**
+   * 统一请求入口(原生 fetch 封装,无 CDN/无构建):
+   * - 带 `Authorization: Bearer <token>`
+   * - 写请求(POST/PUT/PATCH/DELETE)加防重放头 `X-Timestamp`(Unix 秒)+ `X-Nonce`(16 字节 hex)
+   * - 401 → 清登录态并跳 login.html
+   */
+  async function apiFetch(path, opts) {
+    opts = opts || {};
+    var method = String(opts.method || "GET").toUpperCase();
+    var headers = {};
+    if (opts.headers) {
+      Object.keys(opts.headers).forEach(function (key) { headers[key] = opts.headers[key]; });
+    }
+    var token = readToken();
+    if (token) headers["Authorization"] = "Bearer " + token;
+    if (WRITE_METHODS[method]) {
+      headers["X-Timestamp"] = String(Math.floor(Date.now() / 1000));
+      headers["X-Nonce"] = randomHex(16);
+    }
+    var init = {};
+    Object.keys(opts).forEach(function (key) { init[key] = opts[key]; });
+    init.method = method;
+    init.headers = headers;
+    var resp = await fetch(path, init);
+    if (resp.status === 401) gotoLogin();
+    return resp;
+  }
+
+  /* 会话 id 持久化:WS 与续聊都依赖它(同一买家账号下复用) */
+  function saveSession() {
+    if (!state.sessionId) return;
+    try { window.localStorage.setItem(SESSION_KEY, state.sessionId); } catch (err) { /* 隐私模式忽略 */ }
+  }
+
+  function loadSession() {
+    try { return window.localStorage.getItem(SESSION_KEY) || ""; } catch (err) { return ""; }
+  }
+
+  /* 身份一律来自 token(不再读 URL ?merchant_id=&customer_id=) */
+  var ME = readUser();
+  var TOKEN = readToken();
+  if (!TOKEN || !ME || ME.role !== "buyer") {
+    gotoLogin();
+    return;
+  }
+  var MERCHANT_ID = ME.merchant_id || "";
+  var CUSTOMER_ID = ME.customer_id || "";
+  // 会话 id 按买家分开存:同一浏览器切换买家账号不会串会话
+  var SESSION_KEY = "sc_session_" + (CUSTOMER_ID || ME.id || ME.username || "buyer");
 
   var els = {
     stream: document.getElementById("stream"),
@@ -28,7 +117,9 @@
     trace: document.getElementById("trace"),
     toastWrap: document.getElementById("toastWrap"),
     closedHint: document.getElementById("closedHint"),
-    handoffBar: document.getElementById("handoffBar")
+    handoffBar: document.getElementById("handoffBar"),
+    connBadge: document.getElementById("connBadge"),
+    logoutBtn: document.getElementById("logoutBtn")
   };
 
   var state = {
@@ -44,7 +135,15 @@
     pollTimer: null,
     pollFails: 0,
     seenHuman: Object.create(null),
-    lastText: ""
+    lastText: "",
+    confirmCards: Object.create(null), // confirm_token → { okBtn, noBtn, countdown },供 WS 同步
+    ws: null,
+    wsReady: false,
+    wsRetry: 0,
+    wsSession: null, // 当前 WS 订阅的 session_id,会话切换时需重连
+    wsReconnectTimer: null,
+    wsPingTimer: null,
+    wsClosedByUs: false
   };
 
   /* -------------------------------- 基础工具 -------------------------------- */
@@ -257,7 +356,17 @@
     els.stream.appendChild(wrap);
     scrollBottom();
 
+    // W8:登记确认卡,收到 WS confirm_status(含其他标签页确认)时同步最终态
+    state.confirmCards[card.confirm_token] = {
+      okBtn: okBtn,
+      noBtn: noBtn,
+      countdown: countdown,
+      stopped: false // 终态(已提交 / WS 同步)后停掉倒计时,避免覆盖最终文案
+    };
+
     function tick() {
+      var entry = state.confirmCards[card.confirm_token];
+      if (entry && entry.stopped) return;
       if (left <= 0) {
         countdown.textContent = "已超时 = 自动拒绝(草稿保留)";
         bar.style.width = "0%";
@@ -275,10 +384,12 @@
     tick();
 
     function decide(kind) {
+      var entry = state.confirmCards[card.confirm_token];
+      if (entry) entry.stopped = true;
       okBtn.disabled = true;
       noBtn.disabled = true;
       countdown.textContent = "已提交…";
-      fetch("/api/c/confirm/" + encodeURIComponent(card.confirm_token) + "/" + kind, {
+      apiFetch("/api/c/confirm/" + encodeURIComponent(card.confirm_token) + "/" + kind, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -402,6 +513,8 @@
   }
 
   function startPolling() {
+    // W8:WS 主通道正常时暂停轮询;未就绪/断开时恢复(旧轮询逻辑原样保留为降级)
+    if (state.wsReady) return;
     if (state.pollTimer || state.closed) return;
     state.pollFails = 0;
     pollSummary();
@@ -419,7 +532,7 @@
     if (!state.sessionId || state.closed) return;
     try {
       // W5-FIX R1:会话作用域端点——只返回本 session 的工单,不再按客户取最近一张。
-      var resp = await fetch(
+      var resp = await apiFetch(
         "/api/c/handoff/summary?session_id=" + encodeURIComponent(state.sessionId),
         { headers: { Accept: "application/json" } }
       );
@@ -463,6 +576,7 @@
     if (state.closed) return;
     state.closed = true;
     stopPolling();
+    closeWs();
     renderStatus();
     if (els.handoffBar) els.handoffBar.classList.add("hidden");
     els.input.disabled = true;
@@ -474,6 +588,183 @@
       addSysLine("工单已关闭,本次会话已结束。如需新问题,请刷新页面重新发起。", true);
       toast("工单已关闭,输入已停用。", "error");
     }
+  }
+
+  /* ------------------------- W8:WS 主通道(实时推送) ------------------------ */
+  /*
+   * 主通道:GET /ws/buyer/{session_id}?token=(session_id 来自聊天返回/本地保存)。
+   * 事件:ready / agent_message / ticket_status / confirm_status / assistant_message;
+   * 心跳:客户端发 {"type":"ping"} → 服务端回 pong。
+   * 降级:onclose 按 1s/2s/5s 退避重连,重连期间恢复 pollSummary 轮询。
+   */
+
+  function connBadge(stateName, text) {
+    if (!els.connBadge) return;
+    els.connBadge.setAttribute("data-state", stateName);
+    els.connBadge.textContent = text;
+  }
+
+  function wsUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + "/ws/buyer/" +
+      encodeURIComponent(state.sessionId) + "?token=" + encodeURIComponent(readToken());
+  }
+
+  function startWsPing() {
+    stopWsPing();
+    state.wsPingTimer = window.setInterval(function () {
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+          state.ws.send(JSON.stringify({ type: "ping" }));
+        } catch (err) { /* 断线由 onclose 统一处理 */ }
+      }
+    }, WS_PING_MS);
+  }
+
+  function stopWsPing() {
+    if (state.wsPingTimer) {
+      window.clearInterval(state.wsPingTimer);
+      state.wsPingTimer = null;
+    }
+  }
+
+  function closeWs() {
+    state.wsClosedByUs = true;
+    if (state.wsReconnectTimer) {
+      window.clearTimeout(state.wsReconnectTimer);
+      state.wsReconnectTimer = null;
+    }
+    stopWsPing();
+    if (state.ws) {
+      var ws = state.ws;
+      state.ws = null;
+      try { ws.close(); } catch (err) { /* 已关闭忽略 */ }
+    }
+    state.wsReady = false;
+  }
+
+  function scheduleWsReconnect() {
+    if (state.wsClosedByUs || state.closed || !state.sessionId) return;
+    var wait = WS_RETRY_STEPS[Math.min(state.wsRetry, WS_RETRY_STEPS.length - 1)];
+    state.wsRetry += 1;
+    if (state.wsReconnectTimer) window.clearTimeout(state.wsReconnectTimer);
+    state.wsReconnectTimer = window.setTimeout(function () {
+      state.wsReconnectTimer = null;
+      connectWs();
+    }, wait);
+    connBadge("offline", "实时已断开 · " + Math.round(wait / 1000) + "s 后重连");
+  }
+
+  function connectWs() {
+    // W8-FIX:会话切换时会先 closeWs()(置 wsClosedByUs=true)再 connectWs(),
+    // 因此这里必须先复位标志,否则显式重连会被上一行守卫直接挡掉,WS 永不建立。
+    if (state.closed) return;
+    if (!state.sessionId || !readToken()) return;
+    if (state.ws &&
+        (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    state.wsClosedByUs = false;
+    connBadge("connecting", "实时连接中…");
+    var ws;
+    try {
+      ws = new WebSocket(wsUrl());
+    } catch (err) {
+      scheduleWsReconnect();
+      return;
+    }
+    state.ws = ws;
+    state.wsSession = state.sessionId;
+    ws.onopen = function () {
+      // 连接建立后仍等服务端 ready 帧(先鉴权再订阅频道)
+    };
+    ws.onmessage = function (ev) {
+      var msg = null;
+      try { msg = JSON.parse(ev.data); } catch (err) { return; }
+      if (msg && msg.type) handleWsEvent(msg);
+    };
+    ws.onerror = function () { /* onclose 统一处理重连 */ };
+    ws.onclose = function () {
+      if (state.ws === ws) state.ws = null;
+      state.wsReady = false;
+      stopWsPing();
+      if (state.closed || state.wsClosedByUs) {
+        connBadge("offline", "实时已断开");
+        return;
+      }
+      if (state.handedOff) startPolling(); // 降级:WS 断开时恢复旧轮询
+      scheduleWsReconnect();
+    };
+  }
+
+  function handleWsEvent(msg) {
+    switch (msg.type) {
+      case "ready":
+        state.wsReady = true;
+        state.wsRetry = 0;
+        if (state.wsReconnectTimer) {
+          window.clearTimeout(state.wsReconnectTimer);
+          state.wsReconnectTimer = null;
+        }
+        connBadge("online", "实时已连接");
+        startWsPing();
+        pollSummary();  // 先补一次状态,避免 ready 与首帧事件之间漏状态
+        stopPolling();  // WS 正常 → 暂停轮询
+        break;
+      case "pong":
+        break;
+      case "agent_message":
+        onWsAgentMessage(msg);
+        break;
+      case "ticket_status":
+        onWsTicketStatus(msg);
+        break;
+      case "ticket_update":
+        // 队列频道事件:补一次本会话 summary(防御未来重复投递,不打断输入)
+        if (state.sessionId) pollSummary();
+        break;
+      case "confirm_status":
+        onWsConfirmStatus(msg);
+        break;
+      case "assistant_message":
+        // 多标签同步:本标签的 AI 回复已由 SSE 渲染,这里不重复追加
+        break;
+      default:
+        break;
+    }
+  }
+
+  function onWsAgentMessage(msg) {
+    if (!msg || !msg.session_id || msg.session_id !== state.sessionId) return;
+    var key = msg.message_id ||
+      (String(msg.ts || "") + "|" + String(msg.content || ""));
+    if (state.seenHuman[key]) return;
+    state.seenHuman[key] = true;
+    hideEmpty();
+    addBubble("human", msg.content || "", { time: fmtTime(msg.ts) });
+    markHandedOff(false);
+  }
+
+  function onWsTicketStatus(msg) {
+    if (!msg || (msg.session_id && msg.session_id !== state.sessionId)) return;
+    state.ticketStatus = msg.status || state.ticketStatus;
+    if (msg.status === "closed") {
+      onTicketClosed();
+      return;
+    }
+    if (msg.status) markHandedOff(false);
+  }
+
+  function onWsConfirmStatus(msg) {
+    if (!msg || !msg.token) return;
+    var card = state.confirmCards[msg.token];
+    if (!card) return;
+    card.stopped = true;
+    var confirmed = msg.status === "confirmed";
+    card.okBtn.disabled = true;
+    card.noBtn.disabled = true;
+    card.countdown.textContent = confirmed ? "已确认(实时同步)" : "已拒绝(实时同步)";
+    toast(confirmed ? "确认卡已确认" : "确认卡已拒绝", confirmed ? "success" : "warn");
   }
 
   /* --------------------------------- 输入区 ------------------------------- */
@@ -563,7 +854,14 @@
         break;
       case "done":
         meta.done = data;
-        if (data.session_id) state.sessionId = data.session_id;
+        if (data.session_id) {
+          state.sessionId = data.session_id;
+          saveSession();
+          if (!state.ws || state.wsSession !== state.sessionId) {
+            closeWs();          // 会话 id 变化:退订旧频道后重连
+            connectWs();
+          }
+        }
         if (data.trace_id) setTrace(data.trace_id);
         if (data.usage) meta.usage = data.usage;
         if (data.session_status && data.session_status !== "active") {
@@ -616,7 +914,7 @@
     if (state.sessionId) body.session_id = state.sessionId;
 
     try {
-      var resp = await fetch("/api/c/chat/stream", {
+      var resp = await apiFetch("/api/c/chat/stream", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -672,4 +970,25 @@
   renderStatus();
   autoResize();
   els.input.focus();
+
+  /* W8:退出登录(清 token/用户/本次会话 id 的登录态,回登录页) */
+  if (els.logoutBtn) {
+    els.logoutBtn.addEventListener("click", function () {
+      closeWs();
+      try {
+        window.localStorage.removeItem(TOKEN_KEY);
+        window.localStorage.removeItem(USER_KEY);
+      } catch (err) { /* 隐私模式忽略 */ }
+      location.replace("/login.html");
+    });
+  }
+
+  /* W8:恢复本买家上次的会话 id → 先跑旧轮询,再连 WS 主通道(WS 就绪后轮询自动暂停) */
+  (function bootSession() {
+    var saved = loadSession();
+    if (!saved) return;
+    state.sessionId = saved;
+    startPolling();
+    connectWs();
+  })();
 })();

@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
+from app import security
 from app.api import get_db
 from app.db import utc_now
 from app.errors import AppError, NotFoundError, StateConflictError
@@ -104,6 +105,70 @@ def _require_session(db: Session, thread_id: str) -> ChatSession:
     if row is None:
         raise NotFoundError(f"会话不存在: {thread_id}")
     return row
+
+
+def _identity_of(identity: Any) -> security.Identity:
+    """把注入的身份归一成 ``Identity``。
+
+    并发回归测试会直接调用路由函数(不经 FastAPI),此时形参拿到的是
+    ``Depends`` 占位对象;按 internal 身份处理,等价于测试环境的 AUTH_MODE=internal。
+    """
+    if isinstance(identity, security.Identity):
+        return identity
+    return security.Identity(sub="internal", role="internal", merchant_id="*")
+
+
+def _scope_session(
+    db: Session, thread_id: str, identity: security.Identity, ident: security.Identity
+) -> ChatSession:
+    """enforce 下买家只能操作自己的会话(internal 跳过,保证旧回归不变)。
+
+    越权统一按 404 处理,避免泄露他人会话/确认卡是否存在。
+    """
+    row = _require_session(db, thread_id)
+    if not identity.is_internal and (
+        row.merchant_id != ident.merchant_id or row.customer_id != ident.customer_id
+    ):
+        raise NotFoundError(f"会话不存在: {thread_id}")
+    return row
+
+
+def _publish_confirm_status(thread_id: str, token: str, status: str) -> None:
+    """写库 commit 之后广播确认卡状态(buyer 频道,按会话 thread_id 定位)。"""
+    security.publish_event(
+        security.channel_buyer(thread_id),
+        "confirm_status",
+        token=token,
+        session_id=thread_id,
+        status=status,
+    )
+
+
+def _publish_handoff_created(thread_id: str, merchant_id: str, receipt: dict[str, Any]) -> None:
+    """W8:确认卡真正创建人工工单后广播 queue_new(坐席队列)+ ticket_status(买家)。
+
+    没有这两条事件时,坐席工作台要等买家下一条留言(blocked 轮 ack_ticket_id)
+    才会刷新队列,新建工单的实时性就丢了。广播只在 commit 之后、且仅在
+    非幂等首次执行时调用一次。
+    """
+    ticket_id = str(receipt.get("ticket_id") or "")
+    if receipt.get("kind") != "handoff" or not ticket_id:
+        return
+    status = str(receipt.get("status") or "queued")
+    security.publish_event(
+        security.channel_queue(merchant_id),
+        "queue_new",
+        ticket_id=ticket_id,
+        session_id=thread_id,
+        status=status,
+    )
+    security.publish_event(
+        security.channel_buyer(thread_id),
+        "ticket_status",
+        ticket_id=ticket_id,
+        session_id=thread_id,
+        status=status,
+    )
 
 
 def _status_of(db: Session, thread_id: str) -> str:
@@ -275,9 +340,16 @@ def _receipt(
 
 
 @router.get("/pending")
-def pending(thread_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def pending(
+    thread_id: str,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
     """待确认卡(按 thread_id 读 checkpointer);已超时则在此落实"超时=拒绝"。"""
-    _require_session(db, thread_id)
+    # 兼容测试直接调用路由函数(形参为 Depends 占位)时按 internal 身份处理。
+    identity = _identity_of(identity)
+    ident = security.effective_identity(identity, "buyer")
+    _scope_session(db, thread_id, identity, ident)
     state = _read_state(thread_id)
     confirm = state.get("confirm") or {}
     token = str(confirm.get("token") or "")
@@ -293,9 +365,15 @@ def pending(thread_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     return _pending_body(thread_id, state, confirm, request)
 
 
-@router.post("/{confirm_token}/confirm")
+@router.post(
+    "/{confirm_token}/confirm",
+    dependencies=[Depends(security.require_replay_guard)],
+)
 def confirm(
-    confirm_token: str, payload: ThreadRef, db: Session = Depends(get_db)
+    confirm_token: str,
+    payload: ThreadRef,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
     """人工确认 → graph resume → 真实写操作 → verified 回执(幂等,不重复执行)。
 
@@ -303,8 +381,12 @@ def confirm(
     ``expire_all`` 再重读,保证并发点击时只有一个请求真正执行写工具,其余拿到
     幂等回执(``idempotent=True``、``receipt.idempotent_hit=True``)。
     """
+    # 兼容测试直接调用路由函数(形参为 Depends 占位)时按 internal 身份处理。
+    identity = _identity_of(identity)
+    ident = security.effective_identity(identity, "buyer", payload=payload)
     with _confirm_lock(confirm_token):
         db.expire_all()
+        _scope_session(db, payload.thread_id, identity, ident)
         state, request = _require_confirm(db, payload.thread_id, confirm_token)
         confirm_state = state.get("confirm") or {}
         if request.status == "confirmed":
@@ -342,6 +424,10 @@ def confirm(
         receipt = _receipt(db, state, request)
         trace_id = str(state.get("trace_id") or "")
         _append_assistant(db, payload.thread_id, result.reply, trace_id, "confirm")
+        # 写库/补消息已 commit,此时才广播确认卡终态。
+        _publish_confirm_status(payload.thread_id, confirm_token, "confirmed")
+        # 手工转工单在这一步才真正落库:补一条 queue_new 让坐席队列实时出现新工单。
+        _publish_handoff_created(payload.thread_id, ident.merchant_id, receipt)
         return {
             "ok": True,
             "decision": "confirmed",
@@ -354,9 +440,15 @@ def confirm(
         }
 
 
-@router.post("/{confirm_token}/reject")
+@router.post(
+    "/{confirm_token}/reject",
+    dependencies=[Depends(security.require_replay_guard)],
+)
 def reject(
-    confirm_token: str, payload: ThreadRef, db: Session = Depends(get_db)
+    confirm_token: str,
+    payload: ThreadRef,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
     """人工拒绝 → graph resume(False) → 零写操作;草稿保留。
 
@@ -365,8 +457,12 @@ def reject(
     极端并发下第二次 reject 读到的是已 cancelled 的终态,直接返回幂等回执
     (``idempotent=True``,``cancelled`` 已回放),不会双写/409。
     """
+    # 兼容测试直接调用路由函数(形参为 Depends 占位)时按 internal 身份处理。
+    identity = _identity_of(identity)
+    ident = security.effective_identity(identity, "buyer", payload=payload)
     with _confirm_lock(confirm_token):
         db.expire_all()
+        _scope_session(db, payload.thread_id, identity, ident)
         state, request = _require_confirm(db, payload.thread_id, confirm_token)
         confirm_state = state.get("confirm") or {}
         if request.status == "cancelled":
@@ -393,6 +489,8 @@ def reject(
             db.commit()
         trace_id = str(state.get("trace_id") or "")
         _append_assistant(db, payload.thread_id, result.reply, trace_id, "confirm_reject")
+        # 写库/补消息已 commit,此时才广播确认卡终态。
+        _publish_confirm_status(payload.thread_id, confirm_token, "rejected")
         return {
             "ok": True,
             "decision": "rejected",

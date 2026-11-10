@@ -1,6 +1,5 @@
 /* 售后 Copilot · 客服工作台(原生 JS,零第三方依赖 零构建)
- * 对接契约 §二 /api/b/*:
- *   GET  /api/b/services
+ * 对接契约 §二 /api/b/*(全部带 Authorization: Bearer <token>):
  *   GET  /api/b/tickets?merchant_id=&status=
  *   GET  /api/b/tickets/{id}
  *   POST /api/b/tickets/{id}/claim      {service_id}
@@ -13,13 +12,87 @@
 (function () {
   "use strict";
 
-  var params = new URLSearchParams(location.search);
-  var MERCHANT_ID = params.get("merchant_id") || "seed-merchant-1";
+  var TOKEN_KEY = "sc_token";
+  var USER_KEY = "sc_user";
+  var WS_RETRY_STEPS = [1000, 2000, 5000]; // 断线退避:1s → 2s → 5s(之后保持 5s)
+  var WS_PING_MS = 25000;
+  var QUEUE_POLL_MS = 5000;                // WS 断线降级时的队列轮询间隔
 
-  var FALLBACK_SERVICES = [
-    { service_id: "seed-agent-1", display_name: "客服 小暖" },
-    { service_id: "seed-agent-2", display_name: "客服 小满" }
-  ];
+  /* ------------------------- W8 登录态 / 统一请求封装 ------------------------ */
+
+  function readToken() {
+    try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (err) { return ""; }
+  }
+
+  function readUser() {
+    try {
+      var raw = window.localStorage.getItem(USER_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function gotoLogin() {
+    try {
+      window.localStorage.removeItem(TOKEN_KEY);
+      window.localStorage.removeItem(USER_KEY);
+    } catch (err) { /* 隐私模式忽略 */ }
+    if (location.pathname.indexOf("login.html") < 0) location.replace("/login.html");
+  }
+
+  /* 16 字节随机 hex(crypto.getRandomValues;旧浏览器退回 Math.random 兜底) */
+  function randomHex(byteLen) {
+    var buf = new Uint8Array(byteLen);
+    if (window.crypto && window.crypto.getRandomValues) {
+      window.crypto.getRandomValues(buf);
+    } else {
+      for (var i = 0; i < byteLen; i += 1) buf[i] = Math.floor(Math.random() * 256);
+    }
+    var out = "";
+    for (var j = 0; j < buf.length; j += 1) out += ("0" + buf[j].toString(16)).slice(-2);
+    return out;
+  }
+
+  var WRITE_METHODS = { POST: true, PUT: true, PATCH: true, DELETE: true };
+
+  /**
+   * 统一请求入口(原生 fetch 封装,无 CDN/无构建):
+   * - 带 `Authorization: Bearer <token>`
+   * - 写请求(POST/PUT/PATCH/DELETE)加防重放头 `X-Timestamp`(Unix 秒)+ `X-Nonce`(16 字节 hex)
+   * - 401 → 清登录态并跳 login.html
+   */
+  async function apiFetch(path, opts) {
+    opts = opts || {};
+    var method = String(opts.method || "GET").toUpperCase();
+    var headers = {};
+    if (opts.headers) {
+      Object.keys(opts.headers).forEach(function (key) { headers[key] = opts.headers[key]; });
+    }
+    var token = readToken();
+    if (token) headers["Authorization"] = "Bearer " + token;
+    if (WRITE_METHODS[method]) {
+      headers["X-Timestamp"] = String(Math.floor(Date.now() / 1000));
+      headers["X-Nonce"] = randomHex(16);
+    }
+    var init = {};
+    Object.keys(opts).forEach(function (key) { init[key] = opts[key]; });
+    init.method = method;
+    init.headers = headers;
+    var resp = await fetch(path, init);
+    if (resp.status === 401) gotoLogin();
+    return resp;
+  }
+
+  /* 身份一律来自 token(不再读 URL ?merchant_id=,也没有静态坐席列表/手填入口) */
+  var ME = readUser();
+  var TOKEN = readToken();
+  if (!TOKEN || !ME || ME.role !== "agent") {
+    gotoLogin();
+    return;
+  }
+  var MERCHANT_ID = ME.merchant_id || "";
+  var SERVICE_ID = ME.service_id || "";
 
   var STATUS_LABELS = {
     queued: "待领取",
@@ -39,7 +112,9 @@
   };
 
   var els = {
-    agentSelect: document.getElementById("agentSelect"),
+    agentChip: document.getElementById("agentChip"),
+    connBadge: document.getElementById("connBadge"),
+    logoutBtn: document.getElementById("logoutBtn"),
     queueList: document.getElementById("queueList"),
     queueState: document.getElementById("queueState"),
     queueCount: document.getElementById("queueCount"),
@@ -56,7 +131,7 @@
   };
 
   var state = {
-    agentId: "seed-agent-1",
+    agentId: SERVICE_ID,
     statusFilter: "",
     tickets: [],
     selectedId: null,
@@ -64,7 +139,14 @@
     suggestTicketId: null,
     loadingQueue: false,
     detailBusy: false,
-    timer: null
+    timer: null,             // 队列轮询定时器(WS 断线降级用)
+    refreshTimer: null,      // WS 事件触发的队列刷新去抖
+    ws: null,
+    wsReady: false,
+    wsRetry: 0,
+    wsReconnectTimer: null,
+    wsPingTimer: null,
+    wsClosedByUs: false
   };
 
   /* -------------------------------- 基础工具 -------------------------------- */
@@ -135,7 +217,7 @@
   async function api(path, options) {
     var resp;
     try {
-      resp = await fetch(path, options || {});
+      resp = await apiFetch(path, options || {});
     } catch (err) {
       throw new Error("网络错误:" + errorMessage(err));
     }
@@ -163,44 +245,19 @@
 
   /* --------------------------------- 坐席 --------------------------------- */
 
+  /* W8:坐席身份来自登录 token(service_id / merchant_id),不再有静态 _SERVICES
+     选择器或手填 service_id;claim/messages/close 的 body.service_id 仍带 token 值,
+     仅作 AUTH_MODE=internal 回归兜底(enforce 下以 token 为准)。 */
   function currentAgent() {
-    return els.agentSelect.value || state.agentId;
+    return state.agentId || SERVICE_ID;
   }
 
-  function fillServices(services) {
-    els.agentSelect.textContent = "";
-    services.forEach(function (svc) {
-      var opt = document.createElement("option");
-      opt.value = svc.service_id;
-      opt.textContent = svc.display_name + "(" + svc.service_id + ")";
-      els.agentSelect.appendChild(opt);
-    });
-    try {
-      var saved = window.localStorage.getItem("w5.agent");
-      if (saved && services.some(function (s) { return s.service_id === saved; })) {
-        els.agentSelect.value = saved;
-      }
-    } catch (err) { /* 隐私模式忽略 */ }
-    state.agentId = currentAgent();
+  function renderAgentChip() {
+    if (!els.agentChip) return;
+    var name = ME.display_name || ME.username || "坐席";
+    els.agentChip.textContent = name + "(" + SERVICE_ID + ")";
+    els.agentChip.title = "merchant_id: " + MERCHANT_ID;
   }
-
-  async function loadServices() {
-    try {
-      var data = await api("/api/b/services");
-      var items = Array.isArray(data.items) && data.items.length
-        ? data.items : FALLBACK_SERVICES;
-      fillServices(items);
-    } catch (err) {
-      fillServices(FALLBACK_SERVICES);
-      toast("坐席列表加载失败:" + errorMessage(err) + "(已用演示默认值)", "error");
-    }
-  }
-
-  els.agentSelect.addEventListener("change", function () {
-    state.agentId = currentAgent();
-    try { window.localStorage.setItem("w5.agent", state.agentId); } catch (err) { /* ignore */ }
-    if (state.selectedId) loadDetail(state.selectedId);
-  });
 
   /* --------------------------------- 队列 --------------------------------- */
 
@@ -600,6 +657,165 @@
     }
   }
 
+  /* ------------------- W8:WS 主通道 + 队列轮询降级 -------------------- */
+  /*
+   * 主通道:GET /ws/agent/{service_id}?token=,服务端订阅
+   * agent:<service_id> + queue:<merchant_id>;事件:ticket_update / queue_new
+   * (ticket_status 防御性处理)。心跳 {"type":"ping"} → pong。
+   * 降级:WS 正常时暂停队列轮询;onclose 后恢复轮询并 1s/2s/5s 退避重连。
+   * 注意:自动刷新详情时若坐席正在回复框输入,不重绘(避免覆盖草稿)。
+   */
+
+  function connBadge(stateName, text) {
+    if (!els.connBadge) return;
+    els.connBadge.setAttribute("data-state", stateName);
+    els.connBadge.textContent = text;
+  }
+
+  function wsUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + "/ws/agent/" +
+      encodeURIComponent(SERVICE_ID) + "?token=" + encodeURIComponent(readToken());
+  }
+
+  function startWsPing() {
+    stopWsPing();
+    state.wsPingTimer = window.setInterval(function () {
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+          state.ws.send(JSON.stringify({ type: "ping" }));
+        } catch (err) { /* 断线由 onclose 统一处理 */ }
+      }
+    }, WS_PING_MS);
+  }
+
+  function stopWsPing() {
+    if (state.wsPingTimer) {
+      window.clearInterval(state.wsPingTimer);
+      state.wsPingTimer = null;
+    }
+  }
+
+  function closeWs() {
+    state.wsClosedByUs = true;
+    if (state.wsReconnectTimer) {
+      window.clearTimeout(state.wsReconnectTimer);
+      state.wsReconnectTimer = null;
+    }
+    stopWsPing();
+    if (state.ws) {
+      var ws = state.ws;
+      state.ws = null;
+      try { ws.close(); } catch (err) { /* 已关闭忽略 */ }
+    }
+    state.wsReady = false;
+  }
+
+  /* WS 断线降级:队列轮询(旧刷新路径),WS 正常时不跑 */
+  function startQueuePolling() {
+    if (state.timer || state.wsReady) return;
+    state.timer = window.setInterval(function () {
+      loadQueue(true);
+    }, QUEUE_POLL_MS);
+  }
+
+  function stopQueuePolling() {
+    if (state.timer) {
+      window.clearInterval(state.timer);
+      state.timer = null;
+    }
+  }
+
+  /* WS 事件触发的刷新(去抖 300ms):队列必刷;详情仅在坐席未输入时重绘 */
+  function scheduleQueueRefresh() {
+    if (state.refreshTimer) return;
+    state.refreshTimer = window.setTimeout(function () {
+      state.refreshTimer = null;
+      loadQueue(true);
+      if (!state.selectedId) return;
+      var replyInput = els.detailBody.querySelector("#reply-input");
+      if (replyInput && replyInput.value.trim()) return; // 保护未发送草稿
+      loadDetail(state.selectedId);
+    }, 300);
+  }
+
+  function scheduleWsReconnect() {
+    if (state.wsClosedByUs) return;
+    var wait = WS_RETRY_STEPS[Math.min(state.wsRetry, WS_RETRY_STEPS.length - 1)];
+    state.wsRetry += 1;
+    if (state.wsReconnectTimer) window.clearTimeout(state.wsReconnectTimer);
+    state.wsReconnectTimer = window.setTimeout(function () {
+      state.wsReconnectTimer = null;
+      connectWs();
+    }, wait);
+    connBadge("offline", "实时已断开 · " + Math.round(wait / 1000) + "s 后重连");
+  }
+
+  function connectWs() {
+    // W8-FIX:显式重连前会先 closeWs()(置 wsClosedByUs=true),这里必须先复位,
+    // 否则重连被守卫挡掉,工作台 WS 永不重建。
+    if (!SERVICE_ID || !readToken()) return;
+    if (state.ws &&
+        (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    state.wsClosedByUs = false;
+    connBadge("connecting", "实时连接中…");
+    var ws;
+    try {
+      ws = new WebSocket(wsUrl());
+    } catch (err) {
+      scheduleWsReconnect();
+      return;
+    }
+    state.ws = ws;
+    ws.onmessage = function (ev) {
+      var msg = null;
+      try { msg = JSON.parse(ev.data); } catch (err) { return; }
+      if (msg && msg.type) handleWsEvent(msg);
+    };
+    ws.onerror = function () { /* onclose 统一处理重连 */ };
+    ws.onclose = function () {
+      if (state.ws === ws) state.ws = null;
+      state.wsReady = false;
+      stopWsPing();
+      if (state.wsClosedByUs) {
+        connBadge("offline", "实时已断开");
+        return;
+      }
+      startQueuePolling(); // 降级:WS 断开时恢复队列轮询
+      scheduleWsReconnect();
+    };
+  }
+
+  function handleWsEvent(msg) {
+    switch (msg.type) {
+      case "ready":
+        state.wsReady = true;
+        state.wsRetry = 0;
+        if (state.wsReconnectTimer) {
+          window.clearTimeout(state.wsReconnectTimer);
+          state.wsReconnectTimer = null;
+        }
+        connBadge("online", "实时已连接");
+        startWsPing();
+        stopQueuePolling();  // WS 正常 → 暂停轮询
+        break;
+      case "pong":
+        break;
+      case "ticket_update":
+      case "ticket_status":
+        scheduleQueueRefresh();
+        break;
+      case "queue_new":
+        toast("有新工单进入队列", "warn");
+        scheduleQueueRefresh();
+        break;
+      default:
+        break;
+    }
+  }
+
   /* -------------------------------- 事件绑定 ------------------------------- */
 
   els.refreshBtn.addEventListener("click", function () {
@@ -628,11 +844,25 @@
 
   els.fillReplyBtn.addEventListener("click", fillReplyFromSuggestion);
 
+  /* W8:退出登录(清登录态后回登录页) */
+  if (els.logoutBtn) {
+    els.logoutBtn.addEventListener("click", function () {
+      closeWs();
+      stopQueuePolling();
+      try {
+        window.localStorage.removeItem(TOKEN_KEY);
+        window.localStorage.removeItem(USER_KEY);
+      } catch (err) { /* 隐私模式忽略 */ }
+      location.replace("/login.html");
+    });
+  }
+
   /* --------------------------------- 启动 --------------------------------- */
 
   (async function boot() {
-    fillServices(FALLBACK_SERVICES);
-    await loadServices();
+    renderAgentChip();
+    startQueuePolling(); // 旧轮询先跑(WS 未就绪时是唯一自动刷新路径)
+    connectWs();         // 主通道;ready 后暂停轮询
     loadQueue();
   })();
 })();

@@ -17,13 +17,16 @@
         <span>售后 Copilot</span>
         <span class="brand-sub">客服工作台</span>
       </div>
-      <a class="btn btn-ghost btn-sm" href="/chat.html"
-         style="text-decoration:none">返回买家聊天</a>
-      <div class="agent-picker">
-        <label for="agentSelect">当前坐席</label>
-        <select id="agentSelect" aria-label="选择当前坐席"></select>
+      <a class="btn btn-ghost btn-sm" href="/chat.html" target="_blank"
+         rel="noopener" style="text-decoration:none">买家聊天</a>
+      <!-- W8:实时推送状态 + 当前坐席;坐席身份来自登录 token,不再提供服务下拉/手填 -->
+      <span class="conn-badge" id="connBadge" data-state="offline"
+            title="实时推送通道状态">实时未连接</span>
+      <div class="agent-picker" title="坐席身份由登录账号决定,不可切换">
+        <label>当前坐席</label>
+        <span class="agent-name" id="agentChip">—</span>
       </div>
-      <span class="demo-note">演示环境无密码</span>
+      <button class="topbar-exit" id="logoutBtn" type="button">退出登录</button>
     </header>
 
     <main class="wb-main">
@@ -85,7 +88,7 @@
 
     <footer class="meta">
       <span>本页为原生 HTML / CSS / JS,零第三方依赖、零构建工具。</span>
-      <span class="mock-line">MOCK 演示环境:无登录密码,数据来自 seed;不接真实支付与物流。</span>
+      <span class="mock-line">MOCK 演示环境:需登录使用,数据来自 seed;不接真实支付与物流。</span>
     </footer>
   </div>
 

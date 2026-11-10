@@ -39,9 +39,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
+from app import security
 from app.api import get_db
 from app.errors import AppError, NotFoundError
-from app.models import ChatMessage, ChatSession
+from app.models import ChatMessage, ChatSession, Ticket
 from app.graph import runner
 from app.llm import LLMError, build_llm
 from app.perception import PerceptionError, normalize
@@ -69,12 +70,15 @@ class ChatRequest(BaseModel):
     ``context`` 是会话槽位(已由上游/上一轮解析出的确定性字段),不是感知层内容:
     ``order_id`` / ``days_since_delivery`` / ``unresolved_rounds`` /
     ``claimed_refund_cents`` / ``claimed_paid_cents`` / ``refund_amount_cents``。
+
+    ⚠️ ``merchant_id`` / ``customer_id``:仅 AUTH_MODE=internal 回归兜底;
+    enforce 下无身份效力(生效身份一律取自 token,见 ``security.effective_identity``)。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    merchant_id: str = Field(min_length=1, max_length=64)
-    customer_id: str = Field(min_length=1, max_length=64)
+    merchant_id: str | None = Field(default=None, min_length=1, max_length=64)
+    customer_id: str | None = Field(default=None, min_length=1, max_length=64)
     session_id: str | None = Field(default=None, max_length=64)
     text: str
     attachments: list[str] | None = None
@@ -161,8 +165,21 @@ def _degraded_result(
     )
 
 
-def _run_turn(db: Session, payload: ChatRequest) -> dict[str, Any]:
-    """一轮对话:感知 → 落库 → 编排 → 落库;返回对外响应体(含 usage)。"""
+def _run_turn(
+    db: Session, payload: ChatRequest, identity: security.Identity
+) -> dict[str, Any]:
+    """一轮对话:感知 → 落库 → 编排 → 落库;返回对外响应体(含 usage)。
+
+    身份统一从 ``security.current_identity`` 注入,请求体里的 merchant/customer
+    只在 internal 模式下兜底(``effective_identity`` 负责,enforce 下无效)。
+    """
+    ident = security.effective_identity(identity, "buyer", payload=payload)
+    # 日配额在入口处检查;超限直接 429,本轮不产生任何写入。
+    security.enforce_token_quota(db, ident.sub)
+    # 生效身份覆盖请求体归属字段:后续建会话/归属校验一律用 ident 的值。
+    payload = payload.model_copy(
+        update={"merchant_id": ident.merchant_id, "customer_id": ident.customer_id}
+    )
     try:
         percept = normalize(
             payload.text,
@@ -252,18 +269,38 @@ def _run_turn(db: Session, payload: ChatRequest) -> dict[str, Any]:
     # 买家这条文本已由 runner.build_blocked_turn 追加进该会话的未关闭工单。
     # W7-2 降级轮同样不落 assistant 消息(本轮没有可展示的 AI 生成内容)。
     blocked = not result.ai_replied
+    assistant_msg: ChatMessage | None = None
     if not blocked and not degraded:
-        db.add(
-            ChatMessage(
-                session_id=session_row.id,
-                role="assistant",
-                content=result.reply,
-                attachments=[],
-                trace_id=trace_id,
-                intent=result.intent,
-            )
+        assistant_msg = ChatMessage(
+            session_id=session_row.id,
+            role="assistant",
+            content=result.reply,
+            attachments=[],
+            trace_id=trace_id,
+            intent=result.intent,
+        )
+        db.add(assistant_msg)
+    # W8:本轮计量在 commit 前累加(record_token_usage 不自行 commit);
+    # blocked 轮没有 AI 生成,不计费也不写用量。
+    usage: dict[str, Any] | None = (
+        None if blocked else _usage(percept.text, result.reply, latency_ms, llm=llm)
+    )
+    if usage is not None:
+        security.record_token_usage(
+            db, ident.sub, usage["tokens_in"], usage["tokens_out"]
         )
     db.commit()
+
+    # W8:WS 事件一律在 commit 之后发布(订阅端只认已落库的事实)。
+    # 本函数所有分支都拿得到 session_id,故无需跳过。
+    if assistant_msg is not None:
+        security.publish_event(
+            security.channel_buyer(session_id),
+            "assistant_message",
+            session_id=session_id,
+            message_id=assistant_msg.id,
+            trace_id=trace_id,
+        )
 
     body = result.to_dict()
     body.update(
@@ -279,21 +316,37 @@ def _run_turn(db: Session, payload: ChatRequest) -> dict[str, Any]:
     )
     if degraded:
         body["degraded"] = True
-    if not blocked:
+    # W8:转人工创建当轮(blocked 轮已把买家文本追加进工单)广播排队事件,
+    # 坐席队列页据此即时刷新。载荷里的 order_id/customer_id 从工单行查出;
+    # 无工单号或工单已不可见时不发。
+    ack_ticket_id = body.get("ack_ticket_id")
+    if blocked and ack_ticket_id:
+        ticket_row = db.get(Ticket, ack_ticket_id)
+        if ticket_row is not None:
+            queue_payload: dict[str, Any] = {
+                "ticket_id": ticket_row.id,
+                "session_id": session_id,
+                "customer_id": ticket_row.customer_id,
+            }
+            if ticket_row.order_id:
+                queue_payload["order_id"] = ticket_row.order_id
+            security.publish_event(
+                security.channel_queue(ident.merchant_id), "queue_new", **queue_payload
+            )
+    if usage is not None:
         # 非 blocked 轮 usage 照旧;blocked 轮没有 AI 生成,整键不出现(不计费)
-        body["usage"] = _usage(
-            percept.text,
-            result.reply,
-            latency_ms,
-            llm=llm,
-        )
+        body["usage"] = usage
     return body
 
 
 @router.post("/chat")
-def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+def chat(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
     """一轮对话(JSON):感知 → 落库 → 编排 → 落库 → 返回。"""
-    return _run_turn(db, payload)
+    return _run_turn(db, payload, identity)
 
 
 def _chunks(text: str) -> Iterator[str]:
@@ -380,9 +433,13 @@ def _frames(body: dict[str, Any]) -> Iterator[str]:
 
 
 @router.post("/chat/stream")
-def chat_stream(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+def chat_stream(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> StreamingResponse:
     """一轮对话(SSE):同一套编排,按事件流返回。"""
-    frames = list(_frames(_run_turn(db, payload)))
+    frames = list(_frames(_run_turn(db, payload, identity)))
     return StreamingResponse(
         iter(frames),
         media_type="text/event-stream",

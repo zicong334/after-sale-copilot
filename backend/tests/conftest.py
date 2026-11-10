@@ -15,8 +15,43 @@ if str(_BACKEND_DIR) not in sys.path:
 import pytest
 from sqlalchemy.orm import Session
 
+from app import security
 from app.db import create_db_engine
 from app.models import Base
+
+
+# ---------------------------------------------------------------------------
+# W8:既有测试的兼容边界(autouse)
+# ---------------------------------------------------------------------------
+#
+# 为什么必须是 autouse:W8 之前已有 12 个 TestClient 测试文件(W1-W7 的 434 条
+# 用例),它们的调用方式与安全基建天然冲突——例如毫秒级连发同一接口(会触发
+# 用户级 5 QPS/突发 10 的令牌桶)、写接口只带 body 不带 X-Timestamp/X-Nonce
+# (会被防重放依赖 400)、chat 请求不带 JWT(会被鉴权中间件 401)。这些用例是
+# 回归红线,既不能删断言也不能放宽断言,因此**测试环境默认回到内部模式**:
+#
+# - ``AUTH_MODE=internal``:中间件放行并写入 internal 身份,路由经
+#   ``security.effective_identity`` 从请求体兜底身份(与 W8 前行为一致);
+# - ``RATE_LIMIT_ENABLED=False``:关闭令牌桶,毫秒级连发不因限流变 429;
+# - ``REPLAY_GUARD_ENABLED=False``:关闭防重放,既有写请求不必补两个头。
+#
+# 新安全测试(test_auth/test_ratelimit/test_replay/test_ws)在自己文件里用
+# ``monkeypatch.setenv("AUTH_MODE","enforce")`` + 显式打开开关并
+# ``security.reset_security_state()`` 覆盖本 fixture,从而测的仍是生产模式。
+# 无论哪种模式,每个用例前后都重置进程内安全状态(限流桶 / PubSub 订阅表),
+# 避免用例之间互相污染(单进程内存实现,串行执行)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def w8_security_defaults(monkeypatch):
+    """所有测试默认 internal 模式 + 关限流/防重放;前后重置安全状态。"""
+    monkeypatch.setenv("AUTH_MODE", security.AUTH_MODE_INTERNAL)
+    monkeypatch.setattr(security, "RATE_LIMIT_ENABLED", False)
+    monkeypatch.setattr(security, "REPLAY_GUARD_ENABLED", False)
+    security.reset_security_state()
+    yield
+    security.reset_security_state()
 
 
 @pytest.fixture()

@@ -35,7 +35,7 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Callable, Iterable
+from typing import Any, AsyncIterator, Callable, Iterable, Mapping
 
 from fastapi import Depends, Header, Request
 from fastapi.responses import JSONResponse
@@ -295,19 +295,28 @@ def effective_identity(
     role: str,
     *,
     payload: Any | None = None,
+    fallback: Mapping[str, Any] | None = None,
 ) -> Identity:
     """**唯一**的内部兜底入口(``AUTH_MODE=internal`` 专用,enforce 模式恒等返回)。
 
     check_w1_cases.py / demo_w2.py 用 TestClient 直连、不带 token,按任务书回归红线
-    不能改它们,因此在 internal 模式下允许从请求体(payload)取身份,并打 WARN。
-    对外 enforce 模式下这里直接返回 token 身份,请求体里的 customer_id/service_id
-    **没有任何身份效力**(测试 ``test_auth.py::test_body_customer_id_has_no_effect``)。
+    不能改它们,因此在 internal 模式下允许从请求体(payload)或 query 参数
+    (``fallback``)取身份,并打 WARN。对外 enforce 模式下这里直接返回 token 身份,
+    请求体/query 里的 customer_id/service_id **没有任何身份效力**
+    (测试 ``test_auth.py::test_body_customer_id_has_no_effect``)。
     """
     if not identity.is_internal:
         return identity
-    customer_id = getattr(payload, "customer_id", None)
-    service_id = getattr(payload, "service_id", None)
-    merchant_id = getattr(payload, "merchant_id", None) or identity.merchant_id
+
+    def _pick(name: str) -> Any:
+        value = getattr(payload, name, None)
+        if value is None and fallback is not None:
+            value = fallback.get(name)
+        return value
+
+    customer_id = _pick("customer_id")
+    service_id = _pick("service_id")
+    merchant_id = _pick("merchant_id") or identity.merchant_id
     subject = customer_id or service_id or identity.sub
     logger.warning(
         "AUTH_MODE=internal:身份由请求体内部兜底(仅回归脚本),role=%s sub=%s",

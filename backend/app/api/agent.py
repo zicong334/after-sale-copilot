@@ -26,11 +26,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
+from app import security
 from app.api import get_db
 from app.db import utc_now
 from app.errors import AppError, NotFoundError, StateConflictError
@@ -70,25 +71,35 @@ _AUTHOR_LABELS: dict[str, str] = {
 
 
 class ClaimIn(BaseModel):
-    """领单请求:service_id 只用于回执归属,不校验登录态(演示环境)。"""
+    """领单请求。
+
+    ⚠️ ``service_id`` 仅 AUTH_MODE=internal 回归兜底;enforce 下无身份效力
+    (坐席身份取自 token,见 ``security.effective_identity``)。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    service_id: str = Field(min_length=1, max_length=64)
+    service_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class MessageIn(BaseModel):
-    """坐席回复:content 空白由路由层挡成 400 VALIDATION_ERROR。"""
+    """坐席回复:content 空白由路由层挡成 400 VALIDATION_ERROR。
+
+    ⚠️ ``service_id`` 仅 AUTH_MODE=internal 回归兜底;enforce 下无身份效力。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    service_id: str = Field(min_length=1, max_length=64)
+    service_id: str | None = Field(default=None, min_length=1, max_length=64)
     content: str
     is_internal: bool = False
 
 
 class CloseIn(BaseModel):
-    """关单请求:service_id 可选(关单动作以工单状态推进为准)。"""
+    """关单请求:service_id 可选(关单动作以工单状态推进为准)。
+
+    ⚠️ ``service_id`` 仅 AUTH_MODE=internal 回归兜底;enforce 下无身份效力。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -158,6 +169,48 @@ def _get_ticket(db: Session, ticket_id: str) -> Ticket:
     return ticket
 
 
+def _scope_ticket(
+    ticket: Ticket, identity: security.Identity, ident: security.Identity
+) -> Ticket:
+    """enforce 下坐席只能操作自己租户(merchant)的工单;internal 跳过。
+
+    越权统一按 404 处理,避免泄露其他租户工单是否存在。
+    """
+    if not identity.is_internal and ticket.merchant_id != ident.merchant_id:
+        raise NotFoundError(f"工单不存在: {ticket.id}")
+    return ticket
+
+
+def _publish_ticket_events(
+    ticket: Ticket, *, claimed_by: str | None = None, closed_by: str | None = None
+) -> None:
+    """写库 commit 之后广播工单事件(ticket_status → buyer;ticket_update → queue)。
+
+    buyer 频道需要 session_id,拿不到时跳过买家侧并保留 queue 侧广播。
+    """
+    if ticket.session_id:
+        buyer_payload: dict[str, Any] = {
+            "ticket_id": ticket.id,
+            "session_id": ticket.session_id,
+            "status": ticket.status,
+        }
+        if claimed_by:
+            buyer_payload["claimed_by"] = claimed_by
+        if closed_by:
+            buyer_payload["closed_by"] = closed_by
+        security.publish_event(
+            security.channel_buyer(ticket.session_id), "ticket_status", **buyer_payload
+        )
+    queue_payload: dict[str, Any] = {"ticket_id": ticket.id, "status": ticket.status}
+    if claimed_by:
+        queue_payload["claimed_by"] = claimed_by
+    if closed_by:
+        queue_payload["closed_by"] = closed_by
+    security.publish_event(
+        security.channel_queue(ticket.merchant_id), "ticket_update", **queue_payload
+    )
+
+
 def _queue_stats(db: Session, tickets: list[Ticket]) -> dict[str, tuple[int, str | None]]:
     """批量取每张工单的消息条数与最后一条内容(避免列表 N+1 逐单查)。"""
     if not tickets:
@@ -195,14 +248,24 @@ def list_services() -> dict[str, Any]:
 
 @router.get("/tickets")
 def list_tickets(
+    request: Request,
     merchant_id: str | None = Query(default=None),
     status: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
-    """工单队列:queued 优先 → 组内 last_msg_at DESC(NULL 最后)→ created_at DESC。"""
+    """工单队列:queued 优先 → 组内 last_msg_at DESC(NULL 最后)→ created_at DESC。
+
+    enforce 下强制按 token 的 merchant_id 过滤(query 同名字段无身份效力);
+    internal 保持旧行为。
+    """
+    ident = security.effective_identity(
+        identity, "agent", fallback=dict(request.query_params)
+    )
     stmt = select(Ticket)
-    if merchant_id:
-        stmt = stmt.where(Ticket.merchant_id == merchant_id)
+    scope_merchant = merchant_id if identity.is_internal else ident.merchant_id
+    if scope_merchant:
+        stmt = stmt.where(Ticket.merchant_id == scope_merchant)
     if status:
         if status not in _STATUS_LABELS:
             raise AppError(
@@ -228,9 +291,14 @@ def list_tickets(
 
 
 @router.get("/tickets/{ticket_id}")
-def ticket_detail(ticket_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """工单详情:工单结构 + 全量消息(created_at asc)。"""
-    ticket = _get_ticket(db, ticket_id)
+def ticket_detail(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
+    """工单详情:工单结构 + 全量消息(created_at asc);enforce 下校验租户归属。"""
+    ident = security.effective_identity(identity, "agent")
+    ticket = _scope_ticket(_get_ticket(db, ticket_id), identity, ident)
     messages = list(
         db.scalars(
             select(TicketMessage)
@@ -249,25 +317,51 @@ def ticket_detail(ticket_id: str, db: Session = Depends(get_db)) -> dict[str, An
     }
 
 
-@router.post("/tickets/{ticket_id}/claim")
+@router.post(
+    "/tickets/{ticket_id}/claim",
+    dependencies=[Depends(security.require_replay_guard)],
+)
 def claim_ticket(
-    ticket_id: str, payload: ClaimIn, db: Session = Depends(get_db)
+    ticket_id: str,
+    payload: ClaimIn,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
     """守卫式领单:并发只有一个成功,被抢返回 409「已被他人领取」。"""
+    ident = security.effective_identity(identity, "agent", payload=payload)
+    # internal 回归兜底才读 body;enforce 下坐席身份只认 token,防止借 body 冒领。
+    service_id = (
+        (ident.service_id or payload.service_id)
+        if identity.is_internal
+        else ident.service_id
+    )
+    if not service_id:
+        raise AppError(
+            "VALIDATION_ERROR", "缺少坐席身份 service_id", status_code=400, param="service_id"
+        )
+    _scope_ticket(_get_ticket(db, ticket_id), identity, ident)
     try:
-        ticket = ticket_svc.claim(db, ticket_id, payload.service_id)
+        ticket = ticket_svc.claim(db, ticket_id, service_id)
     except StateConflictError as exc:
         raise StateConflictError(
             f"工单已被他人领取或不可领取(当前状态:{exc.param})",
             exc.param,
             param="status",
         ) from exc
+    # commit 已由 ticket_svc 完成,这里才发布事件。
+    _publish_ticket_events(ticket, claimed_by=service_id)
     return {"ok": True, "receipt": _receipt(ticket)}
 
 
-@router.post("/tickets/{ticket_id}/messages")
+@router.post(
+    "/tickets/{ticket_id}/messages",
+    dependencies=[Depends(security.require_replay_guard)],
+)
 def add_ticket_message(
-    ticket_id: str, payload: MessageIn, db: Session = Depends(get_db)
+    ticket_id: str,
+    payload: MessageIn,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
     """坐席回复:author_type=agent;关单后由服务守卫拒绝(409)。"""
     content = str(payload.content or "").strip()
@@ -275,7 +369,8 @@ def add_ticket_message(
         raise AppError(
             "VALIDATION_ERROR", "回复内容不能为空", status_code=400, param="content"
         )
-    _get_ticket(db, ticket_id)
+    ident = security.effective_identity(identity, "agent", payload=payload)
+    ticket = _scope_ticket(_get_ticket(db, ticket_id), identity, ident)
     try:
         message = ticket_svc.add_message(
             db, ticket_id, "agent", content, is_internal=payload.is_internal
@@ -286,14 +381,47 @@ def add_ticket_message(
             exc.param,
             param="status",
         ) from exc
+    # commit 已由 ticket_svc 完成;内部备注(buyer 不可见)不向买家频道广播。
+    if not message.is_internal:
+        if ticket.session_id:
+            security.publish_event(
+                security.channel_buyer(ticket.session_id),
+                "agent_message",
+                ticket_id=ticket.id,
+                session_id=ticket.session_id,
+                message_id=message.id,
+                content=message.content,
+                author_type="agent",
+            )
+        # 拿不到 session_id 的历史工单跳过买家侧,只在队列频道刷新。
+    security.publish_event(
+        security.channel_queue(ticket.merchant_id),
+        "ticket_update",
+        ticket_id=ticket.id,
+        status=ticket.status,
+    )
     return {"ok": True, "message": _message_dict(message)}
 
 
-@router.post("/tickets/{ticket_id}/close")
+@router.post(
+    "/tickets/{ticket_id}/close",
+    dependencies=[Depends(security.require_replay_guard)],
+)
 def close_ticket(
-    ticket_id: str, payload: CloseIn | None = None, db: Session = Depends(get_db)
+    ticket_id: str,
+    payload: CloseIn | None = None,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
     """关单:queued/claimed/waiting_customer → closed;重复关单 409。"""
+    ident = security.effective_identity(identity, "agent", payload=payload)
+    _scope_ticket(_get_ticket(db, ticket_id), identity, ident)
+    # internal 回归兜底才读 body;enforce 下关单人只认 token。
+    closed_by = (
+        (ident.service_id or (payload.service_id if payload is not None else None))
+        if identity.is_internal
+        else ident.service_id
+    )
     try:
         ticket = ticket_svc.close(db, ticket_id)
     except StateConflictError as exc:
@@ -303,8 +431,10 @@ def close_ticket(
             param="status",
         ) from exc
     body: dict[str, Any] = {"ok": True, "receipt": _receipt(ticket)}
-    if payload is not None and payload.service_id:
-        body["closed_by"] = payload.service_id
+    if closed_by:
+        body["closed_by"] = closed_by
+    # commit 已由 ticket_svc 完成。
+    _publish_ticket_events(ticket, closed_by=closed_by)
     return body
 
 
@@ -401,7 +531,11 @@ def _compose_suggestion(
 
 
 @router.post("/tickets/{ticket_id}/suggest")
-def suggest_reply(ticket_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def suggest_reply(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
     """生成建议回复:工单转录 + 命中条款 → ``{summary, suggested_reply}``。
 
     - 规则模板 + MOCK 标注(``mock``/``model``),不发起真实 LLM 调用;
@@ -409,7 +543,8 @@ def suggest_reply(ticket_id: str, db: Session = Depends(get_db)) -> dict[str, An
       剔除含到账时间/赔偿金额的整句;剔除后为空则给确定性兜底话术;
     - 工单不存在 404;已关闭工单按现有写接口风格返回 409(关单后无法再回复)。
     """
-    ticket = _get_ticket(db, ticket_id)
+    ident = security.effective_identity(identity, "agent")
+    ticket = _scope_ticket(_get_ticket(db, ticket_id), identity, ident)
     if ticket.status == "closed":
         raise StateConflictError(
             "工单已关闭,不能生成建议回复",
@@ -460,10 +595,15 @@ def suggest_reply(ticket_id: str, db: Session = Depends(get_db)) -> dict[str, An
 
 
 @router.get("/tickets/{ticket_id}/suggest")
-def get_suggestion(ticket_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_suggestion(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
     """读取最近一次生成结果(进程内缓存按 ticket_id);无缓存返回 ``data=null``。
 
     GET 只读缓存、不写任何状态,因此重复调用不会改变后续 GET 的结果。
     """
-    ticket = _get_ticket(db, ticket_id)
+    ident = security.effective_identity(identity, "agent")
+    ticket = _scope_ticket(_get_ticket(db, ticket_id), identity, ident)
     return {"ok": True, "data": _SUGGEST_CACHE.get(ticket.id)}

@@ -18,8 +18,12 @@
       </div>
       <span class="status-badge" id="statusBadge" data-state="active">AI 接待中</span>
       <span class="trace" id="trace">trace: -</span>
+      <!-- W8:实时推送状态 + 退出登录;身份由登录 token 决定 -->
       <a class="btn btn-ghost btn-sm" href="/agent.html" target="_blank"
          rel="noopener" style="text-decoration:none">客服工作台</a>
+      <span class="conn-badge" id="connBadge" data-state="offline"
+            title="实时推送通道状态">实时未连接</span>
+      <button class="topbar-exit" id="logoutBtn" type="button">退出登录</button>
     </header>
 
     <div class="hidden" id="handoffBar" role="status"

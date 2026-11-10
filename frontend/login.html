@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>售后 Copilot · 登录</title>
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23C05621'/%3E%3Ctext x='16' y='23' font-size='16' text-anchor='middle' fill='%23fff'%3E%E5%AE%A2%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <!-- W8 登录页:账号口令 → JWT;按 user.role 分流到 chat.html(buyer)/ agent.html(agent)。
+       本页是唯一允许在无 token 状态下访问的业务页,浅色卡片直接复用 style.css 既有视觉令牌。 -->
+  <main class="login-wrap">
+    <section class="login-card" aria-labelledby="loginTitle">
+      <div class="login-brand">
+        <span class="brand-mark" aria-hidden="true">客</span>
+        <div>
+          <h1 class="login-title" id="loginTitle">售后 Copilot</h1>
+          <p class="login-sub">演示环境 · 登录后按账号角色进入买家聊天或客服工作台</p>
+        </div>
+      </div>
+
+      <!-- 已有登录态时的提示(可直接进入,也可退出换账号) -->
+      <div class="login-hint hidden" id="loginHint" role="status"></div>
+
+      <form id="loginForm" novalidate>
+        <div class="login-field">
+          <label for="username">账号</label>
+          <input class="login-input" id="username" name="username" type="text"
+                 autocomplete="username" maxlength="64" placeholder="如 buyer_demo"
+                 autocapitalize="off" spellcheck="false" required />
+        </div>
+        <div class="login-field">
+          <label for="password">口令</label>
+          <input class="login-input" id="password" name="password" type="password"
+                 autocomplete="current-password" maxlength="256"
+                 placeholder="演示口令 demo1234" required />
+        </div>
+        <p class="login-error" id="loginError" role="alert" aria-live="polite"></p>
+        <button class="btn btn-primary login-submit" id="loginBtn" type="submit">登录</button>
+      </form>
+
+      <div class="login-demo">
+        <div class="login-demo-title">演示账号(口令均为 demo1234,点击一键填入)</div>
+        <div class="login-demo-list" id="demoList">
+          <button type="button" class="btn btn-ghost btn-sm login-demo-btn"
+                  data-username="buyer_demo">买家 · buyer_demo</button>
+          <button type="button" class="btn btn-ghost btn-sm login-demo-btn"
+                  data-username="buyer_demo2">买家 2 · buyer_demo2</button>
+          <button type="button" class="btn btn-ghost btn-sm login-demo-btn"
+                  data-username="agent_demo">坐席 · agent_demo</button>
+          <button type="button" class="btn btn-ghost btn-sm login-demo-btn"
+                  data-username="agent_demo2">坐席 2 · agent_demo2</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+  /* W8 登录脚本(原生 JS,零依赖、零构建)
+   * - 成功:localStorage 写 sc_token / sc_user,按 user.role 跳转
+   * - 失败:错误体 {"ok":false,"error":{code,message}} 取 message 展示
+   * - localStorage 键名与 app.js / agent.js 共用,禁止单独改名 */
+  (function () {
+    "use strict";
+
+    var TOKEN_KEY = "sc_token";
+    var USER_KEY = "sc_user";
+    var DEMO_PASSWORD = "demo1234";
+
+    var els = {
+      form: document.getElementById("loginForm"),
+      username: document.getElementById("username"),
+      password: document.getElementById("password"),
+      error: document.getElementById("loginError"),
+      button: document.getElementById("loginBtn"),
+      hint: document.getElementById("loginHint"),
+      demoList: document.getElementById("demoList")
+    };
+
+    function setError(message) {
+      els.error.textContent = message || "";
+    }
+
+    function readUser() {
+      try {
+        var raw = window.localStorage.getItem(USER_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function readToken() {
+      try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (err) { return ""; }
+    }
+
+    function clearAuth() {
+      try {
+        window.localStorage.removeItem(TOKEN_KEY);
+        window.localStorage.removeItem(USER_KEY);
+      } catch (err) { /* 隐私模式忽略 */ }
+    }
+
+    function homeOf(user) {
+      return user && user.role === "agent" ? "/agent.html" : "/chat.html";
+    }
+
+    function roleLabel(user) {
+      return user && user.role === "agent" ? "客服坐席" : "买家";
+    }
+
+    /* 已有登录态:提示可直接进入或退出换账号,不自动跳转(避免无法切换账号) */
+    (function showExistingSession() {
+      var token = readToken();
+      var user = readUser();
+      if (!token || !user || !user.username) return;
+      els.hint.textContent = "";
+      els.hint.appendChild(document.createTextNode(
+        "当前已登录为 " + user.username + "(" + roleLabel(user) + ")· "
+      ));
+      var enter = document.createElement("a");
+      enter.href = homeOf(user);
+      enter.className = "login-hint-link";
+      enter.textContent = "直接进入";
+      els.hint.appendChild(enter);
+      els.hint.appendChild(document.createTextNode(" · "));
+      var logout = document.createElement("button");
+      logout.type = "button";
+      logout.className = "login-hint-link login-hint-btn";
+      logout.textContent = "退出该账号";
+      logout.addEventListener("click", function () {
+        clearAuth();
+        els.hint.classList.add("hidden");
+        setError("");
+      });
+      els.hint.appendChild(logout);
+      els.hint.classList.remove("hidden");
+    })();
+
+    /* 演示账号一键填入(只填,不代替点击登录) */
+    els.demoList.addEventListener("click", function (ev) {
+      var btn = ev.target.closest ? ev.target.closest(".login-demo-btn") : null;
+      if (!btn) return;
+      els.username.value = btn.getAttribute("data-username") || "";
+      els.password.value = DEMO_PASSWORD;
+      setError("");
+      els.button.focus();
+    });
+
+    els.form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var username = els.username.value.trim();
+      var password = els.password.value;
+      if (!username || !password) {
+        setError("请输入账号与口令");
+        (username ? els.password : els.username).focus();
+        return;
+      }
+      setError("");
+      els.button.disabled = true;
+      els.button.textContent = "登录中…";
+
+      fetch("/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ username: username, password: password })
+      })
+        .then(function (resp) {
+          return resp.json()
+            .catch(function () { return null; })
+            .then(function (json) { return { status: resp.status, json: json }; });
+        })
+        .then(function (out) {
+          var data = out.json || {};
+          if (out.status >= 400 || data.ok === false || !data.token) {
+            setError(
+              (data.error && data.error.message) ||
+              ("登录失败(HTTP " + out.status + ")")
+            );
+            return;
+          }
+          try {
+            window.localStorage.setItem(TOKEN_KEY, data.token);
+            window.localStorage.setItem(USER_KEY, JSON.stringify(data.user || {}));
+          } catch (err) {
+            setError("浏览器禁用了本地存储,无法保存登录态");
+            return;
+          }
+          location.replace(homeOf(data.user));
+        })
+        .catch(function (err) {
+          setError("网络错误:" + (err && err.message ? err.message : String(err)));
+        })
+        .then(function () {
+          els.button.disabled = false;
+          els.button.textContent = "登录";
+        });
+    });
+
+    /* 演示账号都用同一口令,页面上把口令提示出来,减少试错 */
+    els.password.title = "演示账号口令:" + DEMO_PASSWORD;
+    if (!els.username.value) els.username.focus();
+  })();
+  </script>
+</body>
+</html>
