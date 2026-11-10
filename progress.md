@@ -38,4 +38,5 @@
 - 2026-11-10 W8 | 接入安全+实时通讯验收通过:JWT+RBAC+限流+防重放+WS+CORS;453 测试;真截图四张;Minimax 首棒质量达标 | 452+1(我方);鉴权链/RBAC/check_w1/smoke 全过 | MEMORY 微修派发中(Minimax)
 - 2026-11-10 W8-FIX | MEMORY-001 微修(主会话自修,dsh host 不稳+卡死会话已 cancel,偏离留痕):真因=记录确认轮 must_contain 来自回声而非注入拼接→新增回声守卫(gate 与 intent 解耦+executable 偏好回声,隔离态不回声);run_eval 加 --case-id | 定向 8 绿;**单案真实复验 3/3 通过(failures 空,critical 0)**;验证花费两轮≈0.12 元(高峰,留痕) | 全量回归后台中;过后派 W9
 - 2026-11-10 探活协议 | 用户指令:派发前探 Minimax 5小时额度;.uitools/probe_minimax.py 首跑即 429 EXHAUSTED → W9 按协议回退 flash(high,空闲时段),下一棒重探 | — | 协议入 PRD D-13+记忆
+- 2026-11-10 W9 派发 | 探活 429→协议回退 flash(11:47 进棒,12:00 前高峰尾段约8分钟,接受);send 超时吞 run_id 第三次发生→监测改看门狗+会话活性,回执从会话读 | session-6d66b68c 活跃 | 时钟教训:主会话本地钟感偏差约1h,以 date 实测为准
 - 
