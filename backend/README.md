@@ -151,7 +151,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:651 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:683 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -274,7 +274,24 @@ MOCK 边界:W10-1 的「备」是 `MinimaxRealClient`(代码真实、默认 MOCK
 `SemanticCache` 也尚未接 `api/chat.py` 的 classify 前链路(全仓唯一调用点是 `retrieval/hybrid.py` 的 `clear()`),
 两处生产链路接线均列为后续候选;本棒以 `test_router.py`/`test_cache.py` 作为 W10-1/W10-2 验收证据。
 
-## 8. 已知声明(交接必读)
+### 7.5 售后履约纵深清单(W11)
+
+> 原则:退款金额只在服务端折算(整数分,可复算);状态迁移一律守卫式(`where id + status`),非法迁移 409;
+> 仓库回调不复用 JWT,改 HMAC 签名 + nonce 去重;SLA 扫描是独立守护线程,测试用假时钟直调。
+
+| 项 | 实现位置 | 确定性语义 | 单测 |
+|---|---|---|---|
+| W11-1 部分退款折算 | `app/models/orders.py`(`RefundItem`)、迁移 `0009_fulfillment`、`app/services/refunds.py`(`compute_refund_items`)、`app/tools/refund.py`、`app/schemas/refund.py` | `refund__create` 可选 `items:[{order_item_id,qty}]`:传则按购买单价折算 `line_cents = qty × unit_cents`、忽略 `amount_cents`;退款总额 = Σ line_cents;校验 ≤ 实付残额(= 订单实付 − 已退),同一子项累计退 qty ≤ 购买 qty(含其他活跃退款单占用);不传 items 走旧整单路径;幂等键在旧格式后追加 `\|items:{sha256 前16}` | `tests/test_fulfillment.py`(W11-1 组)、`tests/test_services.py`、`tests/test_api.py` |
+| W11-2 物流回填 | `app/api/refunds_ext.py`、`app/services/refunds.py`(`mark_shipping`) | 买家 `POST /api/c/refunds/{id}/shipping`,单号 `^[A-Za-z0-9][A-Za-z0-9-]{5,63}$`;仅 审核 → 退货中,重复/非审核态 409 | `tests/test_fulfillment.py::test_shipping_api_tracking_validation` |
+| W11-2 验货回调状态机 | `app/api/fulfillment.py`、`app/services/refunds.py`(`mark_received`/`inspect`/`_apply_final`) | `POST /api/fulfillment/receipt` 退货中 → 待验货;`POST /api/fulfillment/inspection` 审核/待验货 → 退款(passed)/驳回;全单退完(残额=0)才推 `order.refunded`,部分退保持 delivered;签名 `X-Signature = hex(sha256(raw_body + FULFILLMENT_SECRET))`,错签 401,nonce 重放 409 | `tests/test_fulfillment.py::test_refund_state_machine_full` 等 |
+| W11-3 SLA 超时升级 | `app/sla.py`、迁移 `0009_fulfillment`(`ticket.sla_breached`)、`app/main.py`(lifespan)、`app/services/tickets.py`(claim 清零)、`app/api/agent.py`(队列字段) | queued 超 `SLA_QUEUED_MINUTES`(默认 30)未领 → `sla_breached=True` + `sla__alert` trace 事件(每单仅一次);领取清零;队列项返回 `sla_breached`/`sla_queued_minutes`;`SLA_SCHEDULER_ENABLED=0` 可关线程 | `tests/test_fulfillment.py`(W11-3 组) |
+| B1-B8 回补 | `app/api/orders.py`(B1)、`app/api/tickets.py`(B2/B7)、`app/api/chat.py`(B3)、`scripts/seed.py`(B4)、`app/api/agent.py`(B5)、`app/main.py`(B6 已满足)、`app/graph/nodes.py`+`app/graph/runner.py`+`frontend/app.js`(B8) | B1 买家只读自己订单;B2 工单详情带最新退款单;B3 买家会话消息合并人工回复;B4 seed 转人工原因全部落在 `HANDOFF_REASON_ENUM`;B5 suggest 的 prompt 由工单转录 + 命中条款动态拼;B6 favicon 内联 SVG 兜底;B7 仅 queued→claimed→waiting_customer→closed,回退全拒;B8 `handed_off` 改为确认建单成功后才置位,确认卡挂起期间 AI 停答、前端徽标「待确认转人工」 | `tests/test_fulfillment.py`(B1-B7)、`tests/test_handoff_flow.py`、`tests/test_chat_route.py`、`tests/test_graph.py` |
+
+MOCK 边界:验货回调的 `FULFILLMENT_SECRET` 未配置时使用 `dev-w11-fulfillment-secret-change-me`(代码内 MOCK 标注),
+生产必须显式注入;验货结论由仓库系统给出,本仓只做验签 + 状态机,不接真实 WMS;SLA 扫描线程只在 `serve` 生命周期内运行,
+多 worker 部署时同一工单的标记有守卫式更新兜底(不会重复告警)。
+
+
 
 1. **Ticket 已有 session_id(W5-FIX 后)**:`ticket` 表新增可空 `session_id` 列(迁移 `0005_ticket_session_id`,索引 `ix_ticket_session_id`);
    转人工 execute 建单时写入当前 `thread_id`(即会话 id),`/api/c/handoff/sessions/{id}/summary` 按会话精确取单,不再按客户最近工单推断全局状态;

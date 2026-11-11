@@ -121,6 +121,13 @@ button, input, textarea, select { font: inherit; color: inherit; }
   color: #8A5A10;
 }
 
+/* W11 B8:确认卡挂起、尚未建单——比"已转人工"弱一档,虚线示意待办。 */
+.status-badge[data-state="pending-handoff"] {
+  background: var(--bg);
+  color: var(--warn);
+  border: 1px dashed var(--warn);
+}
+
 .status-badge[data-state="closed"] {
   background: rgba(107, 101, 96, .13);
   color: var(--muted);
@@ -977,6 +984,8 @@ textarea:focus-visible,
 .badge-claimed { background: #E6F4EA; color: var(--success); }
 .badge-waiting_customer { background: rgba(192, 86, 33, .11); color: var(--accent); }
 .badge-closed { background: rgba(107, 101, 96, .13); color: var(--muted); }
+/* W11-3:SLA 超时红色徽标(只用既有 --danger 令牌) */
+.badge-sla { background: var(--bg); color: var(--danger); border: 1px solid var(--danger); }
 
 /* 队列空态 / 加载 / 错误 */
 .panel-state {

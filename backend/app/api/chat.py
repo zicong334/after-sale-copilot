@@ -34,11 +34,13 @@ import json
 import queue
 import threading
 import time
+from datetime import timezone
 from typing import Any, Iterator
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import security
@@ -46,7 +48,7 @@ from app.api import get_db
 from app.cache import semantic_cache
 from app.errors import AppError, NotFoundError
 from app.guardrails import is_resume_ai_request, sanitize_customer_text
-from app.models import ChatMessage, ChatSession, Ticket
+from app.models import ChatMessage, ChatSession, Ticket, TicketMessage
 from app.graph import runner
 from app.llm import LLMError, build_llm
 from app.llm.base import stream_sink
@@ -232,6 +234,15 @@ def _run_turn(
         )
         resumed = True
         session_status = "active"
+    elif session_status == "active" and runner.pending_handoff_confirm(session_id) is not None:
+        # W11 B8:转人工卡挂起(尚未确认)时 AI 已停答;但会话还没真正 handed_off,
+        # 徽标由前端"待确认转人工"承担,确认建单成功后才写 chat_session.status。
+        result = runner.build_blocked_turn(
+            session=db,
+            session_row=session_row,
+            trace_id=trace_id,
+            text=percept.text,
+        )
     elif session_status != "active":
         # 会话已被人工接手/关闭:记录一条拦截事件后停止自动回复。
         result = runner.build_blocked_turn(
@@ -473,8 +484,13 @@ def _frames(body: dict[str, Any]) -> Iterator[str]:
         card = dict(body["pending_confirm"])
         card.setdefault("thread_id", body.get("session_id"))
         yield _sse("confirm_request", card)
-    if body.get("session_status") == "handed_off" and body.get("ai_replied") is True:
-        # 仅"转人工创建当轮"发一次;后续 blocked 轮在上面的早退分支不会走到这里
+    if (
+        body.get("session_status") == "handed_off"
+        and body.get("ai_replied") is True
+        and not body.get("pending_confirm")
+    ):
+        # 仅"转人工**已确认建单**当轮"发一次;待确认挂起轮由前端显示的
+        # 「待确认转人工」徽标承担(B8),不发已转人工横幅。
         yield _sse(
             "handoff_notice",
             {
@@ -588,6 +604,86 @@ def _stream_frames(
         return
 
     yield from _frames(dict(outcome.get("body") or {}))
+
+
+@router.get("/sessions/{session_id}/messages")
+def session_messages(
+    session_id: str,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
+    """W11 B3:买家侧聊天历史(含转人工后的坐席回复)。
+
+    口径:``chat_message``(AI 问答) ∪ ``ticket_message``(转人工后买家留言 +
+    坐席回复,按 ``ticket.session_id`` 关联),按时间升序合并。只允许会话归属
+    买家本人读取;越权与不存在同样按 404 处理(不泄露会话是否存在)。
+    """
+    session_row = db.get(ChatSession, session_id)
+    if session_row is None:
+        raise NotFoundError(f"会话不存在: {session_id}")
+    if not identity.is_internal:
+        if session_row.merchant_id != identity.merchant_id:
+            raise NotFoundError(f"会话不存在: {session_id}")
+        if identity.role == "buyer" and identity.customer_id:
+            if session_row.customer_id != identity.customer_id:
+                raise NotFoundError(f"会话不存在: {session_id}")
+
+    items: list[dict[str, Any]] = []
+    chat_rows = db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+    ).scalars()
+    for row in chat_rows:
+        items.append(
+            {
+                "id": f"chat:{row.id}",
+                "role": str(row.role or "user"),
+                "author_type": str(row.role or "user"),
+                "content": row.content,
+                "source": "chat",
+                "created_at_utc": _iso_utc(row.created_at),
+            }
+        )
+
+    ticket_ids = list(
+        db.scalars(select(Ticket.id).where(Ticket.session_id == session_id)).all()
+    )
+    if ticket_ids:
+        ticket_rows = db.execute(
+            select(TicketMessage)
+            .where(TicketMessage.ticket_id.in_(ticket_ids))
+            .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
+        ).scalars()
+        for row in ticket_rows:
+            items.append(
+                {
+                    "id": f"ticket:{row.id}",
+                    "role": row.author_type,
+                    "author_type": row.author_type,
+                    "content": row.content,
+                    "is_internal": bool(row.is_internal),
+                    "source": "ticket",
+                    "created_at_utc": _iso_utc(row.created_at),
+                }
+            )
+    items.sort(key=lambda item: (item.get("created_at_utc") or "", item["id"]))
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "status": session_row.status,
+        "items": items,
+        "total": len(items),
+    }
+
+
+def _iso_utc(value) -> str | None:
+    """datetime → ISO8601(UTC);SQLite 取出的 naive 时间按 UTC 解释。"""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 @router.post("/chat/stream")

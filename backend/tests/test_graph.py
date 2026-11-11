@@ -211,13 +211,16 @@ def test_handoff_turn_through_graph(db, ckpt):
     assert result.intent == "handoff"
     assert result.classification_path == "fast_path"
     assert result.confidence == 1.0
-    assert result.session_status == "handed_off"
+    assert result.session_status == "active", "W11 B8:确认前不置 handed_off"
     assert result.pending_confirm is not None
     assert result.pending_confirm["what"]
+    assert result.pending_confirm["tool"] == TOOL_HANDOFF
     assert [c["name"] for c in result.tool_calls] == [TOOL_HANDOFF]
     # 确认门未通过前不得真正建工单(副作用绝不在 interrupt 之前)
     assert count_rows(db, Ticket) == tickets_before
-    assert EVENT_SESSION_STATUS in event_names(events_of(db, trace_id))
+    assert EVENT_SESSION_STATUS not in event_names(events_of(db, trace_id)), (
+        "W11 B8:确认前不得记录会话状态迁移"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +302,7 @@ def test_step_limit_trace_events_complete(db, ckpt, monkeypatch):
     names = event_names(events)
     assert names.count(EVENT_CLASSIFY) == 1
     assert names.count(EVENT_GRAPH_STEP_LIMIT) == 1
-    assert names.count(EVENT_SESSION_STATUS) == 1
+    assert names.count(EVENT_SESSION_STATUS) == 0, "W11 B8:确认建单前不写会话状态迁移"
     assert names.count("policy__search") == 8
     steps = [e.step for e in events]
     assert steps == sorted(steps) and len(set(steps)) == len(steps), "trace step 必须唯一递增"
@@ -321,6 +324,7 @@ def test_suspend_then_resume_creates_single_refund(db, ckpt):
         "confirm_token",
         "impact",
         "irreversibility",
+        "tool",
         "what",
     ]
     assert count_rows(db, RefundRequest) == 0

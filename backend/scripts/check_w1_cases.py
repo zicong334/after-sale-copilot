@@ -116,9 +116,22 @@ def run_case(client: TestClient, case: dict, clause_ids: set[str]) -> dict:
         checks.append(("ground_truth.error_code", ok, f"want={gt['error_code']}; got={call_errors}"))
 
     if gt.get("session_status"):
-        ok = data.get("session_status") == gt["session_status"]
+        want = gt["session_status"]
+        got = data.get("session_status")
+        pending_tool = str((pending or {}).get("tool") or "")
+        # W11 B8 契约:handed_off 改为"确认建单成功后"才写库;工单确认卡挂起期间会话仍是
+        # active,但转人工已进入"待确认"态。此处按与 app/eval/hard_assert.py 相同的口径,
+        # 把"待确认转人工"视为 handed_off 已达成,不改 data/eval 的既有 ground_truth。
+        pending_handoff = (
+            want == "handed_off" and got == "active" and pending_tool == "handoff__create_ticket"
+        )
         checks.append(
-            ("ground_truth.session_status", ok, f"want={gt['session_status']}; got={data.get('session_status')}")
+            (
+                "ground_truth.session_status",
+                got == want or pending_handoff,
+                f"want={want}; got={got}; pending_tool={pending_tool or '-'}; "
+                f"pending_handoff={pending_handoff}",
+            )
         )
 
     citations = data.get("citations") or []

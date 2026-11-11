@@ -157,6 +157,7 @@
     sessionId: null,
     busy: false,
     handedOff: false,
+    pendingHandoff: false, // W11 B8:已挂转人工确认卡、尚未确认
     closed: false,
     ticketId: null,
     ticketStatus: null,
@@ -269,6 +270,10 @@
     } else if (state.handedOff) {
       els.status.setAttribute("data-state", "handoff");
       els.status.textContent = "已转人工";
+    } else if (state.pendingHandoff) {
+      /* W11 B8:确认卡还没点,不能提前显示"已转人工"。 */
+      els.status.setAttribute("data-state", "pending-handoff");
+      els.status.textContent = "待确认转人工";
     } else if (state.busy) {
       els.status.setAttribute("data-state", "active");
       els.status.textContent = "AI 回复中…";
@@ -573,6 +578,15 @@
    * verified/trace 等调试字段留在后端与日志,不再出现在买家页面。 */
   function renderDecision(result) {
     var receipt = result.receipt;
+    /* W11 B8:只有确认执行成功并真正建出工单,才算转人工完成。 */
+    if (result.decision === "confirmed" && receipt && receipt.ticket_id) {
+      state.pendingHandoff = false;
+      if (!state.handedOff) markHandedOff(true);
+      else renderStatus();
+    } else if (result.decision !== "confirmed") {
+      state.pendingHandoff = false;
+      renderStatus();
+    }
     var box = el("div", "receipt");
     if (result.decision === "confirmed") {
       var ok = !receipt || receipt.status !== "unknown";
@@ -609,6 +623,7 @@
 
   function markHandedOff(withToast) {
     state.handedOff = true;
+    state.pendingHandoff = false;
     renderStatus();
     if (state.wsReady) connBadge("waiting", "等待坐席接入中…");
     applyHandoffUi();
@@ -990,6 +1005,9 @@
       case "confirm_request":
         removeNode(ui.loading);
         ui.loading = null;
+        /* W11 B8:转人工确认卡挂起时,顶部徽标显示"待确认转人工"。 */
+        state.pendingHandoff = data.tool === "handoff__create_ticket";
+        renderStatus();
         /* W14 ISS-68:确认卡永远排在本轮 AI 气泡下方;先确保气泡存在,
          * 避免「确认卡在上、AI 回复在下」的错序。 */
         if (ui.ensureAi) ui.ensureAi();
@@ -1217,8 +1235,12 @@
       var card = Object.assign({}, data.card, {
         confirm_token: data.confirm_token,
         thread_id: data.thread_id || state.sessionId,
-        expires_in_seconds: data.expires_in_seconds
+        expires_in_seconds: data.expires_in_seconds,
+        tool: data.tool
       });
+      /* W11 B8:刷新后仍挂着转人工确认卡 → 保持"待确认转人工"。 */
+      state.pendingHandoff = data.tool === "handoff__create_ticket";
+      renderStatus();
       hideEmpty();
       renderConfirmCard(card);
     } catch (err) {

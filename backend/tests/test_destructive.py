@@ -732,11 +732,13 @@ def test_a7_long_loop_hands_off_and_stays_bounded(client, db, engine, monkeypatc
     assert max(lengths) <= COMPOSE_MAX_CHARS, lengths
     assert max(lengths) - min(lengths) <= 1500, ("compose 输入不得随轮数线性增长", lengths)
 
-    # 会话侧证据:确实建了工单确认卡且会话状态已 handed_off(不是"回复里提到人工")
+    # 会话侧证据:确实挂起工单确认卡(B8:DB 状态等确认建单后才 handed_off)
     with Session(engine) as fresh:
         row = fresh.get(ChatSession, session_id)
         assert row is not None
-        assert row.status == "handed_off", row.status
+        assert row.status == "active", row.status
+    assert body.get("pending_confirm"), "必须挂起转人工确认卡"
+    assert body["pending_confirm"]["tool"] == "handoff__create_ticket"
 
 
 def test_a7_step_limit_still_fires(db, ckpt, monkeypatch):

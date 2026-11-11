@@ -119,19 +119,45 @@ def _seed_orders(session: Session, now) -> list[str]:
 
 
 def _seed_tickets(session: Session, order_ids: list[str], now) -> None:
-    """插入 8 工单覆盖 4 状态 + 若干消息。"""
-    # (status, claimed_by, order_idx, handoff_reason, 消息列表[(author, content)])
+    """插入 8 工单覆盖 4 状态 + 若干消息。
+
+    W11 B4:``handoff_reason`` 列只放 canonical 枚举(``HANDOFF_REASON_ENUM``),
+    自然语言说明改放 ``summary`` 列 —— 与 ``tools/handoff.py`` 的落库约定一致,
+    否则工作台会拿枚举外的脏值去查标签字典。
+    """
+    # (status, claimed_by, order_idx, handoff_reason(枚举), summary, 消息列表[(author, content)])
     specs = [
-        ("queued", None, 6, None, []),  # seed-order-007 (paid)
-        ("queued", None, 18, None, []),  # seed-order-019 (9 天前 delivered)
-        ("claimed", AGENT_1, 18, None, [("agent", "您好,关于退款申请我来跟进")]),
-        ("claimed", AGENT_2, 19, None, [("agent", "已受理,请稍候")]),  # 3 天前 delivered
-        ("waiting_customer", AGENT_1, 11, "需客户补充物流凭证", [("user", "申请退款"), ("agent", "请提供物流单号")]),
-        ("waiting_customer", AGENT_2, 12, "等待客户确认方案", [("agent", "我们提供两种方案可选")]),
-        ("closed", AGENT_1, 24, None, [("user", "问题已解决"), ("system", "工单已关闭")]),
-        ("closed", AGENT_2, 25, None, [("user", "满意"), ("system", "工单已关闭")]),
+        ("queued", None, 6, None, None, []),  # seed-order-007 (paid)
+        ("queued", None, 18, None, None, []),  # seed-order-019 (9 天前 delivered)
+        ("claimed", AGENT_1, 18, None, None, [("agent", "您好,关于退款申请我来跟进")]),
+        ("claimed", AGENT_2, 19, None, None, [("agent", "已受理,请稍候")]),  # 3 天前 delivered
+        (
+            "waiting_customer",
+            AGENT_1,
+            11,
+            "other",
+            "需客户补充物流凭证",
+            [("user", "申请退款"), ("agent", "请提供物流单号")],
+        ),
+        (
+            "waiting_customer",
+            AGENT_2,
+            12,
+            "other",
+            "等待客户确认方案",
+            [("agent", "我们提供两种方案可选")],
+        ),
+        ("closed", AGENT_1, 24, None, None, [("user", "问题已解决"), ("system", "工单已关闭")]),
+        ("closed", AGENT_2, 25, None, None, [("user", "满意"), ("system", "工单已关闭")]),
     ]
-    for i, (status, claimed_by, order_idx, handoff_reason, messages) in enumerate(specs):
+    for i, (
+        status,
+        claimed_by,
+        order_idx,
+        handoff_reason,
+        summary,
+        messages,
+    ) in enumerate(specs):
         ticket_id = f"seed-ticket-{i + 1:03d}"
         order = order_ids[order_idx]
         customer_id = f"seed-cust-{order_idx % 10 + 1:03d}"
@@ -144,6 +170,7 @@ def _seed_tickets(session: Session, order_ids: list[str], now) -> None:
                 status=status,
                 claimed_by=claimed_by,
                 handoff_reason=handoff_reason,
+                summary=summary,
                 last_msg_at=now if messages else None,
             )
         )

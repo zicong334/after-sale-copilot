@@ -49,6 +49,7 @@ def create_refund(
         amount_cents=payload.amount_cents,
         reason=payload.reason,
         idempotency_key=payload.idempotency_key,
+        items=payload.items,
     )
     return Receipt(
         refund_request_id=refund.id,

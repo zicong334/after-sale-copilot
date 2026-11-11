@@ -412,6 +412,11 @@ class EvalEngine:
                 or pending_seen
                 or {}
             )
+            # W11 B8:确认卡挂着但未确认(工单未建)= "待确认转人工"进行态;
+            # 供 hard_assert 在 handed_off 断言上按新语义兼容(不改 eval 数据)。
+            artifact["handoff_pending"] = (
+                str(pending.get("tool") or "") == "handoff__create_ticket"
+            )
             token = str(pending.get("confirm_token") or "")
             if token:
                 confirm_row = session.scalar(

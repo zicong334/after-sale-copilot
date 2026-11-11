@@ -18,7 +18,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import gen_id, utc_now
 from app.models import Base
@@ -132,6 +132,13 @@ class RefundRequest(Base):
         default=utc_now, server_default=func.current_timestamp(),
     )
 
+    #: 子项(部分退款折算,W11-1);删除退款单时级联删除子项。
+    items: Mapped[list["RefundItem"]] = relationship(
+        back_populates="refund_request",
+        cascade="all, delete-orphan",
+        order_by="RefundItem.created_at",
+    )
+
     __table_args__ = (
         CheckConstraint("amount_cents > 0", name="ck_refund_amount_pos"),
         CheckConstraint(
@@ -150,8 +157,10 @@ class RefundRequest(Base):
             "uq_refund_active",
             "order_id",
             unique=True,
-            sqlite_where=text("status IN ('申请','审核','退款')"),
-            postgresql_where=text("status IN ('申请','审核','退款')"),
+            # '退款' 是终态:已完成的退款不再占活跃名额,否则同一订单无法做
+            # 第二次部分退款(实付残额>0 时正是 W11-1 要支持的场景)。
+            sqlite_where=text("status IN ('申请','审核','退货中','待验货')"),
+            postgresql_where=text("status IN ('申请','审核','退货中','待验货')"),
         ),
     )
 
@@ -181,6 +190,8 @@ class RefundItem(Base):
         DateTime(timezone=True), nullable=False,
         default=utc_now, server_default=func.current_timestamp(),
     )
+
+    refund_request: Mapped["RefundRequest"] = relationship(back_populates="items")
 
     __table_args__ = (
         CheckConstraint("qty > 0", name="ck_refund_item_qty_pos"),

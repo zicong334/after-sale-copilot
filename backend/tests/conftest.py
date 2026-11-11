@@ -50,6 +50,9 @@ def w8_security_defaults(monkeypatch):
     monkeypatch.setenv("AUTH_MODE", security.AUTH_MODE_INTERNAL)
     monkeypatch.setattr(security, "RATE_LIMIT_ENABLED", False)
     monkeypatch.setattr(security, "REPLAY_GUARD_ENABLED", False)
+    # W11-3:SLA 后台扫描线程在测试里默认关闭(假时钟用例直接调 scan_breaches),
+    # 避免每个 TestClient 生命周期都拉起守护线程、跨用例写库。
+    monkeypatch.setenv("SLA_SCHEDULER_ENABLED", "0")
     security.reset_security_state()
     # W13:SemanticCache 是进程级单例,chat 读路径接入后必须逐用例清空,
     # 否则前一个用例的问答会被后一个用例命中(跨用例污染)。

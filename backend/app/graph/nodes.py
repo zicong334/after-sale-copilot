@@ -1329,7 +1329,11 @@ def make_nodes(
     # ---- ⑥ handoff:转人工 IO + 确认门 -----------------------------------
 
     def handoff(state: GraphState) -> dict[str, Any]:
-        """建工单确认卡 + 会话置 handed_off;下一圈再 interrupt 收确认后 execute。"""
+        """建工单确认卡;下一圈 interrupt 收确认后 execute,**建单成功才置 handed_off**。
+
+        W11 B8:首圈只挂确认卡(会话仍是 active),避免"还没确认就显示已转人工";
+        第二圈确认执行成功后置位并发 session__status_change,与工单落库同轮。
+        """
         trace_id = str(state.get("trace_id") or "")
         ctx = _ctx(trace_id)
 
@@ -1364,6 +1368,20 @@ def make_nodes(
                         "result_id": (executed.get("data") or {}).get("ticket_id"),
                     },
                 )
+                # W11 B8:handed_off 只在确认后建单成功的这一刻置位(幂等:已在位则不重写)。
+                if session_row.status != "handed_off":
+                    previous = session_row.status
+                    session_row.status = "handed_off"
+                    record_event(
+                        session,
+                        trace_id=trace_id,
+                        event=EVENT_SESSION_STATUS,
+                        payload={
+                            "from": previous,
+                            "to": "handed_off",
+                            "reason": "确认后建单",
+                        },
+                    )
             return {
                 "handoff": True,
                 "confirm": {**confirm, "decided": True, "approved": True, "executed": executed},
@@ -1399,14 +1417,7 @@ def make_nodes(
 
         built: dict[str, Any] | None = None
         if ticket.ok:
-            previous = session_row.status
-            session_row.status = "handed_off"
-            record_event(
-                session,
-                trace_id=trace_id,
-                event=EVENT_SESSION_STATUS,
-                payload={"from": previous, "to": "handed_off", "reason": label},
-            )
+            # W11 B8:首圈只挂卡,会话状态保持 active(确认执行后才 handed_off)。
             built = _build_confirm(
                 TOOL_HANDOFF, dict((ticket.data or {}).get("pending_confirm") or {})
             )

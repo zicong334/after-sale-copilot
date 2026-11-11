@@ -30,7 +30,11 @@ class TicketMessageIn(BaseModel):
 
 
 class TicketOut(BaseModel):
-    """工单响应。"""
+    """工单响应。
+
+    W11 B2:详情额外带该订单最新退款单 id/状态(无关联退款单时为 None),
+    工作台据此显示"退款中/待验货"等履约进度。
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -42,6 +46,21 @@ class TicketOut(BaseModel):
     claimed_by: str | None
     last_msg_at: datetime | None
     created_at: datetime
+    refund_request_id: str | None = None
+    refund_status: str | None = None
+
+
+class TicketStatusIn(BaseModel):
+    """W11 B7:工单状态手动流转请求。
+
+    仅允许正向链路 ``queued → claimed → waiting_customer → closed``,
+    任何回退/跳跃由服务层守卫拒绝(409)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    to_status: Literal["claimed", "waiting_customer", "closed"]
+    service_id: str | None = None
 
 
 class TicketMessageOut(BaseModel):

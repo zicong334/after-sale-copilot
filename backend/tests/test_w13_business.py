@@ -148,7 +148,8 @@ def test_iss06_single_人工客服_message_raises_confirm_card(db, ckpt):
     assert result.intent == "handoff", result.intent
     assert result.pending_confirm is not None, "必须直接挂起转人工确认卡"
     assert result.pending_confirm.get("what")
-    assert result.session_status == "handed_off"
+    assert result.pending_confirm["tool"] == "handoff__create_ticket"
+    assert result.session_status == "active", "W11 B8:确认前不置 handed_off"
 
 
 # ---------------------------------------------------------------------------

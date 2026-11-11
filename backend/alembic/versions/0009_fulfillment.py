@@ -120,8 +120,9 @@ def _rebuild_refund_request_sqlite() -> None:
         "refund_request",
         ["order_id"],
         unique=True,
-        sqlite_where=sa.text("status IN ('申请','审核','退款')"),
-        postgresql_where=sa.text("status IN ('申请','审核','退款')"),
+        # 活跃态不含终态 '退款'(允许同一订单第二次部分退款)。
+        sqlite_where=sa.text("status IN ('申请','审核','退货中','待验货')"),
+        postgresql_where=sa.text("status IN ('申请','审核','退货中','待验货')"),
     )
     bind  # 保持 bind 引用,便于将来扩展
 

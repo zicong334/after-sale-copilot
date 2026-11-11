@@ -640,7 +640,11 @@ PUBLIC_PATHS = (
     "/redoc",
     "/auth/login",
 )
-PUBLIC_PREFIXES = ("/ws/",)
+PUBLIC_PREFIXES = (
+    "/ws/",
+    # W11-2 仓库履约回调:用 X-Signature(HMAC)鉴权,不走 JWT。
+    "/api/fulfillment/",
+)
 #: 只需要"任意合法身份"的路径(如 /auth/me:登录态校验,不区分角色)。
 ANY_ROLE_PATHS = ("/auth/me",)
 #: 角色路由前缀:``/api/c/*`` 只认 buyer,``/api/b/*`` 与 ``/api/kb/*`` 只认 agent。

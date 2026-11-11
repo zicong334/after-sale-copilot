@@ -259,6 +259,14 @@
     return el("span", cls, statusLabel(ticket));
   }
 
+  // W11-3:队列/详情共用的 SLA 超时红色徽标(仅服务端标记为真时展示)
+  function slaBadge(ticket) {
+    if (!ticket || !ticket.sla_breached) return null;
+    var node = el("span", "badge badge-sla", "SLA 超时");
+    node.title = "排队超过 " + (ticket.sla_queued_minutes || 30) + " 分钟未领取";
+    return node;
+  }
+
   function reasonLabel(ticket) {
     if (ticket && ticket.handoff_reason_label) return ticket.handoff_reason_label;
     if (ticket && ticket.handoff_reason) {
@@ -398,6 +406,8 @@
       var row = el("div", "ticket-row");
       row.appendChild(el("span", "ticket-id", shortCode(ticket.ticket_id)));
       row.appendChild(badge(ticket));
+      var sla = slaBadge(ticket);
+      if (sla) row.appendChild(sla);
       if (state.unread[ticket.ticket_id]) {
         row.appendChild(el("span", "new-dot", "● 新消息"));
       }
@@ -513,6 +523,8 @@
 
     var badges = el("div", "head-badges");
     badges.appendChild(badge(ticket));
+    var headSla = slaBadge(ticket);
+    if (headSla) badges.appendChild(headSla);
     badges.appendChild(el("span", "demo-note", "原因 · " + reasonLabel(ticket)));
     head.appendChild(badges);
 

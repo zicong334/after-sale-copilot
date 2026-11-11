@@ -208,11 +208,18 @@ def evaluate(case: dict[str, Any], artifact: dict[str, Any]) -> HardResult:
     if expected_handoff is None:
         expected_handoff = verdict.get("handoff")
     if expected_handoff is not None:
-        actual_handoff = bool(artifact.get("session_status") == "handed_off")
+        # W11 B8:handed_off 改为"确认后建单"才置位;确认卡仍挂起(handoff_pending)
+        # 且工单未建时,视为"转人工已发起"达成(待确认转人工)。
+        handoff_pending = bool(artifact.get("handoff_pending"))
+        actual_handoff = bool(
+            artifact.get("session_status") == "handed_off"
+            or (handoff_pending and not tickets)
+        )
         check(
             "handoff",
             actual_handoff is bool(expected_handoff),
-            f"期望 handoff={expected_handoff},实际会话状态 {artifact.get('session_status')!r}",
+            f"期望 handoff={expected_handoff},实际会话状态 {artifact.get('session_status')!r}"
+            f"(handoff_pending={handoff_pending})",
         )
 
     # 7) 工单(真实落库 + 状态)
@@ -293,10 +300,22 @@ def evaluate(case: dict[str, Any], artifact: dict[str, Any]) -> HardResult:
 
     # 10) 会话状态 / 转人工后 AI 停止回复
     if gt.get("session_status"):
+        expected_session_status = gt["session_status"]
+        actual_session_status = artifact.get("session_status")
+        # W11 B8:待确认转人工(卡已挂起、工单未建)算作 handed_off 的进行态。
+        status_ok = actual_session_status == expected_session_status
+        if (
+            not status_ok
+            and expected_session_status == "handed_off"
+            and bool(artifact.get("handoff_pending"))
+            and not tickets
+        ):
+            status_ok = True
         check(
             "session_status",
-            artifact.get("session_status") == gt["session_status"],
-            f"期望会话状态 {gt['session_status']},实际 {artifact.get('session_status')!r}",
+            status_ok,
+            f"期望会话状态 {expected_session_status},实际 {actual_session_status!r}"
+            f"(handoff_pending={bool(artifact.get('handoff_pending'))})",
         )
     if gt.get("ai_stops_reply"):
         actual = flags.get("followup_ai_replied")

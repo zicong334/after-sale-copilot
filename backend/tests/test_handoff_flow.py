@@ -116,14 +116,16 @@ def parse_sse(text: str) -> list[tuple[str, dict]]:
 # ---------------------------------------------------------------------------
 
 
-def test_handoff_then_ai_stops_without_running_graph(client, engine):
+def test_handoff_pending_confirm_then_ai_stops_without_running_graph(client, engine):
     first = post_chat(client, HANDOFF_TEXT)
     thread_id = first["session_id"]
     with Session(engine) as db:
-        assert db.get(ChatSession, thread_id).status == "handed_off"
+        # W11 B8:建卡≠已转人工;DB 状态要等确认建单成功后才置 handed_off。
+        assert db.get(ChatSession, thread_id).status == "active"
         assert first["pending_confirm"], "建单前必须先出确认卡"
+        assert first["pending_confirm"]["tool"] == "handoff__create_ticket"
 
-    # 第二次发消息:会话已 handed_off → AI 真静默(不回固定话术),不跑图
+    # 第二次发消息:确认卡挂起 = 转人工进行态 → AI 真静默(不回固定话术),不跑图
     second = post_chat(client, "我还在吗？", session_id=thread_id)
     assert second["ai_replied"] is False
     assert second["intent"] == "blocked"
@@ -133,7 +135,7 @@ def test_handoff_then_ai_stops_without_running_graph(client, engine):
     assert second["ack"] == "消息已记录,坐席会尽快跟进。"
     assert second["ack_ticket_id"] is None, "还没确认建单,没有可追加的工单"
     assert second["tool_calls"] == []
-    assert second["session_status"] == "handed_off"
+    assert second["session_status"] == "active", "确认前 DB 仍是 active(待确认转人工)"
 
     with Session(engine) as db:
         events = trace_events(db, second["trace_id"])
@@ -207,24 +209,29 @@ def test_stream_refund_emits_confirm_card(client):
     assert card["thread_id"], "SSE 确认卡要带 thread_id,前端确认时用"
 
 
-def test_stream_handoff_emits_notice(client):
+def test_stream_pending_handoff_emits_confirm_not_notice(client):
+    """W11 B8:确认前只发确认卡(待确认转人工),不提前发"已转人工"横幅。"""
     resp = client.post(
         "/api/c/chat/stream",
         json={"merchant_id": MERCHANT_ID, "customer_id": CUSTOMER, "text": HANDOFF_TEXT},
     )
     assert resp.status_code == 200
     frames = parse_sse(resp.text)
-    notice = [data for name, data in frames if name == "handoff_notice"]
-    assert len(notice) == 1
-    assert notice[0]["session_status"] == "handed_off"
+    names = [name for name, _ in frames]
+    assert names.count("handoff_notice") == 0, "确认建单前不得发转人工横幅"
+    cards = [data for name, data in frames if name == "confirm_request"]
+    assert len(cards) == 1
+    assert cards[0]["tool"] == "handoff__create_ticket"
+    assert cards[0]["confirm_token"]
     done = next(data for name, data in frames if name == "done")
-    assert done["session_status"] == "handed_off"
+    assert done["session_status"] == "active", "确认前 DB 仍是 active"
     assert done["ai_replied"] is True  # 首轮还说话,确认后才停答
 
 
-def test_stream_handed_off_emits_append_ack_without_usage(client):
-    """W5 真静默:handed_off 后的 SSE 只有 append_ack + done(零 message/usage/横幅)。"""
+def test_stream_pending_handoff_emits_append_ack_without_usage(client):
+    """W11 B8:确认卡挂起(待确认转人工)后的 SSE 只有 append_ack + done(零文本/usage/横幅)。"""
     first = post_chat(client, HANDOFF_TEXT)
+    assert first["pending_confirm"]["tool"] == "handoff__create_ticket"
     resp = client.post(
         "/api/c/chat/stream",
         json={"merchant_id": MERCHANT_ID, "customer_id": CUSTOMER,
@@ -234,12 +241,12 @@ def test_stream_handed_off_emits_append_ack_without_usage(client):
     frames = parse_sse(resp.text)
     names = [name for name, _ in frames]
     assert names.count("append_ack") == 1, names
-    assert "handoff_notice" not in names, "横幅只在转人工创建当轮发一次"
+    assert "handoff_notice" not in names, "确认建单前不发转人工横幅"
     assert "usage" not in names
     assert "message" not in names, "blocked 轮不得有任何 AI 文本分片"
     ack = next(data for name, data in frames if name == "append_ack")
     assert ack["ack"]
-    assert ack["session_status"] == "handed_off"
+    assert ack["session_status"] == "active", "确认前 DB 仍是 active"
     assert ack["ticket_id"] is None  # 尚未确认建单
     done = next(data for name, data in frames if name == "done")
     assert done["ai_replied"] is False
@@ -248,8 +255,8 @@ def test_stream_handed_off_emits_append_ack_without_usage(client):
     assert done["ack"]
 
 
-def test_three_blocked_messages_append_to_ticket_and_notice_once(client, engine):
-    """连发 3 条:每轮零 AI 文本/零 usage/1 次 append_ack;买家消息全部进工单;横幅仅 1 次。"""
+def test_three_blocked_messages_append_to_ticket_after_confirm(client, engine):
+    """W11 B8:先确认建单,再连发 3 条:零 AI 文本/零 usage/1 次 append_ack;消息全部进工单。"""
     first = client.post(
         "/api/c/chat/stream",
         json={"merchant_id": MERCHANT_ID, "customer_id": CUSTOMER, "text": HANDOFF_TEXT},
@@ -257,10 +264,8 @@ def test_three_blocked_messages_append_to_ticket_and_notice_once(client, engine)
     assert first.status_code == 200, first.text
     first_frames = parse_sse(first.text)
     first_names = [name for name, _ in first_frames]
-    assert first_names.count("handoff_notice") == 1, "转人工创建当轮必须发横幅"
-    # 横幅携带 reply_stopped=False(当轮 AI 还说话),确认后才彻底静默
-    notice = next(data for name, data in first_frames if name == "handoff_notice")
-    assert notice["reply_stopped"] is False
+    assert first_names.count("confirm_request") == 1, "首次转人工必须先出确认卡"
+    assert first_names.count("handoff_notice") == 0, "确认建单前不得发转人工横幅"
     session_id = next(data for name, data in first_frames if name == "done")["session_id"]
     token = next(
         data for name, data in first_frames if name == "confirm_request"
@@ -272,7 +277,6 @@ def test_three_blocked_messages_append_to_ticket_and_notice_once(client, engine)
     ticket_id = confirmed.json()["receipt"]["ticket_id"]
 
     texts = ["转人工后第一条", "转人工后第二条", "转人工后第三条"]
-    notice_count = first_names.count("handoff_notice")
     for text in texts:
         resp = client.post(
             "/api/c/chat/stream",
@@ -295,8 +299,6 @@ def test_three_blocked_messages_append_to_ticket_and_notice_once(client, engine)
         assert done["reply"] == "" and done["ai_replied"] is False
         assert "usage" not in done
         assert done["ack_ticket_id"] == ticket_id
-        notice_count += names.count("handoff_notice")
-    assert notice_count == 1, "整条流程只允许 1 次 handoff_notice"
 
     with Session(engine) as db:
         rows = list(

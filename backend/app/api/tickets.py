@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.api import get_db
 from app.db import utc_now
 from app.errors import NotFoundError
-from app.models import Ticket, TicketMessage
+from app.models import RefundRequest, Ticket, TicketMessage
 from app.schemas import (
     Receipt,
     TicketClaim,
@@ -24,6 +24,7 @@ from app.schemas import (
     TicketMessageIn,
     TicketMessageOut,
     TicketOut,
+    TicketStatusIn,
 )
 from app.security import Identity, current_identity
 from app.services import tickets as ticket_svc
@@ -77,12 +78,52 @@ def get_ticket(
     ticket_id: str,
     db: Session = Depends(get_db),
     identity: Identity = Depends(current_identity),
-) -> Ticket:
+) -> TicketOut:
+    """工单详情:W11 B2 附带该订单最新退款单 id/状态。"""
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         raise NotFoundError(f"工单不存在: {ticket_id}")
     _assert_tenant(identity, ticket)
-    return ticket
+    out = TicketOut.model_validate(ticket)
+    refund = _latest_refund(db, ticket)
+    if refund is not None:
+        out.refund_request_id = refund.id
+        out.refund_status = refund.status
+    return out
+
+
+def _latest_refund(db: Session, ticket: Ticket) -> RefundRequest | None:
+    """工单关联订单的最新退款单(无订单/无退款单返回 None)。"""
+    if not ticket.order_id:
+        return None
+    return db.execute(
+        select(RefundRequest)
+        .where(RefundRequest.order_id == ticket.order_id)
+        .order_by(RefundRequest.created_at.desc(), RefundRequest.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+@router.post("/tickets/{ticket_id}/status", response_model=Receipt)
+def transition_status(
+    ticket_id: str,
+    payload: TicketStatusIn,
+    db: Session = Depends(get_db),
+    identity: Identity = Depends(current_identity),
+) -> Receipt:
+    """W11 B7:工单状态手动流转(仅 queued→claimed→waiting_customer→closed)。"""
+    ticket = db.get(Ticket, ticket_id)
+    if ticket is None:
+        raise NotFoundError(f"工单不存在: {ticket_id}")
+    _assert_tenant(identity, ticket)
+    updated = ticket_svc.transition(
+        db, ticket_id, payload.to_status, service_id=payload.service_id
+    )
+    return Receipt(
+        ticket_id=updated.id,
+        status=updated.status,
+        occurred_at_utc=utc_now(),
+    )
 
 
 @router.post("/tickets/{ticket_id}/claim", response_model=Receipt)

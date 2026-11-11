@@ -259,7 +259,9 @@ def test_amount_dispute_goes_handoff_without_refund(client, engine):
     assert "refund__create" not in names
     assert "按 499 退" not in data["reply"]
     assert data["pending_confirm"] is not None
-    assert data["session_status"] == "handed_off"
+    assert data["pending_confirm"]["tool"] == "handoff__create_ticket"
+    # W11 B8:建卡≠已转人工;DB 状态确认建单后才变 handed_off。
+    assert data["session_status"] == "active"
     assert count_rows(engine, RefundRequest) == 0
 
 
@@ -288,7 +290,7 @@ def test_order_not_owned_does_not_leak_fields(client, engine):
 
 
 def test_explicit_handoff_creates_ticket_and_stops_ai(client, engine):
-    """明示转人工:快捷路径 conf=1.0 → 工单确认卡 + handed_off;再发消息被拦截。"""
+    """明示转人工:快捷路径 conf=1.0 → 工单确认卡;确认建单后才 handed_off,再发消息被拦截。"""
     first = post_chat(client, "我不跟你聊了，直接给我转人工客服", customer_id=CUSTOMER_OTHER)
     data = first.json()
     assert data["intent"] == "handoff"
@@ -296,15 +298,17 @@ def test_explicit_handoff_creates_ticket_and_stops_ai(client, engine):
     assert data["confidence"] == 1.0
     assert "handoff__create_ticket" in tool_names(first)
     assert data["pending_confirm"] is not None
-    assert data["session_status"] == "handed_off"
+    assert data["pending_confirm"]["tool"] == "handoff__create_ticket"
+    # W11 B8:确认前不置 handed_off,由前端显示"待确认转人工"。
+    assert data["session_status"] == "active"
     for phrase in ("我来帮您解决", "请稍等，我继续为您处理"):
         assert phrase not in data["reply"]
 
     session_id = data["session_id"]
     with Session(engine) as session:
-        assert session.get(ChatSession, session_id).status == "handed_off"
+        assert session.get(ChatSession, session_id).status == "active"
 
-    # 转人工后:入口守卫拦截,AI 真静默(零 AI 文本)、不调编排、不产生任何工具调用
+    # 确认卡挂起期间:入口守卫拦截,AI 真静默(零 AI 文本)、不调编排、不产生任何工具调用
     second = post_chat(
         client, "我再补充一句:快递单号发你了", customer_id=CUSTOMER_OTHER, session_id=session_id
     )
@@ -313,7 +317,7 @@ def test_explicit_handoff_creates_ticket_and_stops_ai(client, engine):
     assert blocked["intent"] == "blocked"
     assert blocked["reply"] == ""
     assert blocked["tool_calls"] == []
-    assert blocked["session_status"] == "handed_off"
+    assert blocked["session_status"] == "active", "确认前 DB 仍是 active"
     # W5 真静默:没有 AI 生成 → 响应整键不含 usage,改由轻量 ack 提示(不是 AI 气泡)
     assert "usage" not in blocked
     assert blocked["ack"], "blocked 轮必须返回系统回执文本"
@@ -337,6 +341,7 @@ def test_explicit_handoff_creates_ticket_and_stops_ai(client, engine):
         client, "转人工后追加给坐席的话", customer_id=CUSTOMER_OTHER, session_id=session_id
     ).json()
     assert third["reply"] == ""
+    assert third["session_status"] == "handed_off", "确认建单后会话才真正 handed_off"
     assert third["ack_ticket_id"] == ticket_id
     assert ticket_id in third["ack"]
     with Session(engine) as session:
@@ -385,7 +390,8 @@ def test_unresolved_rounds_handoff_trigger(client, engine):
     assert data["intent"] == "handoff"
     assert "连续" in data["intent_reason"]
     assert "handoff__create_ticket" in tool_names(r)
-    assert data["session_status"] == "handed_off"
+    assert data["pending_confirm"]["tool"] == "handoff__create_ticket"
+    assert data["session_status"] == "active", "确认前不置 handed_off"
 
 
 def test_three_same_intent_turns_escalate(client, engine):
@@ -406,7 +412,8 @@ def test_three_same_intent_turns_escalate(client, engine):
     assert data["intent"] == "handoff"
     assert data["classification_path"] == "rule:unresolved_3"
     assert "handoff__create_ticket" in tool_names(third)
-    assert data["session_status"] == "handed_off"
+    assert data["pending_confirm"]["tool"] == "handoff__create_ticket"
+    assert data["session_status"] == "active", "确认前不置 handed_off"
 
 
 # ---------------------------------------------------------------------------

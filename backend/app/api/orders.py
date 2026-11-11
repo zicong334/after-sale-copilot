@@ -59,9 +59,17 @@ def list_orders(
     db: Session = Depends(get_db),
     identity: Identity = Depends(current_identity),
 ) -> list[Order]:
+    """订单列表。
+
+    W11 B1:除了商户租户隔离,还必须按 ``customer_id`` 过滤 —— 买家 token
+    只能看到自己的订单(此前 ``/orders?customer_id=`` 仅作建议,能越权读到
+    同店其他买家的订单)。
+    """
     stmt = select(Order).order_by(Order.created_at.desc())
     if not identity.is_internal:
         stmt = stmt.where(Order.merchant_id == identity.merchant_id)
+        if identity.role == "buyer" and identity.customer_id:
+            stmt = stmt.where(Order.customer_id == identity.customer_id)
     return list(db.execute(stmt).scalars())
 
 

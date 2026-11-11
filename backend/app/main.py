@@ -29,15 +29,18 @@ from sqlalchemy.orm import Session
 
 from app import jobs
 from app import security
+from app import sla
 from app.api import agent as agent_api
 from app.api import get_db
 from app.api import kb as kb_api
 from app.api import auth as auth_api
 from app.api import chat as chat_api
 from app.api import confirm as confirm_api
+from app.api import fulfillment as fulfillment_api
 from app.api import handoff as handoff_api
 from app.api import orders as orders_api
 from app.api import refunds as refunds_api
+from app.api import refunds_ext as refunds_ext_api
 from app.api import tickets as tickets_api
 from app.db import SessionLocal, engine, utc_now
 from app.errors import register_error_handlers
@@ -55,9 +58,12 @@ async def lifespan(_app: FastAPI):
     """
     Base.metadata.create_all(bind=engine)
     jobs.start_worker(engine)
+    sla_scheduler = sla.start_scheduler(engine)
     try:
         yield
     finally:
+        if sla_scheduler is not None:
+            sla_scheduler.stop()
         jobs.stop_worker(engine)
         engine.dispose()
 
@@ -189,6 +195,8 @@ def health() -> dict:
 app.include_router(orders_api.router)
 app.include_router(tickets_api.router)
 app.include_router(refunds_api.router)
+app.include_router(refunds_ext_api.router)
+app.include_router(fulfillment_api.router)
 app.include_router(auth_api.router)
 app.include_router(chat_api.router)
 app.include_router(confirm_api.router)

@@ -21,7 +21,13 @@ def claim(session: Session, ticket_id: str, service_id: str) -> Ticket:
     result = session.execute(
         update(Ticket)
         .where(Ticket.id == ticket_id, Ticket.status == "queued")
-        .values(status="claimed", claimed_by=service_id, last_msg_at=utc_now())
+        .values(
+            status="claimed",
+            claimed_by=service_id,
+            last_msg_at=utc_now(),
+            # W11-3:领取即清零 SLA 超时标记(超时已升级过的单被认领后不再红色)。
+            sla_breached=False,
+        )
     )
     if result.rowcount != 1:
         session.rollback()
@@ -89,6 +95,50 @@ def add_message(
     session.commit()
     session.refresh(message)
     return message
+
+
+#: W11 B7 允许的手动流转(仅正向链路,回退/跳跃一律拒绝)。
+_MANUAL_TRANSITIONS: dict[tuple[str, str], str] = {
+    ("queued", "claimed"): "领取",
+    ("claimed", "waiting_customer"): "转待客户回复",
+    ("waiting_customer", "closed"): "关单",
+}
+
+
+def transition(
+    session: Session,
+    ticket_id: str,
+    to_status: str,
+    *,
+    service_id: str | None = None,
+) -> Ticket:
+    """工单状态手动流转(守卫式):仅 queued→claimed→waiting_customer→closed。"""
+    ticket = session.get(Ticket, ticket_id)
+    if ticket is None:
+        raise NotFoundError(f"工单不存在: {ticket_id}")
+    if (ticket.status, to_status) not in _MANUAL_TRANSITIONS:
+        raise StateConflictError(
+            f"工单状态不允许从 {ticket.status} 流转到 {to_status}", ticket.status
+        )
+    values: dict[str, object] = {"status": to_status, "last_msg_at": utc_now()}
+    if to_status == "claimed":
+        values["claimed_by"] = service_id or ticket.claimed_by or "manual-agent"
+        values["sla_breached"] = False
+    result = session.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket_id, Ticket.status == ticket.status)
+        .values(**values)
+    )
+    if result.rowcount != 1:
+        session.rollback()
+        current = session.get(Ticket, ticket_id)
+        if current is None:
+            raise NotFoundError(f"工单不存在: {ticket_id}")
+        raise StateConflictError(
+            f"工单状态流转失败: 期望 {ticket.status}", current.status
+        )
+    session.commit()
+    return session.get(Ticket, ticket_id)
 
 
 def chat_prefix(session: Session, ticket: Ticket) -> list[ChatMessage]:

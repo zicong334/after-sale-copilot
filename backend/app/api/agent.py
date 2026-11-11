@@ -32,6 +32,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app import security
+from app import sla
 from app.api import get_db
 from app.db import utc_now
 from app.errors import AppError, NotFoundError, StateConflictError
@@ -220,6 +221,9 @@ def _ticket_dict(
         "last_msg_at_utc": _iso(ticket.last_msg_at),
         "message_count": message_count,
         "last_message": last_message,
+        # W11-3:SLA 超时升级标记(前端队列红色徽标用)。
+        "sla_breached": bool(ticket.sla_breached),
+        "sla_queued_minutes": sla.queued_threshold_minutes(),
     }
 
 
@@ -573,17 +577,63 @@ def _suggest_citations(
     return backend.search(query, top_k=top_k, threshold=DEFAULT_THRESHOLD).results
 
 
-def _compose_suggestion(
-    ticket: Ticket, user_texts: list[str], citations: list[RetrievedChunk]
-) -> dict[str, str]:
-    """MOCK:规则模板生成 ``{summary, suggested_reply}``,不调用真实模型。
+#: W11 B5:建议回复的 prompt 模板(基于工单转录 + 命中条款动态拼装)。
+_SUGGEST_PROMPT_TEMPLATE = (
+    "你是电商售后客服 Copilot,请基于以下工单转录与店铺政策条款,"
+    "输出 JSON:{{\"summary\":\"≤120字内部摘要\",\"suggested_reply\":\"对客回复\"}}。\n"
+    "硬约束:不得承诺到账时间/赔偿金额;不得编造条款;条款未覆盖时说明需人工核实。\n"
+    "【工单】id={ticket_id} 状态={status} 订单={order_id} 转人工原因={reason}\n"
+    "【工单摘要】{summary}\n"
+    "【转录】\n{transcript}\n"
+    "【命中条款】\n{clauses}\n"
+)
 
-    确定性拼装:摘要 = 关键诉求 + 命中条款号;建议回复 = 致谢 + 条款依据 +
-    处理中说明,模板本身不含时效/金额承诺;调用方仍统一过禁词剔除。
+
+def _suggest_transcript(messages: list[TicketMessage]) -> str:
+    """把工单消息压成 prompt 里的转录段(最近 12 条,标注作者)。"""
+    lines = [
+        f"- {message.author_type}: {message.content.strip()}"
+        for message in messages[-12:]
+        if message.content.strip()
+    ]
+    return "\n".join(lines) or "- (无消息)"
+
+
+def _suggest_prompt(
+    ticket: Ticket,
+    messages: list[TicketMessage],
+    citations: list[RetrievedChunk],
+) -> str:
+    """W11 B5:按"工单转录 + 命中条款"动态拼 prompt(不再用固定话术模板)。"""
+    clauses = "\n".join(
+        f"- {chunk.clause_id} {getattr(chunk, 'title', '')}: {chunk.text[:160]}"
+        for chunk in citations
+    ) or "- (未命中条款:需坐席人工核实)"
+    return _SUGGEST_PROMPT_TEMPLATE.format(
+        ticket_id=ticket.id,
+        status=ticket.status,
+        order_id=ticket.order_id or "-",
+        reason=ticket.handoff_reason or "-",
+        summary=ticket.summary or "-",
+        transcript=_suggest_transcript(messages),
+        clauses=clauses,
+    )
+
+
+def _compose_suggestion(
+    ticket: Ticket,
+    user_texts: list[str],
+    citations: list[RetrievedChunk],
+    prompt: str | None = None,
+) -> dict[str, str]:
+    """MOCK:按动态 prompt 的输入(转录 + 条款)确定性生成 ``{summary, suggested_reply}``。
+
+    仍不调用真实模型(响应里 ``mock=True``/``model`` 标注);但输入不再是固定
+    模板,而是 ``_suggest_prompt`` 拼出的真实转录与条款,摘要取最近两轮买家诉求。
     monkeypatch 本函数即可测试禁词剔除分支(测试注入含承诺的草稿)。
     """
-    demand = (user_texts[-1] if user_texts else (ticket.summary or "")).strip()
-    demand = demand[:60] or "买家转人工咨询售后问题"
+    demand_source = " ".join(user_texts[-2:]) if user_texts else (ticket.summary or "")
+    demand = demand_source.strip()[:60] or "买家转人工咨询售后问题"
     clause_ids = "、".join(chunk.clause_id for chunk in citations[:2])
     if clause_ids:
         summary = f"买家诉求:{demand};命中条款:{clause_ids}"
@@ -634,7 +684,8 @@ def suggest_reply(
     citations = _suggest_citations(
         db, ticket.merchant_id, _suggest_query(ticket, user_texts)
     )
-    draft = _compose_suggestion(ticket, user_texts, citations)
+    prompt = _suggest_prompt(ticket, messages, citations)
+    draft = _compose_suggestion(ticket, user_texts, citations, prompt=prompt)
 
     summary = str(draft.get("summary") or "").strip()
     if has_commitment_claim(summary):
@@ -666,6 +717,8 @@ def suggest_reply(
         ],
         "mock": True,
         "model": _SUGGEST_MODEL,
+        # W11 B5:留痕本次使用的动态 prompt(转录 + 命中条款),便于审计与复现。
+        "prompt": prompt,
         "generated_at": _iso(utc_now()),
     }
     _SUGGEST_CACHE[ticket.id] = data

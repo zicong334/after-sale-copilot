@@ -202,7 +202,35 @@ def _pending_confirm(state: dict[str, Any]) -> dict[str, Any] | None:
         return None
     pending = dict(card)
     pending["confirm_token"] = str(confirm.get("token") or "")
+    # W11 B8:带上工具名,前端据此在确认前显示"待确认转人工"(而非已转人工)。
+    pending["tool"] = str(confirm.get("tool") or "")
     return pending
+
+
+#: 转人工工具名(与 ``nodes.TOOL_HANDOFF`` 一致;此处不反向 import nodes,避免层次倒置)。
+_TOOL_HANDOFF = "handoff__create_ticket"
+
+
+def pending_handoff_confirm(thread_id: str) -> dict[str, Any] | None:
+    """W11 B8:读取该会话图状态里**尚未确认**的转人工卡。
+
+    用途:确认卡挂起期间 AI 已停答(买家再发消息走 blocked 轮),但
+    ``chat_session.status`` 仍是 active——只有确认后建单成功才真正 handed_off。
+    """
+    if not thread_id:
+        return None
+    saver = open_checkpointer()
+    try:
+        tup = saver.get_tuple({"configurable": {"thread_id": thread_id}})
+    finally:
+        saver.conn.close()
+    if tup is None:
+        return None
+    state = dict((tup.checkpoint or {}).get("channel_values") or {})
+    confirm = dict(state.get("confirm") or {})
+    if confirm and not confirm.get("decided") and confirm.get("tool") == _TOOL_HANDOFF:
+        return confirm
+    return None
 
 
 def _to_result(state: dict[str, Any], session_status: str) -> TurnResult:
