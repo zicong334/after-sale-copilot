@@ -22,7 +22,7 @@ from app.models.eval import EvalCase  # noqa: E402,F401
 from app.models.kb import KB_STATUS_ACTIVE, KbVector, KnowledgeItem  # noqa: E402,F401
 from app.models.jobs import Job, TurnAudit  # noqa: E402,F401
 from app.models.merchant import Merchant  # noqa: E402,F401
-from app.models.orders import Order, OrderItem, RefundRequest  # noqa: E402,F401
+from app.models.orders import Order, OrderItem, RefundItem, RefundRequest  # noqa: E402,F401
 from app.models.ticket import Ticket, TicketMessage  # noqa: E402,F401
 
 __all__ = [
@@ -35,6 +35,7 @@ __all__ = [
     "Order",
     "OrderItem",
     "RefundRequest",
+    "RefundItem",
     "ChatSession",
     "ChatMessage",
     "Ticket",

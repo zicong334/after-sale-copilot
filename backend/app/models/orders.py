@@ -85,7 +85,25 @@ class OrderItem(Base):
 
 
 class RefundRequest(Base):
-    """退款申请单(新增,幂等台账)。三张核心表之一,约束全部照 DDL 落库。"""
+    """退款申请单(新增,幂等台账)。三张核心表之一,约束全部照 DDL 落库。
+
+    W11 状态机(唯一合法迁移,其余一律拒绝):
+
+    ==========  ==========  ==========================================
+    源状态       目标状态    触发方
+    ==========  ==========  ==========================================
+    申请        审核        商家审核通过(approve)
+    申请        驳回        商家审核驳回(reject)
+    审核        退货中      买家回填物流单号(POST /api/c/refunds/{id}/shipping)
+    退货中      待验货      仓库收货确认(POST /api/fulfillment/receipt)
+    审核        退款        验货通过且无需退货(inspection passed)
+    审核        驳回        验货不通过(inspection failed)
+    待验货      退款        验货通过(inspection passed)
+    待验货      驳回        验货不通过(inspection failed)
+    ==========  ==========  ==========================================
+
+    "退货中"/"待验货"为 W11-2 新增状态;子项金额见 RefundItem。
+    """
 
     __tablename__ = "refund_request"
 
@@ -108,6 +126,7 @@ class RefundRequest(Base):
     decided_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    tracking_no: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=utc_now, server_default=func.current_timestamp(),
@@ -120,7 +139,7 @@ class RefundRequest(Base):
             name="ck_refund_reason",
         ),
         CheckConstraint(
-            "status IN ('申请','审核','退款','驳回')",
+            "status IN ('申请','审核','退货中','待验货','退款','驳回')",
             name="ck_refund_status",
         ),
         CheckConstraint(
@@ -133,5 +152,48 @@ class RefundRequest(Base):
             unique=True,
             sqlite_where=text("status IN ('申请','审核','退款')"),
             postgresql_where=text("status IN ('申请','审核','退款')"),
+        ),
+    )
+
+
+class RefundItem(Base):
+    """退款单子项(W11-1 部分退款折算)。
+
+    一张退款单可含多条子项;退款单总额 = Σ line_cents = Σ qty × unit_cents。
+    同一 order_item 在所有退款单上的累计退 qty 不得超过其购买 qty。
+    """
+
+    __tablename__ = "refund_item"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_id)
+    refund_request_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("refund_request.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    order_item_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("order_item.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    line_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=utc_now, server_default=func.current_timestamp(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_refund_item_qty_pos"),
+        CheckConstraint("unit_cents >= 0", name="ck_refund_item_unit_nonneg"),
+        CheckConstraint("line_cents >= 0", name="ck_refund_item_line_nonneg"),
+        CheckConstraint(
+            "line_cents = qty * unit_cents",
+            name="ck_refund_item_line_consistent",
+        ),
+        Index(
+            "uq_refund_item_unique",
+            "refund_request_id",
+            "order_item_id",
+            unique=True,
         ),
     )

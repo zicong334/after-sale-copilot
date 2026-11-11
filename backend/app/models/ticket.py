@@ -45,6 +45,10 @@ class Ticket(Base):
     claimed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     handoff_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # W11-3 SLA:queued 超过阈值(默认 30 分钟)未被领取 → 置 True;领取后清零。
+    sla_breached: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0"),
+    )
     last_msg_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
