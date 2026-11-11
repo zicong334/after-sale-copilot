@@ -100,6 +100,31 @@ def _error_code_in_reply(text: str) -> str | None:
     return None
 
 
+def _should_auto_approve(gt: dict[str, Any]) -> bool:
+    """按 ground_truth 判断是否要把 "approve" 送进确认门(纯函数,便于单测)。
+
+    触发条件(任一成立即批准):
+    - ``approve`` / ``refund_created`` / ``ticket_created`` 为 True:期望产生写操作;
+    - ``toctou_tamper_total_cents`` 非空:TOCTOU 回归,即使期望最终拒绝,
+      也必须把 approve 送进确认门,否则篡改后的旧金额不会触发拒赔;
+    - ``handoff`` 为 True 或 ``session_status == "handed_off"``:期望转人工。
+      W11c_FIX:像 CS-ADV-004 这类"只写了 handoff、没写 ticket_created"的用例,
+      以前引擎不批准确认卡 → 工单不建、session 永远不写 handed_off,
+      handed_off 只能靠 hard_assert 的放宽分支兜底;这里补上触发条件,
+      主路径回到"确认 → 真实建单 → 真正转人工"。
+    """
+    return bool(
+        gt.get("approve") is True
+        or gt.get("refund_created") is True
+        or gt.get("ticket_created") is True
+        # TOCTOU 回归:即使期望最终拒绝,也必须把 approve 送进确认门
+        or gt.get("toctou_tamper_total_cents") is not None
+        # 期望转人工:必须批准确认卡,工单才会真实创建、session 才会写 handed_off
+        or gt.get("handoff") is True
+        or gt.get("session_status") == "handed_off"
+    )
+
+
 def _jsonable(value: Any) -> Any:
     """payload 是 JSON 字符串;解析失败时原样保留(便于排错)。"""
     if value is None:
@@ -423,13 +448,7 @@ class EvalEngine:
                     select(ConfirmRequest).where(ConfirmRequest.confirm_token == token)
                 )
                 artifact["confirm"] = self._confirm_view(confirm_row)
-                should_approve = bool(
-                    gt.get("approve") is True
-                    or gt.get("refund_created") is True
-                    or gt.get("ticket_created") is True
-                    # TOCTOU 回归:即使期望最终拒绝,也必须把 approve 送进确认门
-                    or gt.get("toctou_tamper_total_cents") is not None
-                )
+                should_approve = _should_auto_approve(gt)
                 if should_approve and confirm_row is not None:
                     # TOCTOU:确认卡已按旧金额生成,批准前篡改订单实付
                     tamper = gt.get("toctou_tamper_total_cents")
