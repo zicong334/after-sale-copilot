@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from app import jobs
 from app import security
 from app.api import agent as agent_api
 from app.api import kb as kb_api
@@ -43,10 +44,19 @@ from app.models import Base
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """启动时幂等建表(dev.db 已由 alembic 建好,此处兜底无迁移环境也能用);退出时 dispose。"""
+    """启动时幂等建表并拉起异步作业 worker;退出时优雅停 worker,再 dispose。
+
+    W10/ISS-49:生产必须走异步队列(``enqueue`` 返回作业 id、worker 线程消费),
+    不能在 ``lifespan`` 里漏掉 ``start_worker`` —— 否则队列退化为"在调用方
+    事务里同步执行",P95 直接受业务写锁拖累。
+    """
     Base.metadata.create_all(bind=engine)
-    yield
-    engine.dispose()
+    jobs.start_worker(engine)
+    try:
+        yield
+    finally:
+        jobs.stop_worker(engine)
+        engine.dispose()
 
 
 app = FastAPI(title="售后 Copilot 服务", lifespan=lifespan)

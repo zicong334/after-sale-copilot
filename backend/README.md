@@ -151,7 +151,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:494 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:577 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -252,6 +252,27 @@ PubSub 都是**进程内内存实现**,单进程本机形态成立,多 worker �
 回归脚本兼容:`AUTH_MODE=internal` 时中间件跳过鉴权、身份由请求体/query 内部兜底并打 WARN,
 仅用于 `check_w1_cases.py` / `demo_w2.py`;既有 434 测试由 `tests/conftest.py` 的 autouse
 fixture 固定为 internal 且关闭限流/防重放(测试毫秒级连发,不带重放头)。
+
+### 7.4 模型网关与异步队列清单(W10)
+
+> 原则:主备路由 + 语义缓存 + 异步队列 + 真流式四件套;除 `healthcheck()` 单次探活外全部离线可测,
+> 生产模块只读 `os.environ`、不解析 `.env`(`LLM_FALLBACK_*` 由进程环境注入;`healthcheck()` 是唯一允许出网点)。
+
+| 项 | 实现位置 | 确定性语义 | 单测 |
+|---|---|---|---|
+| W10-1 主备路由 | `app/llm/router.py`(`ModelRouter`)、`app/llm/minimax_client.py` | 主 → 备(Minimax)→ 规则 Fake 三档;连续失败 N=3 熔断 open,冷却后 half-open 只放 1 个探针,成功即 closed;备用也 open 时降级规则 tier;每次切换发 `router_failover` trace 事件 | `tests/test_router.py` |
+| W10-1 探活 | `app/llm/router.py`(`healthcheck`)、`app/llm/minimax_client.py`(`healthcheck`) | 只向 `{LLM_FALLBACK_BASE_URL}/chat/completions` POST 一次(极小 `max_tokens`),不重试、不建长连接;返回 `{ok,provider,model,error}`,日志 scrub key | `tests/test_router.py`(离线桩) |
+| W10-2 语义缓存 | `app/cache.py`(`SemanticCache`) | 键 = `merchant_id` + 归一化文本;TF-IDF char_wb 余弦 ≥0.92 命中;写意图/订单号/PII 永不缓存;TTL 30min;LRU 上限 512;`clear(merchant_id=...)` 可按租户清 | `tests/test_cache.py` |
+| W10-2 停用词与同义归一 | `app/cache.py`(`_strip_stopwords`/`SYNONYM_GROUPS`) | 单字停用词只保留句末语气词,实义单字(没/会/还/被/把/要/能)不删,否定语义不反转;同义组整词替换 | `tests/test_cache.py::test_stopwords_do_not_reverse_negation` |
+| W10-3 异步队列 | `app/jobs.py`(`SQLiteJobQueue`)、`app/models/jobs.py`、迁移 `0008_jobs`、`app/main.py`(lifespan) | 单 worker 线程轮询 SQLite 作业表;失败重试到 3 次进 dead-letter;`start_worker`/`stop_worker` 幂等优雅停;lifespan 启停(生产不再退化为同步内联) | `tests/test_jobs.py`、`tests/test_stream.py::test_lifespan_starts_and_stops_job_worker` |
+| W10-4 真流式 | `app/llm/real_client.py`(`stream_text`)、`app/llm/base.py`(`stream_sink`/`FakeLLM.stream_text`)、`app/graph/nodes.py`(compose)、`app/api/chat.py`(`_stream_frames`)、`frontend/app.js` | 解析 `data:` SSE 增量与 `[DONE]`;compose 边生成边推 `delta` 事件;整轮结束仍补 `message/citation/usage/done` 兼容旧契约;PII 跨块未闭合 `[` 超过占位符长度立即放行,不卡死 | `tests/test_stream.py`、`tests/test_frontend_delta.py` |
+| W10-3 P95 | 本机实测脚本,日志 `.tmp/w10c/p95.txt` | 同步内联 vs 异步入队各 20 轮:作业体 200ms 时 p95 201.8→81.3ms(2.48x);作业体 25ms 时异步入队受 SQLite fsync 固定成本拖累(见日志注) | `.tmp/w10c/p95_jobs.py` |
+
+MOCK 边界:W10-1 的「备」是 `MinimaxRealClient`(代码真实、默认 MOCK 声明,只有 `healthcheck()` 允许出网 1 次);
+语义缓存是进程内内存实现,多 worker 部署前需换 Redis/DB;异步队列是 SQLite 单文件单 worker,
+横向扩容前需换独立队列(接口已留 `JobQueue` ABC)。`build_llm()` 尚未接 `ModelRouter`(llm/`__init__.py` 在白名单外),
+`SemanticCache` 也尚未接 `api/chat.py` 的 classify 前链路(全仓唯一调用点是 `retrieval/hybrid.py` 的 `clear()`),
+两处生产链路接线均列为后续候选;本棒以 `test_router.py`/`test_cache.py` 作为 W10-1/W10-2 验收证据。
 
 ## 8. 已知声明(交接必读)
 

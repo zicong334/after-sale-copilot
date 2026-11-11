@@ -16,7 +16,7 @@ import socket
 
 import pytest
 
-from app.cache import CacheEntry, SemanticCache, semantic_cache
+from app.cache import CacheEntry, SemanticCache, _normalize, semantic_cache
 
 
 # ---------------------------------------------------------------------------
@@ -258,3 +258,98 @@ def test_cache_never_opens_network(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cache.lookup("退貨期限要多久") is not None
     assert cache.lookup("运费什么时候到账") is None
     assert cache.stats()["hits"] == 1
+
+
+# ---------------------------------------------------------------------------
+# W10 缺陷回归:ISS-46 / ISS-47 / ISS-55
+# ---------------------------------------------------------------------------
+
+def test_merchant_isolation_cross_tenant_miss(cache: SemanticCache) -> None:
+    """ISS-46(P0):同一句问法在两个租户各存一份,互不命中、各回各的答案。"""
+    assert cache.store("退货期限是几天", _payload("A 店:7 天。"), merchant_id="m_a")
+    assert cache.store("退货期限是几天", _payload("B 店:15 天。"), merchant_id="m_b")
+
+    hit_a = cache.lookup("退货期限是几天", merchant_id="m_a")
+    hit_b = cache.lookup("退货期限是几天", merchant_id="m_b")
+    assert hit_a is not None and hit_a.reply == "A 店:7 天。"
+    assert hit_b is not None and hit_b.reply == "B 店:15 天。"
+    # 第三个租户绝不能命中别人的自定义条款。
+    assert cache.lookup("退货期限是几天", merchant_id="m_c") is None
+    # 不传 merchant_id(全局口径)也看不到租户分区内的条目。
+    assert cache.lookup("退货期限是几天") is None
+    assert cache.stats()["size"] == 2
+
+
+def test_clear_scoped_to_merchant(cache: SemanticCache) -> None:
+    """ISS-46:按租户清缓存只清该租户,不误伤其他租户。"""
+    cache.store("退货期限是几天", _payload("A 店:7 天。"), merchant_id="m_a")
+    cache.store("退货期限是几天", _payload("B 店:15 天。"), merchant_id="m_b")
+
+    cache.clear(merchant_id="m_a")
+
+    assert cache.lookup("退货期限是几天", merchant_id="m_a") is None
+    hit_b = cache.lookup("退货期限是几天", merchant_id="m_b")
+    assert hit_b is not None and hit_b.reply == "B 店:15 天。"
+
+
+def test_stopwords_do_not_reverse_negation(cache: SemanticCache) -> None:
+    """ISS-47(P0):"没有收到"不能归一成"有收到"(否定→肯定)。"""
+    # 归一化层:实义构词单字不再被子串抹除。
+    assert _normalize("没有收到") == "没有收到"
+    assert _normalize("没有收到") != _normalize("有收到")
+    assert "会员" in _normalize("会员权益")
+    assert "还是" not in _normalize("还是退货吧")  # 多字虚词仍整体删除
+
+    # 缓存层:肯定说法绝不命中否定说法的缓存。
+    assert cache.store("没有收到", _payload("请先查物流。")) is True
+    assert cache.lookup("有收到") is None
+    assert cache.lookup("没有收到") is not None
+
+
+def test_lru_evicts_least_recently_used() -> None:
+    """ISS-55(P2):max_entries 上限生效,按 LRU 淘汰最久未使用条目。"""
+    cache = SemanticCache(threshold=1.0, max_entries=2)
+    assert cache.max_entries == 2
+    cache.store("问题一", _payload("答一"))
+    cache.store("问题二", _payload("答二"))
+    # 命中一次"问题一",把它刷成最近使用。
+    assert cache.lookup("问题一") is not None
+    cache.store("问题三", _payload("答三"))
+
+    assert cache.stats()["size"] == 2
+    assert cache.lookup("问题二") is None      # 最久未使用 → 先被淘汰
+    assert cache.lookup("问题一") is not None  # 刚用过 → 保留
+    assert cache.lookup("问题三") is not None
+
+
+def test_default_max_entries_is_bounded() -> None:
+    """ISS-55:默认实例有容量上限(512),避免无限增长。"""
+    assert SemanticCache().max_entries == 512
+    assert SemanticCache(max_entries=None).max_entries is None
+
+
+def test_concurrent_lookup_store_stays_bounded() -> None:
+    """ISS-55:并发读写不崩,容量始终不超过 max_entries。"""
+    import threading
+
+    cache = SemanticCache(threshold=1.0, max_entries=8)
+    errors: list[BaseException] = []
+
+    def _worker(prefix: str) -> None:
+        try:
+            for index in range(30):
+                cache.store(f"{prefix}问题{index}", _payload(f"{prefix}答{index}"))
+                cache.lookup(f"{prefix}问题{index}")
+        except BaseException as exc:  # noqa: BLE001 - 收集后统一断言
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_worker, args=(f"t{idx}",)) for idx in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors
+    assert cache.stats()["size"] <= 8

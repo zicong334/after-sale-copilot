@@ -23,6 +23,11 @@ from app.llm.base import LLMClient, Message
 #: 占位符模板(类型前缀 + 本轮序号)。
 PLACEHOLDER_TEMPLATE = "[{kind}_{index}]"
 
+#: 未闭合 ``[`` 的最大等待长度(字符):超过该长度仍未闭合就认为它是正文里的
+#: 普通方括号,立即放行。合法占位符(``[PHONE_1]``/``[ID_1]``/``[ADDR_1]``)
+#: 内部只有十来个字符,16 足够覆盖(ISS-66)。
+PLACEHOLDER_MAX_LEN = 16
+
 
 class PIIMasker:
     """单轮 PII 映射器:mask 累积映射,restore 反解。"""
@@ -128,12 +133,21 @@ class MaskingLLM(LLMClient):
 
     @staticmethod
     def _safe_cut(text: str) -> int:
-        """返回可安全吐出的前缀长度(不切断占位符)。"""
+        """返回可安全吐出的前缀长度(不切断占位符)。
+
+        只有"看起来像占位符"的未闭合 ``[`` 才压住等待下一块:若 ``[`` 之后已
+        积累超过 ``PLACEHOLDER_MAX_LEN`` 个字符仍未闭合,按普通正文立即放行
+        —— 否则正文里一个孤立的 ``[`` 会把后续所有 delta 卡到整段生成结束
+        (ISS-66)。
+        """
         start = text.rfind("[")
         if start == -1:
             return len(text)
         end = text.rfind("]")
         if end == -1 or end < start:
+            # 未闭合:很近(可能是被切断的占位符)就等下一块,太远则当正文放行。
+            if len(text) - start - 1 > PLACEHOLDER_MAX_LEN:
+                return len(text)
             return start
         return end + 1
 

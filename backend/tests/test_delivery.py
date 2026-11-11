@@ -264,13 +264,15 @@ def test_rollback_drill(tmp_dir):
     db_url = f"sqlite:///{db_path.as_posix()}"
 
     up = rollback.upgrade_database(db_url)
-    assert up["current_revision"] == "0007_kb_vectors"
+    assert up["current_revision"] == "0008_jobs"
     assert up["integrity_check"] == "ok"
     assert up["foreign_key_violations"] == 0
     assert _sqlite_table_exists(db_path, "memory")
     assert _sqlite_column_exists(db_path, "ticket", "session_id")
     assert _sqlite_table_exists(db_path, "auth_user")
     assert _sqlite_table_exists(db_path, "kb_vector")  # W9 新增 0007
+    assert _sqlite_table_exists(db_path, "job_queue")  # W10 新增 0008
+    assert _sqlite_table_exists(db_path, "turn_audit")  # W10 新增 0008
 
     down = rollback.downgrade_database(db_url, "0003", backup_dir=tmp_dir / "backup")
     assert down["target"] == "0003_ticket_summary"
@@ -282,13 +284,16 @@ def test_rollback_drill(tmp_dir):
     assert not _sqlite_column_exists(db_path, "ticket", "session_id")
     assert not _sqlite_table_exists(db_path, "auth_user")
     assert not _sqlite_table_exists(db_path, "kb_vector")
+    assert not _sqlite_table_exists(db_path, "job_queue")
+    assert not _sqlite_table_exists(db_path, "turn_audit")
 
     up2 = rollback.upgrade_database(db_url)
-    assert up2["current_revision"] == "0007_kb_vectors"
+    assert up2["current_revision"] == "0008_jobs"
     assert _sqlite_table_exists(db_path, "memory")
     assert _sqlite_column_exists(db_path, "ticket", "session_id")
     assert _sqlite_table_exists(db_path, "auth_user")
     assert _sqlite_table_exists(db_path, "kb_vector")
+    assert _sqlite_table_exists(db_path, "job_queue")
 
 
 # ---------------------------------------------------------------------------

@@ -12,8 +12,9 @@
    → 口语同义归一 → 去停用词。目的是让"退货期限是几天"与"退貨期限要多久"
    落到同一串。
 2. **相似度**:``sklearn.feature_extraction.text.TfidfVectorizer(analyzer="char_wb",
-   ngram_range=(2,3))`` 在"查询 + 全部未过期条目"这个语料上拟合,取 **余弦**,
-   最高分 ``>= threshold``(默认 0.92)即命中。
+   ngram_range=(2,3))`` 在"全部未过期条目"这个语料上拟合,查询向量用
+   ``transform`` 得到,取 **余弦**,最高分 ``>= threshold``(默认 0.92)即命中。
+   拟合结果按 ``(version, candidates)`` 缓存,条目不变时不重复 ``fit_transform``。
 
    ⚠️ 为什么必须用字符 n-gram:中文没有空格,若整句成一个 token,改写句之间
    词集无交集,余弦恒为 0 —— 字符 2/3-gram 才能让改写句落到 0.92 以上。
@@ -37,6 +38,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -66,38 +68,47 @@ __all__ = [
 # 规范化用的常量表
 # ---------------------------------------------------------------------------
 
-#: 停用词:问句客套、语气词与虚词。按**子串**删除(中文无空格),长词优先。
+#: 停用词:问句客套与句末纯语气词。
 #:
 #: 口径刻意保守:只收几乎不承载业务语义的虚词,避免把两个不同问题归一成
 #: 同一串(归一后相同 → 余弦 1.0 → 误命中)。
+#:
+#: **实义构词单字一律不收**(W10/ISS-47):``没/会/还/被/把/要/能/是`` 是
+#: "没有收到 / 会员 / 还是 / 被退回 / 把货 / 要多久 / 能退吗 / 是几天" 的
+#: 构词成分;按子串抹除会把"没有收到"删成"有收到"(否定→肯定)。
 STOPWORDS: frozenset[str] = frozenset(
     {
-        # 客套/疑问(多字)
+        # 客套/疑问(多字) —— 整段不承载业务语义,子串删除安全
         "请问", "麻烦", "一下", "有没有", "是不是", "能不能", "可不可以",
         "为什么", "怎么", "怎样", "如何", "什么", "多少", "哪些", "哪个",
         "我想", "我要", "我需要", "我想要", "帮我", "替我", "给我", "马上",
         "立即", "立刻", "可以", "还是", "的话", "这个", "那个",
-        # 语气/虚词(单字)
+        # 句末纯语气词(单字) —— 只在句首/句尾整词边界剥离,不从词内挖字
         "的", "了", "呢", "吗", "吧", "啊", "呀", "哦", "嗯", "哈", "呗",
-        "啦", "嘛", "么", "没", "是", "我", "你", "您", "咱", "就", "都",
-        "也", "还", "再", "很", "和", "与", "把", "被", "要", "能", "会",
+        "啦", "嘛", "么",
     }
 )
-"""停用词集合(63 词):多字 30 个 + 单字 33 个。"""
+"""停用词集合(44 词):多字 30 个 + 句末纯语气词 14 个。"""
 
 _STOPWORDS_BY_LENGTH: tuple[str, ...] = tuple(
-    sorted(STOPWORDS, key=lambda w: (-len(w), w))
+    sorted((w for w in STOPWORDS if len(w) > 1), key=lambda w: (-len(w), w))
 )
-"""按长度降序的替换顺序:保证"为什么"先于"什么"被删。"""
+"""多字停用词按长度降序的替换顺序:保证"为什么"先于"什么"被删。"""
+
+_SINGLE_STOPWORDS: frozenset[str] = frozenset(
+    w for w in STOPWORDS if len(w) == 1
+)
+"""单字停用词(纯语气词):只允许在词边界(句首/句尾)剥离。"""
 
 #: 口语同义归一:每组第一个是**规范形式**,其余是同义说法。
 #:
 #: 覆盖的是电商售后域常见问法族(时间问法 / 事务动作 / 费用名目),
 #: 目的只有一个:让"换个说法"的同一问题归一到同一串,否则 0.92 余弦打不到。
 SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
-    # 时间问法族
+    # 时间问法族(整段替换,不依赖删"是/要"这类构词单字)
     ("几天", "多久", "多长时间", "多少天", "几天时间", "几天之内", "几天内",
-     "几天以内", "多久能"),
+     "几天以内", "多久能", "要多久", "要多长时间", "需要多长时间", "需要多久",
+     "得多久", "是几天", "要几天", "需要几天", "得几天"),
     # 事务动作族
     ("退货", "退貨", "退回商品"),
     ("退款", "退錢", "退钱", "退费"),
@@ -243,11 +254,20 @@ def _apply_synonyms(text: str) -> str:
 
 
 def _strip_stopwords(text: str) -> str:
-    """按子串删停用词(长词优先),不做词形变换。"""
+    """删停用词:多字按子串,单字只在词边界(句首/句尾)连续剥离。
+
+    中文没有空格,单字子串替换会连实义词内部成分一起吞掉
+    ("没有收到"→"有收到"、"会员"→"员"),因此单字语气词只在两端删除;
+    中间的"是/要/没/会…"原样保留,交给同义归一处理其问法变体。
+    """
     out = text
-    for word in _STOPWORDS_BY_LENGTH:
+    for word in _STOPWORDS_BY_LENGTH:  # 长词优先
         if word in out:
             out = out.replace(word, "")
+    while out and out[-1] in _SINGLE_STOPWORDS:
+        out = out[:-1]
+    while out and out[0] in _SINGLE_STOPWORDS:
+        out = out[1:]
     return out
 
 
@@ -388,8 +408,9 @@ class CacheEntry:
 
 @dataclass
 class _Record:
-    """内部存储记录:归一后的查询串 + 缓存条目。"""
+    """内部存储记录:租户 + 归一后的查询串 + 缓存条目。"""
 
+    merchant_id: str
     normalized: str
     entry: CacheEntry
 
@@ -405,10 +426,17 @@ class SemanticCache:
     用法::
 
         cache = SemanticCache()
-        hit = cache.lookup("退貨期限要多久")
+        hit = cache.lookup("退貨期限要多久", merchant_id="m_001")
         if hit is None:
             ...  # 跑图,拿到结果
-            cache.store("退货期限是几天", payload)
+            cache.store("退货期限是几天", payload, merchant_id="m_001")
+
+    隔离与容量(W10/ISS-46、ISS-55):
+
+    - 条目按 ``merchant_id`` 分区,跨租户永不命中(自定义条款不能串店);
+    - ``max_entries`` 上限 + LRU 淘汰(``OrderedDict`` 顺序 = 使用顺序);
+    - 相似度计算在锁外进行,锁内只做清理/快照/命中记账,避免全量拟合
+      长时间占着 ``RLock``。
     """
 
     def __init__(
@@ -416,15 +444,19 @@ class SemanticCache:
         *,
         threshold: float = 0.92,
         ttl_seconds: int = 1800,
+        max_entries: int | None = 512,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._threshold = float(threshold)
         self._ttl = float(ttl_seconds)
+        self._max_entries = None if max_entries is None else max(0, int(max_entries))
         self._clock: Callable[[], float] = clock if clock is not None else _now
-        self._records: dict[str, _Record] = {}
+        self._records: OrderedDict[str, _Record] = OrderedDict()
         self._hits = 0
         self._misses = 0
         self._stores = 0
+        self._version = 0
+        self._matrix_cache: tuple[int, tuple[str, ...], Any, Any] | None = None
         self._lock = threading.RLock()
 
     # -- 内部 ------------------------------------------------------------
@@ -438,6 +470,16 @@ class SemanticCache:
         """条目存活时长(秒)。"""
         return self._ttl
 
+    @property
+    def max_entries(self) -> int | None:
+        """容量上限(``None`` = 不限)。"""
+        return self._max_entries
+
+    @staticmethod
+    def _key(merchant_id: str, normalized: str) -> str:
+        """内部键:租户前缀 + 归一文本(``\\x1f`` 不会出现在归一文本里)。"""
+        return f"{merchant_id}\x1f{normalized}"
+
     def _purge_expired(self) -> None:
         """删掉过期条目(惰性清理)。"""
         now = self._clock()
@@ -448,6 +490,54 @@ class SemanticCache:
         ]
         for key in stale:
             self._records.pop(key, None)
+        if stale:
+            self._version += 1
+            self._matrix_cache = None
+
+    def _matrix_for(self, candidates: tuple[str, ...], version: int) -> tuple[Any, Any]:
+        """取(或构建)候选语料的 TF-IDF 矩阵,按版本号复用。"""
+        cached = self._matrix_cache
+        if cached is not None and cached[0] == version and cached[1] == candidates:
+            return cached[2], cached[3]
+        try:
+            vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3))
+            matrix = vectorizer.fit_transform(list(candidates))
+        except ValueError:
+            # 语料里全是空串/无 n-gram → 退化为精确/包含判断,不让缓存崩掉。
+            vectorizer, matrix = None, None
+        with self._lock:
+            if self._version == version:
+                self._matrix_cache = (version, candidates, vectorizer, matrix)
+        return vectorizer, matrix
+
+    def _similarities(
+        self, query: str, candidates: tuple[str, ...], version: int
+    ) -> list[float]:
+        """锁外计算 query 与候选的余弦(短文本退化为精确/包含判断)。"""
+        scores: list[float] = [0.0] * len(candidates)
+        long_idx: list[int] = []
+        for index, candidate in enumerate(candidates):
+            if len(query) < MIN_SIMILARITY_LEN or len(candidate) < MIN_SIMILARITY_LEN:
+                scores[index] = _exact_or_contains(query, candidate)
+            else:
+                long_idx.append(index)
+        if not long_idx:
+            return scores
+        vectorizer, matrix = self._matrix_for(candidates, version)
+        if vectorizer is None or matrix is None:
+            for index in long_idx:
+                scores[index] = _exact_or_contains(query, candidates[index])
+            return scores
+        try:
+            query_vector = vectorizer.transform([query])
+            sims = (matrix[long_idx] @ query_vector.T).toarray().ravel()
+        except ValueError:
+            for index in long_idx:
+                scores[index] = _exact_or_contains(query, candidates[index])
+            return scores
+        for offset, index in enumerate(long_idx):
+            scores[index] = float(sims[offset])
+        return scores
 
     # -- 对外 ------------------------------------------------------------
     def is_cacheable(self, text: str, *, intent: str | None = None) -> bool:
@@ -470,12 +560,15 @@ class SemanticCache:
             return False
         return True
 
-    def lookup(self, text: str) -> CacheEntry | None:
+    def lookup(self, text: str, *, merchant_id: str = "") -> CacheEntry | None:
         """查缓存。
 
+        ``merchant_id`` 是隔离维度(W10/ISS-46):只看同租户的条目
+        (空串 = 全局/未分租户),跨租户永不命中。
         返回命中的条目(``reply`` + ``citations`` 等),调用方据此标
         ``cache_hit: true`` 并记 0 token;未命中/不可缓存/过期 → ``None``。
         """
+        merchant = str(merchant_id or "")
         with self._lock:
             self._purge_expired()
             if not self.is_cacheable(text):
@@ -486,20 +579,39 @@ class SemanticCache:
             if not query:
                 self._misses += 1
                 return None
-            keys = list(self._records.keys())
-            candidates = [self._records[key].normalized for key in keys]
-            scores = _tfidf_cosine_scores(query, candidates)
-            best_index = -1
-            best_score = 0.0
-            for index, score in enumerate(scores):
-                if score > best_score:
-                    best_score = score
-                    best_index = index
-            if best_index < 0 or best_score < self._threshold:
+            keys = [
+                key
+                for key, record in self._records.items()
+                if record.merchant_id == merchant
+            ]
+            candidates = tuple(self._records[key].normalized for key in keys)
+            version = self._version
+        if not keys:
+            with self._lock:
+                self._misses += 1
+            return None
+        # 相似度计算放到锁外:512 条全量拟合不再长时间占着 RLock。
+        scores = self._similarities(query, candidates, version)
+        best_index = -1
+        best_score = 0.0
+        for index, score in enumerate(scores):
+            if score > best_score:
+                best_score = score
+                best_index = index
+        with self._lock:
+            # 计算发生在锁外:目标条目可能已被清掉/覆盖,取回时再校验一次。
+            record = self._records.get(keys[best_index]) if best_index >= 0 else None
+            if (
+                record is None
+                or best_score < self._threshold
+                or record.normalized != candidates[best_index]
+            ):
                 self._misses += 1
                 return None
             self._hits += 1
-            source = self._records[keys[best_index]].entry
+            # LRU:命中即刷新使用顺序(距尾部越近越新)。
+            self._records.move_to_end(keys[best_index])
+            source = record.entry
             # 返回副本:避免调用方改到缓存里的 citations。
             return CacheEntry(
                 reply=source.reply,
@@ -510,15 +622,27 @@ class SemanticCache:
                 created_at=source.created_at,
             )
 
-    def store(self, text: str, payload: Mapping[str, Any]) -> bool:
+    def store(
+        self,
+        text: str,
+        payload: Mapping[str, Any],
+        *,
+        merchant_id: str = "",
+    ) -> bool:
         """写入缓存。
 
         ``payload`` 至少含 ``reply`` / ``citations`` / ``intent`` /
         ``confidence`` / ``intent_reason``;``citations`` 是 ``list[dict]``。
+        ``merchant_id`` 与 ``lookup`` 同维度。
         不可缓存 → 返回 ``False`` 且不入库;成功 → ``True``。
+        超出 ``max_entries`` 时按 LRU 淘汰最久未使用条目(容量是进程级资源,
+        跨租户共享)。
         """
+        merchant = str(merchant_id or "")
         with self._lock:
             self._purge_expired()
+            if self._max_entries is not None and self._max_entries <= 0:
+                return False
             data = dict(payload or {})
             intent = data.get("intent")
             if not self.is_cacheable(text, intent=intent if isinstance(intent, str) else None):
@@ -552,14 +676,43 @@ class SemanticCache:
                 intent_reason=str(data.get("intent_reason") or ""),
                 created_at=self._clock(),
             )
-            self._records[normalized] = _Record(normalized=normalized, entry=entry)
+            key = self._key(merchant, normalized)
+            if key in self._records:
+                # 覆盖:先摘除再重插到 LRU 尾部。
+                self._records.pop(key, None)
+            elif (
+                self._max_entries is not None
+                and len(self._records) >= self._max_entries
+            ):
+                self._records.popitem(last=False)
+            self._records[key] = _Record(
+                merchant_id=merchant,
+                normalized=normalized,
+                entry=entry,
+            )
+            self._version += 1
             self._stores += 1
             return True
 
-    def clear(self) -> None:
-        """清空所有缓存条目(手动失效;统计计数保留)。"""
+    def clear(self, *, merchant_id: str | None = None) -> None:
+        """清空缓存条目(手动失效;统计计数保留)。
+
+        不传 ``merchant_id`` → 全清(``hybrid.invalidate_cache`` 的 KB 热
+        更新语义:条款变了,旧答案不能继续命中);传入则只清该租户。
+        """
         with self._lock:
-            self._records.clear()
+            if merchant_id is None:
+                self._records.clear()
+            else:
+                merchant = str(merchant_id or "")
+                for key in [
+                    key
+                    for key, record in self._records.items()
+                    if record.merchant_id == merchant
+                ]:
+                    self._records.pop(key, None)
+            self._version += 1
+            self._matrix_cache = None
 
     def stats(self) -> dict:
         """统计:``{"size": n, "hits": h, "misses": m, "stores": s}``。
