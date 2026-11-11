@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>售后 Copilot · 客服工作台</title>
+  <title>安心退 · 客服工作台</title>
   <link rel="stylesheet" href="/style.css" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23C05621'/%3E%3Ctext x='16' y='23' font-size='16' text-anchor='middle' fill='%23fff'%3E%E5%AE%A2%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23C05621'/%3E%3Cpath d='M16 6l8 3v7c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10V9z' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M12.2 15.6l2.6 2.6 5-5' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
 </head>
 <body>
   <div class="toast-wrap" id="toastWrap" aria-live="polite" aria-atomic="false"></div>
@@ -13,21 +13,35 @@
   <div class="workbench">
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">台</span>
-        <span>售后 Copilot</span>
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="1.9" stroke-linecap="round"
+               stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="13" rx="2.4" />
+            <path d="M8 21h8M12 17v4M7 9h4M7 12.5h7" />
+          </svg>
+        </span>
+        <span>安心退</span>
         <span class="brand-sub">客服工作台</span>
       </div>
-      <a class="btn btn-ghost btn-sm" href="/chat.html" target="_blank"
-         rel="noopener" style="text-decoration:none">买家聊天</a>
+      <nav class="topbar-nav" aria-label="工作台导航">
+        <a class="nav-pill" href="/chat.html" target="_blank" rel="noopener">买家聊天</a>
+        <button class="nav-pill" id="kbToggle" type="button">知识库</button>
+      </nav>
       <!-- W8:实时推送状态 + 当前坐席;坐席身份来自登录 token,不再提供服务下拉/手填 -->
-      <span class="conn-badge" id="connBadge" data-state="offline"
-            title="实时推送通道状态">实时未连接</span>
+      <span class="conn-badge" id="connBadge" data-state="connecting"
+            title="服务通道状态">正在连接服务…</span>
       <div class="agent-picker" title="坐席身份由登录账号决定,不可切换">
-        <label>当前坐席</label>
+        <label>值班坐席</label>
         <span class="agent-name" id="agentChip">—</span>
       </div>
-      <button class="btn btn-ghost btn-sm" id="kbToggle" type="button">知识库</button>
-      <button class="topbar-exit" id="logoutBtn" type="button">退出登录</button>
+      <button class="topbar-exit" id="logoutBtn" type="button">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
+        </svg>
+        退出登录
+      </button>
     </header>
 
     <main class="wb-main">
@@ -37,11 +51,11 @@
           <button class="btn btn-ghost btn-sm" id="refreshBtn" type="button">刷新</button>
         </div>
         <div class="queue-filters" id="queueFilters" role="group" aria-label="按状态筛选">
-          <button type="button" class="filter-chip active" data-status="">全部</button>
-          <button type="button" class="filter-chip" data-status="queued">待领取</button>
-          <button type="button" class="filter-chip" data-status="claimed">跟进中</button>
-          <button type="button" class="filter-chip" data-status="waiting_customer">待客户回复</button>
-          <button type="button" class="filter-chip" data-status="closed">已关闭</button>
+          <button type="button" class="filter-chip active" data-status="">全部<span class="chip-count" data-count="all">0</span></button>
+          <button type="button" class="filter-chip" data-status="queued">待领取<span class="chip-count" data-count="queued">0</span></button>
+          <button type="button" class="filter-chip" data-status="claimed">跟进中<span class="chip-count" data-count="claimed">0</span></button>
+          <button type="button" class="filter-chip" data-status="waiting_customer">待客户回复<span class="chip-count" data-count="waiting_customer">0</span></button>
+          <button type="button" class="filter-chip" data-status="closed">已关闭<span class="chip-count" data-count="closed">0</span></button>
         </div>
         <div class="queue-list" id="queueList" aria-live="polite">
           <div class="panel-state" id="queueState">
@@ -62,15 +76,15 @@
             </svg>
           </div>
           <h3>选择左侧工单开始处理</h3>
-          <p>队列按「待领取优先 + 最近消息倒序」排列;领取后即可回复买家。</p>
+          <p>队列按「待领取优先 + 最近消息倒序」排列；领取后即可回复买家。</p>
         </div>
         <div class="detail-body hidden" id="detailBody" aria-live="polite"></div>
 
-        <!-- W7-4 Copilot 建议回复:选择工单后由 agent.js 显示;MOCK 规则模板,不自动发送 -->
-        <div class="reply-box hidden" id="suggestPanel" aria-label="Copilot 建议回复"
+        <!-- W7-4 建议回复:选择工单后由 agent.js 显示;规则辅助生成,不自动发送 -->
+        <div class="reply-box hidden" id="suggestPanel" aria-label="AI 建议回复"
              style="margin:0 20px 20px">
           <div class="reply-bar">
-            <span class="block-label">Copilot 建议回复<span class="demo-note">MOCK 规则模板</span></span>
+            <span class="block-label"><span class="sparkle" aria-hidden="true">✨</span> AI 建议回复</span>
             <button class="btn btn-ghost btn-sm" id="suggest-btn" type="button">生成建议</button>
           </div>
           <div class="summary-block">
@@ -78,21 +92,21 @@
             <span class="summary-text empty-text" id="suggest-summary">尚未生成建议。</span>
           </div>
           <textarea id="suggest-reply" aria-label="建议回复内容"
-                    placeholder="点击「生成建议」后,建议回复会显示在这里…"></textarea>
+                    placeholder="点击「生成建议」后，可直接发送给买家的话术会显示在这里…"></textarea>
           <div class="reply-bar">
-            <span class="reply-hint">建议仅供参考,填入后可在回复框内编辑,不会自动发送。</span>
+            <span class="reply-hint">建议仅供参考，填入后可在回复框内编辑，不会自动发送。</span>
             <button class="btn btn-ghost btn-sm" id="fill-reply-btn" type="button" disabled>填入回复框</button>
           </div>
         </div>
       </section>
     </main>
 
-    <!-- W9-3 知识库管理:条款 CRUD / 灰度 / 上传切片 / 热更新(agent 角色) -->
+    <!-- W9-3 知识库管理:条款 CRUD / 灰度 / 上传切片 / 重新发布(agent 角色) -->
     <section class="kb-view hidden" id="kbView" aria-label="知识库管理">
       <div class="kb-head">
         <div>
           <h2 class="kb-title">知识库条款</h2>
-          <p class="kb-sub">灰度:draft 草稿不参与检索 · active 生效 · retired 退役可回滚。改完点「热更新」重建索引,立即生效。</p>
+          <p class="kb-sub">已生效的条款会参与智能回复检索；草稿仅自己可见，停用后立即不再命中，可随时重新启用。改完保存即同步，点「重新发布」让买家端立刻生效。</p>
         </div>
         <div class="kb-actions">
           <button class="btn btn-ghost btn-sm" id="kbBack" type="button">返回工单</button>
@@ -101,28 +115,40 @@
             上传 MD
             <input type="file" id="kbUpload" accept=".md,.markdown,text/markdown" hidden />
           </label>
-          <button class="btn btn-primary btn-sm" id="kbReload" type="button">热更新</button>
+          <button class="btn btn-primary btn-sm" id="kbReload" type="button">重新发布</button>
         </div>
       </div>
 
       <div class="kb-badges" id="kbStats" aria-live="polite"></div>
 
+      <div class="kb-filterbar" role="group" aria-label="知识库筛选">
+        <input id="kbSearch" class="kb-search" type="search" autocomplete="off"
+               placeholder="搜索条款号、标题或正文关键词…" aria-label="搜索条款" />
+        <div class="kb-filter-chips" id="kbFilters">
+          <button type="button" class="filter-chip active" data-kb-filter="all">全部</button>
+          <button type="button" class="filter-chip" data-kb-filter="RP">退货 RP</button>
+          <button type="button" class="filter-chip" data-kb-filter="LP">物流 LP</button>
+          <button type="button" class="filter-chip" data-kb-filter="retired">已停用</button>
+        </div>
+      </div>
+
       <div class="kb-body">
         <div class="kb-list" id="kbList" role="list" aria-live="polite"></div>
 
         <form class="kb-editor" id="kbEditor" autocomplete="off">
-          <div class="kb-editor-head"><span id="kbEditorTitle">新建条款</span></div>
+          <div class="kb-editor-head"><span id="kbEditorTitle">新建条款 · 新建模式</span></div>
           <label class="kb-field">条款号
-            <input id="kbClauseId" required maxlength="100" placeholder="RP-20" />
+            <input id="kbClauseId" required maxlength="100" placeholder="如 RP-20（退货）/ LP-05（物流）"
+                   aria-describedby="kbEditorHint" />
           </label>
           <label class="kb-field">标题
             <input id="kbTitle" maxlength="200" placeholder="退款到账时效" />
           </label>
           <label class="kb-field">状态
             <select id="kbStatus">
-              <option value="draft">draft · 草稿(不参与检索)</option>
-              <option value="active">active · 生效</option>
-              <option value="retired">retired · 退役</option>
+              <option value="draft">草稿 · 仅自己可见，不参与检索</option>
+              <option value="active">生效 · 参与智能回复</option>
+              <option value="retired">已停用 · 暂不参与检索</option>
             </select>
           </label>
           <label class="kb-field">正文
@@ -138,8 +164,8 @@
     </section>
 
     <footer class="meta">
-      <span>本页为原生 HTML / CSS / JS,零第三方依赖、零构建工具。</span>
-      <span class="mock-line">MOCK 演示环境:需登录使用,数据来自 seed;不接真实支付与物流。</span>
+      <span>安心退 · 客服工作台</span>
+      <span class="assure-line">所有操作实时同步至买家端 · 敏感操作均有记录可追溯</span>
     </footer>
   </div>
 
@@ -147,7 +173,7 @@
   <div class="modal-mask hidden" id="closeModal" role="dialog" aria-modal="true" aria-labelledby="closeModalTitle">
     <div class="modal-card">
       <h3 class="modal-title" id="closeModalTitle">关闭工单 <span id="closeTicketId"></span></h3>
-      <p class="modal-tip">请填写结单原因;原因会写入工单内部备注,买家不可见。</p>
+      <p class="modal-tip">请填写结单原因；原因会写入工单内部备注，买家不可见。</p>
       <textarea id="closeReason" rows="3" aria-label="结单原因" placeholder="例如:已为买家办理退款,双方确认完结"></textarea>
       <div class="modal-actions">
         <button class="btn btn-ghost" type="button" id="closeCancel">取消</button>

@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>售后 Copilot · 在线客服</title>
+  <title>安心退 · 在线售后管家</title>
   <link rel="stylesheet" href="/style.css" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23C05621'/%3E%3Ctext x='16' y='23' font-size='16' text-anchor='middle' fill='%23fff'%3E%E5%AE%A2%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23C05621'/%3E%3Cpath d='M16 6l8 3v7c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10V9z' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M12.2 15.6l2.6 2.6 5-5' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
 </head>
 <body>
   <div class="toast-wrap" id="toastWrap" aria-live="polite" aria-atomic="false"></div>
@@ -13,50 +13,64 @@
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">客</span>
-        <span>售后 Copilot</span>
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="1.9" stroke-linecap="round"
+               stroke-linejoin="round">
+            <path d="M12 3c4.5 0 8 3.1 8 7.2 0 4.4-3.6 7.6-8 7.6-1.1 0-2.2-.2-3.2-.6L4 20l1.2-4.2A7 7 0 0 1 4 10.2C4 6.1 7.5 3 12 3Z" />
+            <path d="M12 16.2c-2.6-1.4-4-3.2-4-5.1 0-1.5 1.2-2.6 2.6-2.6.9 0 1.6.5 1.9 1.2.3-.7 1-1.2 1.9-1.2 1.4 0 2.6 1.1 2.6 2.6 0 1.9-1.4 3.7-4 5.1Z" />
+          </svg>
+        </span>
+        <span>安心退</span>
+        <span class="brand-sub">智能售后管家</span>
       </div>
       <span class="status-badge" id="statusBadge" data-state="active">AI 接待中</span>
-      <span class="trace" id="trace">trace: -</span>
       <!-- W8:实时推送状态 + 退出登录;身份由登录 token 决定 -->
       <a class="btn btn-ghost btn-sm" href="/agent.html" target="_blank"
          rel="noopener" style="text-decoration:none">客服工作台</a>
-      <span class="conn-badge" id="connBadge" data-state="offline"
-            title="实时推送通道状态">实时未连接</span>
+      <span class="conn-badge" id="connBadge" data-state="connecting"
+            title="服务连接状态">正在连接服务…</span>
       <button class="topbar-exit" id="logoutBtn" type="button">退出登录</button>
     </header>
 
     <div class="hidden" id="handoffBar" role="status"
          style="margin:10px 24px 0;padding:9px 14px;border-radius:10px;background:#FEF3C7;border:1px solid rgba(183,121,31,.28);color:#8A5A10;font-size:13px;line-height:1.5;">
-      已转人工 · AI 已停止自动回复,继续留言会追加到人工工单,坐席会尽快跟进。
+      已为您转接人工坐席 · 专属坐席正在接入，您可以直接留言，坐席会尽快回复。
     </div>
+
+    <!-- W14 ISS-41:我的订单快捷选择(登录买家本人订单,点选即发起售后) -->
+    <section class="order-strip hidden" id="orderStrip" aria-label="我的订单快捷选择">
+      <span class="order-strip-title">我的订单</span>
+      <div class="order-chips" id="orderChips"></div>
+    </section>
 
     <main class="stream" id="stream" aria-live="polite">
       <section class="empty" id="emptyState">
-        <div class="empty-icon" aria-hidden="true">
-          <svg width="30" height="30" viewBox="0 0 24 24" fill="none"
-               stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
-               stroke-linejoin="round">
-            <path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3 8.9 8.9 0 0 1-3.8-.8L3 21l1.9-4.6a8.1 8.1 0 0 1-1.4-4.6A8.4 8.4 0 0 1 12 3.3a8.4 8.4 0 0 1 9 8.2Z" />
-            <path d="M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01" />
+        <div class="empty-badge" aria-hidden="true">
+          <svg class="empty-badge-star" width="46" height="46" viewBox="0 0 48 48" fill="none">
+            <path d="M24 4l4.6 10.9L40 19.4l-8.6 8 2.4 11.6L24 33.4 14.2 39l2.4-11.6-8.6-8 11.4-4.5L24 4Z"
+                  fill="currentColor" opacity=".16" />
+            <path d="M24 7.5l3.7 8.8 9.2 3.6-6.9 6.5 1.9 9.3L24 31.2l-7.9 4.5 1.9-9.3-6.9-6.5 9.2-3.6L24 7.5Z"
+                  fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+            <path d="M35.5 8.5l.9 2.2 2.2.9-2.2.9-.9 2.2-.9-2.2-2.2-.9 2.2-.9.9-2.2Z" fill="currentColor" />
           </svg>
         </div>
-        <h1>你好,我是售后 Copilot</h1>
-        <p>描述你的售后问题,我会依据店铺政策给出处理方案。需要人工介入时,随时说「转人工」。</p>
+        <h1>您好，我是「安心退」智能管家。</h1>
+        <p>把繁琐售后交给我，把放心结果还给你。</p>
         <div class="examples" id="examples">
-          <button type="button" class="example-chip" data-text="订单 seed-order-007 的商品有质量问题,我要退货退款">商品有质量问题,怎么退款?</button>
-          <button type="button" class="example-chip" data-text="订单 seed-order-001 的衣服有线头,我要退货退款">订单衣服有线头,想退货</button>
-          <button type="button" class="example-chip" data-text="转人工">我要转人工客服</button>
+          <button type="button" class="example-chip" data-text="我的退款什么时候能到账？帮我查一下退款进度">查退款进度</button>
+          <button type="button" class="example-chip" data-text="我的订单物流一直没更新，能帮我看看吗？">查物流进度</button>
+          <button type="button" class="example-chip" data-text="收到的商品有瑕疵，我想退换，需要怎么操作？">商品瑕疵退换</button>
         </div>
       </section>
     </main>
 
-    <div class="closed-hint hidden" id="closedHint" role="status">工单已关闭,本次会话已结束。</div>
+    <div class="closed-hint hidden" id="closedHint" role="status">工单已关闭，本次会话已结束。</div>
 
     <form class="composer" id="composer">
       <div class="composer-box">
         <textarea id="text" rows="1" autocomplete="off" maxlength="2000"
-                  placeholder="描述你的售后问题…(Enter 发送,Shift+Enter 换行)"></textarea>
+                  placeholder="描述您的售后问题…（Enter 发送，Shift+Enter 换行）"></textarea>
         <button class="btn btn-primary btn-send" id="send" type="submit" aria-label="发送消息">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -68,8 +82,8 @@
     </form>
 
     <footer class="meta">
-      <span>本页为原生 HTML / CSS / JS,零第三方依赖、零构建工具。</span>
-      <span class="mock-line">MOCK 演示:金额与 token 用量为估算,非真实账单;不接真实支付与物流。</span>
+      <span>安心退 · 您的专属智能售后管家</span>
+      <span class="assure-line">本服务由智能售后大模型提供支持 · 全天候服务保障</span>
     </footer>
   </div>
 

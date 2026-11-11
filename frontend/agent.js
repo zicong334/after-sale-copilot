@@ -1,13 +1,15 @@
-/* 售后 Copilot · 客服工作台(原生 JS,零第三方依赖 零构建)
+/* 安心退 · 客服工作台(原生 JS,零第三方依赖 零构建)
  * 对接契约 §二 /api/b/*(全部带 Authorization: Bearer <token>):
- *   GET  /api/b/tickets?merchant_id=&status=
+ *   GET  /api/b/tickets?merchant_id=(固定拉全量,前端按状态筛选)
  *   GET  /api/b/tickets/{id}
  *   POST /api/b/tickets/{id}/claim      {service_id}
  *   POST /api/b/tickets/{id}/messages   {service_id, content, is_internal?}
  *   POST /api/b/tickets/{id}/close      {service_id?}
- *   POST /api/b/tickets/{id}/suggest     → {data:{summary, suggested_reply, citations, mock}}
+ *   POST /api/b/tickets/{id}/suggest     → {data:{summary, suggested_reply, citations}}
  *   GET  /api/b/tickets/{id}/suggest     → 最近一次建议(进程内缓存)
  * 409 时 toast 后端 message(含「已被他人领取」)。
+ * W14 前端体验包:界面只出现业务语言——短单号、中文状态、可直接发的话术,
+ * 不出现内部实现术语(状态枚举、索引细节、trace 等)。
  */
 (function () {
   "use strict";
@@ -125,12 +127,16 @@
   };
 
   var REASON_FALLBACK = {
-    amount_dispute: "金额争议",
-    complaint: "投诉 / 风险信号",
+    amount_dispute: "退款金额争议",
+    refund_dispute: "退款金额争议",
+    logistics_delay: "物流超时未更新",
+    shipping_delay: "物流超时未更新",
+    quality_defect: "商品瑕疵 / 质量问题",
+    complaint: "投诉风险",
     unresolved_3rounds: "连续 3 轮未解决",
-    explicit_request: "客户主动要求转人工",
-    step_limit: "处理步数上限",
-    security_risk: "安全 / 越权风险",
+    explicit_request: "买家明确要求转人工",
+    step_limit: "处理步数已达上限",
+    security_risk: "安全风险",
     other: "其他原因"
   };
 
@@ -164,6 +170,8 @@
     detailBusy: false,
     timer: null,             // 队列轮询定时器(WS 断线降级用)
     refreshTimer: null,      // WS 事件触发的队列刷新去抖
+    prevLastMsg: Object.create(null), // ticket_id → 上次看到的最后消息时间
+    unread: Object.create(null),      // ticket_id → true(买家有新消息)
     ws: null,
     wsReady: false,
     wsRetry: 0,
@@ -202,6 +210,34 @@
     return pad(d.getMonth() + 1) + "-" + pad(d.getDate());
   }
 
+  /* W14 ISS-17/32:工单号展示后 6 位短码,长 UUID 只用于接口与埋点。 */
+  function shortCode(id) {
+    var raw = String(id || "").replace(/-/g, "");
+    if (!raw) return "—";
+    return "#" + raw.slice(-6).toUpperCase();
+  }
+
+  /* 对客界面里的实现细节统一转成业务话术。 */
+  function bizCopy(text) {
+    return String(text == null ? "" : text)
+      .replace(/policy_search/g, "线上自助查询")
+      .replace(/\bverified\b/g, "已核验")
+      .replace(/\bqueued\b/g, "排队中")
+      .replace(/\bactive\b/g, "生效")
+      .replace(/\bretired\b/g, "已停用");
+  }
+
+  /* W14 ISS-17/40:副标题优先用真实对话摘要,其次最后一句,最后才是原因描述。 */
+  function ticketSummary(ticket) {
+    var raw = (ticket.summary || ticket.last_message || "").trim();
+    if (raw) {
+      var first = raw.split(/[\n。！？!?]/)[0].trim();
+      return bizCopy(first.length > 48 ? first.slice(0, 48) + "…" : first);
+    }
+    var reason = reasonLabel(ticket);
+    return reason && reason !== "—" ? "买家因" + reason + "转人工" : "买家发起人工咨询";
+  }
+
   function toast(message, kind) {
     var node = el("div", "toast" + (kind ? " " + kind : ""), message);
     node.setAttribute("role", "status");
@@ -226,9 +262,9 @@
   function reasonLabel(ticket) {
     if (ticket && ticket.handoff_reason_label) return ticket.handoff_reason_label;
     if (ticket && ticket.handoff_reason) {
-      return REASON_FALLBACK[ticket.handoff_reason] || ticket.handoff_reason;
+      return REASON_FALLBACK[ticket.handoff_reason] || "其他原因";
     }
-    return "—";
+    return "暂未标注原因";
   }
 
   function errorMessage(err) {
@@ -277,15 +313,19 @@
 
   function renderAgentChip() {
     if (!els.agentChip) return;
-    var name = ME.display_name || ME.username || "坐席";
-    els.agentChip.textContent = name + "(" + SERVICE_ID + ")";
-    els.agentChip.title = "merchant_id: " + MERCHANT_ID;
+    var name = ME.display_name || ME.username || "值班坐席";
+    els.agentChip.textContent = name;
+    els.agentChip.title = "坐席身份由登录账号决定";
   }
 
   /* --------------------------------- 队列 --------------------------------- */
 
   function sortTickets(items) {
     return items.slice().sort(function (a, b) {
+      /* W14 ISS-29:有买家新消息的工单永远置顶。 */
+      var ua = state.unread[a.ticket_id] ? 0 : 1;
+      var ub = state.unread[b.ticket_id] ? 0 : 1;
+      if (ua !== ub) return ua - ub;
       var qa = a.status === "queued" ? 0 : 1;
       var qb = b.status === "queued" ? 0 : 1;
       if (qa !== qb) return qa - qb;
@@ -318,7 +358,20 @@
     }
   }
 
+  function renderQueueCounts() {
+    var counts = { all: state.tickets.length, queued: 0, claimed: 0, waiting_customer: 0, closed: 0 };
+    state.tickets.forEach(function (t) {
+      if (counts[t.status] !== undefined) counts[t.status] += 1;
+    });
+    var nodes = els.queueFilters ? els.queueFilters.querySelectorAll(".chip-count") : [];
+    for (var i = 0; i < nodes.length; i += 1) {
+      var key = nodes[i].getAttribute("data-count") || "all";
+      nodes[i].textContent = String(counts[key] || 0);
+    }
+  }
+
   function renderQueue() {
+    renderQueueCounts();
     var items = state.tickets.filter(function (t) {
       return !state.statusFilter || t.status === state.statusFilter;
     });
@@ -337,27 +390,33 @@
     els.queueState.classList.add("hidden");
     items.forEach(function (ticket) {
       var item = el("button", "ticket-item" +
-        (ticket.ticket_id === state.selectedId ? " active" : ""));
+        (ticket.ticket_id === state.selectedId ? " active" : "") +
+        (state.unread[ticket.ticket_id] ? " has-new" : ""));
       item.type = "button";
       item.setAttribute("data-ticket", ticket.ticket_id);
 
       var row = el("div", "ticket-row");
-      row.appendChild(el("span", "ticket-id", "#" + ticket.ticket_id));
+      row.appendChild(el("span", "ticket-id", shortCode(ticket.ticket_id)));
       row.appendChild(badge(ticket));
+      if (state.unread[ticket.ticket_id]) {
+        row.appendChild(el("span", "new-dot", "● 新消息"));
+      }
       row.appendChild(el("span", "ticket-time", fmtQueueTime(ticket.last_msg_at_utc || ticket.created_at_utc)));
       item.appendChild(row);
 
-      var summary = ticket.summary || ticket.last_message ||
-        (ticket.handoff_reason_label ? "转人工原因:" + ticket.handoff_reason_label : "无摘要");
-      item.appendChild(el("div", "ticket-summary", summary));
+      item.appendChild(el("div", "ticket-summary", ticketSummary(ticket)));
 
       var sub = el("div", "ticket-sub");
-      sub.appendChild(el("span", "", "买家 " + (ticket.customer_id || "—")));
-      if (ticket.order_id) sub.appendChild(el("span", "", "订单 " + ticket.order_id));
-      if (ticket.claimed_by) sub.appendChild(el("span", "", "领取 " + ticket.claimed_by));
+      sub.appendChild(el("span", "", "买家 " + shortCode(ticket.customer_id)));
+      if (ticket.order_id) sub.appendChild(el("span", "", "订单 " + shortCode(ticket.order_id)));
+      if (ticket.claimed_by) sub.appendChild(el("span", "", "领取 " + shortCode(ticket.claimed_by)));
       item.appendChild(sub);
 
       item.addEventListener("click", function () {
+        delete state.unread[ticket.ticket_id];
+        item.classList.remove("has-new");
+        var dot = item.querySelector(".new-dot");
+        if (dot && dot.parentNode) dot.parentNode.removeChild(dot);
         loadDetail(ticket.ticket_id);
       });
       els.queueList.appendChild(item);
@@ -373,10 +432,22 @@
       els.queueState.textContent = "正在加载工单队列…";
     }
     try {
+      /* W14 ISS-40:一次拉全量,前端按状态过滤并显示各状态数量,
+       * 否则筛选 Tab 上的计数永远只能是当前筛选的那一档。 */
       var query = "/api/b/tickets?merchant_id=" + encodeURIComponent(MERCHANT_ID);
-      if (state.statusFilter) query += "&status=" + encodeURIComponent(state.statusFilter);
       var data = await api(query);
-      state.tickets = sortTickets(Array.isArray(data.items) ? data.items : []);
+      var items = Array.isArray(data.items) ? data.items : [];
+      /* W14 ISS-29:与本轮已知的最后消息时间做差量,买家追评即打「新消息」。 */
+      items.forEach(function (t) {
+        var prev = state.prevLastMsg[t.ticket_id];
+        var now = t.last_msg_at_utc || "";
+        if (prev && now && Date.parse(now) > Date.parse(prev) &&
+            t.ticket_id !== state.selectedId) {
+          state.unread[t.ticket_id] = true;
+        }
+        state.prevLastMsg[t.ticket_id] = now;
+      });
+      state.tickets = sortTickets(items);
       renderQueue();
     } catch (err) {
       els.queueState.classList.remove("hidden");
@@ -437,12 +508,12 @@
 
     var head = el("div", "detail-head");
     var titleBox = el("div", "");
-    titleBox.appendChild(el("h2", "", "工单 #" + (ticket.ticket_id || state.selectedId)));
+    titleBox.appendChild(el("h2", "", "工单 " + shortCode(ticket.ticket_id || state.selectedId)));
     head.appendChild(titleBox);
 
     var badges = el("div", "head-badges");
     badges.appendChild(badge(ticket));
-    badges.appendChild(el("span", "demo-note", "原因:" + reasonLabel(ticket)));
+    badges.appendChild(el("span", "demo-note", "原因 · " + reasonLabel(ticket)));
     head.appendChild(badges);
 
     var actions = el("div", "detail-actions");
@@ -469,16 +540,16 @@
 
     var summary = el("div", "summary-block");
     summary.appendChild(el("span", "block-label", "诉求摘要"));
-    summary.appendChild(el("span", "summary-text" + (ticket.summary ? "" : " empty-text"),
-      ticket.summary || ticket.last_message || "转人工前对话见上方转录"));
+    summary.appendChild(el("span", "summary-text" + (ticket.summary || ticket.last_message ? "" : " empty-text"),
+      ticketSummary(ticket)));
     els.detailBody.appendChild(summary);
 
     var grid = el("div", "meta-grid");
-    grid.appendChild(metaItem("买家", ticket.customer_id));
-    grid.appendChild(metaItem("店铺", ticket.merchant_id));
-    grid.appendChild(metaItem("订单", ticket.order_id));
+    grid.appendChild(metaItem("买家", shortCode(ticket.customer_id)));
+    grid.appendChild(metaItem("店铺", "本店"));
+    grid.appendChild(metaItem("订单", shortCode(ticket.order_id)));
     grid.appendChild(metaItem("转人工原因", reasonLabel(ticket)));
-    grid.appendChild(metaItem("领取人", ticket.claimed_by || "未领取"));
+    grid.appendChild(metaItem("领取人", ticket.claimed_by ? shortCode(ticket.claimed_by) : "未领取"));
     grid.appendChild(metaItem("创建时间", fmtDateTime(ticket.created_at_utc)));
     grid.appendChild(metaItem("最后消息", fmtDateTime(ticket.last_msg_at_utc)));
     if (ticket.message_count !== undefined && ticket.message_count !== null) {
@@ -492,13 +563,13 @@
       chatTranscript.forEach(function (item) {
         var role = item.author_type === "user" ? "user" : "system";
         var row = el("div", "tmsg " + role);
-        var head = el("div", "tmsg-head");
-        head.appendChild(el("span", "role-name",
+        var tHead = el("div", "tmsg-head");
+        tHead.appendChild(el("span", "role-name",
           item.author_label || (role === "user" ? "买家" : "AI 助手")));
-        if (role !== "user") head.appendChild(el("span", "internal-badge", "机器人"));
-        head.appendChild(el("span", "", fmtDateTime(item.created_at_utc)));
-        row.appendChild(head);
-        row.appendChild(el("div", "tmsg-bubble", item.content || ""));
+        if (role !== "user") tHead.appendChild(el("span", "internal-badge", "机器人"));
+        tHead.appendChild(el("span", "", fmtDateTime(item.created_at_utc)));
+        row.appendChild(tHead);
+        row.appendChild(el("div", "tmsg-bubble", bizCopy(item.content || "")));
         chatWrap.appendChild(row);
       });
       els.detailBody.appendChild(chatWrap);
@@ -508,26 +579,88 @@
 
     var reply = el("div", "reply-box");
     reply.appendChild(el("div", "section-title", "回复买家"));
+
+    /* W14 ISS-43:未领取的工单先领取再回复,避免抢单前误发。 */
+    if (ticket.status === "queued") {
+      var locked = el("div", "reply-locked");
+      locked.appendChild(el("div", "lock-icon", "🔒"));
+      locked.appendChild(el("div", "lock-text", "请先领取工单后回复"));
+      if (els.detailBody) {
+        locked.appendChild(actionButton("领取工单", "btn-primary", function (btn) {
+          claimTicket(ticket, btn);
+        }));
+      }
+      reply.appendChild(locked);
+      els.detailBody.appendChild(reply);
+      showSuggestPanel(ticket);
+      return;
+    }
+
+    /* W14 ISS-27:公开发送 / 内部备忘拆成独立选项卡。 */
+    var tabs = el("div", "reply-tabs");
+    var publicTab = el("button", "reply-tab active", "公开发送给买家");
+    publicTab.type = "button";
+    publicTab.setAttribute("aria-pressed", "true");
+    var internalTab = el("button", "reply-tab", "内部备忘（仅坐席可见）");
+    internalTab.type = "button";
+    internalTab.setAttribute("aria-pressed", "false");
+    tabs.appendChild(publicTab);
+    tabs.appendChild(internalTab);
+    reply.appendChild(tabs);
+
+    var internalCheck = document.createElement("input");
+    internalCheck.type = "checkbox";
+    internalCheck.className = "sr-only";
+    reply.appendChild(internalCheck);
+
+    function setMode(internal) {
+      internalCheck.checked = internal;
+      publicTab.classList.toggle("active", !internal);
+      internalTab.classList.toggle("active", internal);
+      publicTab.setAttribute("aria-pressed", String(!internal));
+      internalTab.setAttribute("aria-pressed", String(internal));
+    }
+    publicTab.addEventListener("click", function () { setMode(false); });
+    internalTab.addEventListener("click", function () { setMode(true); });
+
     var textarea = el("textarea");
     textarea.id = "reply-input";
-    textarea.placeholder = "以「人工客服」身份回复买家…(演示环境,内容会落库)";
+    textarea.placeholder = "输入回复内容，Enter 发送，Shift+Enter 换行……";
     textarea.setAttribute("aria-label", "回复买家内容");
     reply.appendChild(textarea);
 
     var bar = el("div", "reply-bar");
-    var internal = el("label", "switch");
-    var internalCheck = document.createElement("input");
-    internalCheck.type = "checkbox";
-    var internalText = el("span", "", "内部备注(仅坐席可见,不发给买家)");
-    internal.appendChild(internalCheck);
-    internal.appendChild(internalText);
-    bar.appendChild(internal);
-    bar.appendChild(el("span", "reply-hint", "回车换行;点击发送提交"));
-    var sendBtn = actionButton("发送回复", "btn-primary", function (btn) {
+    /* W14 ISS-27:工单状态单独展示(只读),不再和「内部备注」勾选耦合。 */
+    var statusWrap = el("label", "reply-status-wrap");
+    statusWrap.appendChild(el("span", "", "工单状态"));
+    var statusSelect = document.createElement("select");
+    statusSelect.id = "replyStatus";
+    statusSelect.className = "reply-status";
+    statusSelect.disabled = true;
+    statusSelect.title = "状态随领取/关单自动流转";
+    Object.keys(STATUS_LABELS).forEach(function (key) {
+      var opt = document.createElement("option");
+      opt.value = key;
+      opt.textContent = STATUS_LABELS[key];
+      if (key === ticket.status) opt.selected = true;
+      statusSelect.appendChild(opt);
+    });
+    statusWrap.appendChild(statusSelect);
+    bar.appendChild(statusWrap);
+    bar.appendChild(el("span", "reply-hint", "Enter 发送 · Shift+Enter 换行"));
+    var sendBtn = actionButton("发送", "btn-primary", function (btn) {
       replyTicket(ticket, textarea, internalCheck, btn);
     });
     bar.appendChild(sendBtn);
     reply.appendChild(bar);
+
+    /* W14 ISS-18:回复框 Enter 直接发送,Shift+Enter 换行。 */
+    textarea.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        if (!sendBtn.disabled) sendBtn.click();
+      }
+    });
 
     if (ticket.status === "closed") {
       var closedHint = el("div", "reply-hint");
@@ -536,14 +669,66 @@
       textarea.disabled = true;
       internalCheck.disabled = true;
       sendBtn.disabled = true;
+      publicTab.disabled = true;
+      internalTab.disabled = true;
     }
     els.detailBody.appendChild(reply);
 
     showSuggestPanel(ticket);
   }
 
-  async function loadDetail(ticketId) {
+  /* W14 ISS-53:静默刷新只替换转录/徽章/摘要,保留回复框草稿与滚动位置。 */
+  function refreshDetailInPlace(ticket, messages, chatTranscript) {
+    var body = els.detailBody;
+    var badges = body.querySelector(".head-badges");
+    if (badges) {
+      badges.textContent = "";
+      badges.appendChild(badge(ticket));
+      badges.appendChild(el("span", "demo-note", "原因 · " + reasonLabel(ticket)));
+    }
+    var summaryText = body.querySelector(".summary-text");
+    if (summaryText) {
+      summaryText.classList.toggle("empty-text", !(ticket.summary || ticket.last_message));
+      summaryText.textContent = ticketSummary(ticket);
+    }
+    var meta = body.querySelector(".meta-grid");
+    if (meta) {
+      meta.textContent = "";
+      meta.appendChild(metaItem("买家", shortCode(ticket.customer_id)));
+      meta.appendChild(metaItem("店铺", "本店"));
+      meta.appendChild(metaItem("订单", shortCode(ticket.order_id)));
+      meta.appendChild(metaItem("转人工原因", reasonLabel(ticket)));
+      meta.appendChild(metaItem("领取人", ticket.claimed_by ? shortCode(ticket.claimed_by) : "未领取"));
+      meta.appendChild(metaItem("创建时间", fmtDateTime(ticket.created_at_utc)));
+      meta.appendChild(metaItem("最后消息", fmtDateTime(ticket.last_msg_at_utc)));
+      if (ticket.message_count !== undefined && ticket.message_count !== null) {
+        meta.appendChild(metaItem("消息数", String(ticket.message_count)));
+      }
+    }
+    var oldTranscript = body.querySelector(".transcript:not(.chat-prefix)");
+    if (oldTranscript && oldTranscript.parentNode) {
+      oldTranscript.parentNode.replaceChild(renderTranscript(messages), oldTranscript);
+    }
+    var prefix = body.querySelector(".chat-prefix");
+    if (prefix && chatTranscript && chatTranscript.length) {
+      prefix.textContent = "";
+      chatTranscript.forEach(function (item) {
+        var role = item.author_type === "user" ? "user" : "system";
+        var row = el("div", "tmsg " + role);
+        var tHead = el("div", "tmsg-head");
+        tHead.appendChild(el("span", "role-name",
+          item.author_label || (role === "user" ? "买家" : "AI 助手")));
+        tHead.appendChild(el("span", "", fmtDateTime(item.created_at_utc)));
+        row.appendChild(tHead);
+        row.appendChild(el("div", "tmsg-bubble", bizCopy(item.content || "")));
+        prefix.appendChild(row);
+      });
+    }
+  }
+
+  async function loadDetail(ticketId, opts) {
     if (!ticketId) return;
+    var silent = !!(opts && opts.silent);
     state.selectedId = ticketId;
     var items = els.queueList.querySelectorAll(".ticket-item");
     for (var i = 0; i < items.length; i += 1) {
@@ -552,9 +737,12 @@
     }
     els.detailEmpty.classList.add("hidden");
     els.detailBody.classList.remove("hidden");
-    els.detailBody.textContent = "";
-    els.suggestPanel.classList.add("hidden");
-    els.detailBody.appendChild(el("div", "panel-state", "正在加载工单详情…"));
+    var scrollTop = els.detailBody.scrollTop;
+    if (!silent) {
+      els.detailBody.textContent = "";
+      els.suggestPanel.classList.add("hidden");
+      els.detailBody.appendChild(el("div", "panel-state", "正在加载工单详情…"));
+    }
     try {
       var data = await api("/api/b/tickets/" + encodeURIComponent(ticketId));
       if (state.selectedId !== ticketId) return;
@@ -567,9 +755,15 @@
       });
       var chatTranscript = (Array.isArray(data.chat_transcript) ? data.chat_transcript : [])
         .filter(function (m) { return m && m.source === "chat" && !shownChatIds[m.id]; });
-      renderDetail(data.ticket || {}, Array.isArray(data.messages) ? data.messages : [], chatTranscript);
+      var msgs = Array.isArray(data.messages) ? data.messages : [];
+      if (silent && els.detailBody.querySelector(".transcript:not(.chat-prefix)")) {
+        refreshDetailInPlace(data.ticket || {}, msgs, chatTranscript);
+        els.detailBody.scrollTop = scrollTop;
+      } else {
+        renderDetail(data.ticket || {}, msgs, chatTranscript);
+      }
     } catch (err) {
-      if (state.selectedId !== ticketId) return;
+      if (state.selectedId !== ticketId || silent) return;
       els.detailBody.textContent = "";
       els.suggestPanel.classList.add("hidden");
       var box = el("div", "panel-state error");
@@ -583,7 +777,7 @@
     }
   }
 
-  /* ------------------ Copilot 建议回复(W7-4,MOCK 规则模板) ------------------ */
+  /* ------------------- AI 建议回复(W7-4,AI 建议话术) ------------------- */
 
   function resetSuggestion() {
     els.suggestSummary.textContent = "尚未生成建议。";
@@ -602,6 +796,25 @@
     els.suggestBtn.textContent = "生成建议";
   }
 
+  /* W14 ISS-16/18:建议必须是能直接发给买家的一句话;
+   * 去掉寒暄套话,补上订单号与诉求背景,坐席点开就能发。 */
+  function enhanceSuggestedReply(ticket, payload) {
+    var reply = String(payload.suggested_reply || payload.reply || "").trim();
+    if (!reply) return "";
+    reply = reply.replace(/^(您好|你好|亲爱的|亲)[，,、:：\s]*/, "");
+    var mentionsOrder = ticket.order_id &&
+      (reply.indexOf(shortCode(ticket.order_id)) >= 0 ||
+       reply.indexOf(String(ticket.order_id)) >= 0);
+    if (!mentionsOrder) {
+      var reason = reasonLabel(ticket);
+      var prefix = reason && reason !== "暂未标注原因"
+        ? "关于订单 " + shortCode(ticket.order_id) + " 的" + reason + "，"
+        : "关于订单 " + shortCode(ticket.order_id) + " 的售后问题，";
+      reply = prefix + "已为您跟进处理，" + reply;
+    }
+    return reply;
+  }
+
   async function suggestReply(ticket, btn) {
     btn.disabled = true;
     btn.textContent = "生成中…";
@@ -609,11 +822,12 @@
       var data = await postJSON(
         "/api/b/tickets/" + encodeURIComponent(ticket.ticket_id) + "/suggest", {});
       var payload = data.data || {};
-      els.suggestSummary.textContent = payload.summary || "未提取到摘要,请查看会话转录";
+      var summary = String(payload.summary || "").trim() || ticketSummary(ticket);
+      els.suggestSummary.textContent = bizCopy(summary);
       els.suggestSummary.classList.remove("empty-text");
-      els.suggestReply.value = payload.suggested_reply || "";
+      els.suggestReply.value = enhanceSuggestedReply(ticket, payload);
       els.fillReplyBtn.disabled = !els.suggestReply.value;
-      toast("建议已生成(MOCK 规则模板,仅供坐席参考)", "success");
+      toast("建议已生成，可直接编辑后发送", "success");
     } catch (err) {
       toast("生成建议失败:" + errorMessage(err), "error");
     } finally {
@@ -648,7 +862,7 @@
       await postJSON("/api/b/tickets/" + encodeURIComponent(ticket.ticket_id) + "/claim", {
         service_id: currentAgent()
       });
-      toast("已领取工单 #" + ticket.ticket_id, "success");
+      toast("已领取工单 " + shortCode(ticket.ticket_id), "success");
       await loadDetail(ticket.ticket_id);
       await loadQueue(true);
     } catch (err) {
@@ -699,7 +913,7 @@
         resolve(text === null ? null : text);
         return;
       }
-      if (idBox) idBox.textContent = "#" + ticket.ticket_id;
+      if (idBox) idBox.textContent = shortCode(ticket.ticket_id);
       input.value = "";
       modal.classList.remove("hidden");
       input.focus();
@@ -742,7 +956,7 @@
       await postJSON("/api/b/tickets/" + encodeURIComponent(ticket.ticket_id) + "/close", {
         service_id: currentAgent()
       });
-      toast("工单 #" + ticket.ticket_id + " 已关闭", "success");
+      toast("工单 " + shortCode(ticket.ticket_id) + " 已关闭", "success");
       await loadDetail(ticket.ticket_id);
       await loadQueue(true);
     } catch (err) {
@@ -823,15 +1037,16 @@
   }
 
   /* WS 事件触发的刷新(去抖 300ms):队列必刷;详情仅在坐席未输入时重绘 */
-  function scheduleQueueRefresh() {
+  function scheduleQueueRefresh(ticketId) {
     if (state.refreshTimer) return;
     state.refreshTimer = window.setTimeout(function () {
       state.refreshTimer = null;
       loadQueue(true);
       if (!state.selectedId) return;
-      var replyInput = els.detailBody.querySelector("#reply-input");
-      if (replyInput && replyInput.value.trim()) return; // 保护未发送草稿
-      loadDetail(state.selectedId);
+      /* W14 ISS-53:事件只静默刷新转录/徽章,不重建详情,草稿与滚动都不丢;
+       * 其他工单的事件只刷新队列,不打断当前正在处理的工单。 */
+      if (ticketId && ticketId !== state.selectedId) return;
+      loadDetail(state.selectedId, { silent: true });
     }, 300);
   }
 
@@ -844,7 +1059,7 @@
       state.wsReconnectTimer = null;
       connectWs();
     }, wait);
-    connBadge("offline", "实时已断开 · " + Math.round(wait / 1000) + "s 后重连");
+    connBadge("offline", "服务暂时离线 · 正在为您重连…");
   }
 
   function connectWs() {
@@ -856,7 +1071,7 @@
       return;
     }
     state.wsClosedByUs = false;
-    connBadge("connecting", "实时连接中…");
+    connBadge("connecting", "正在连接服务…");
     var ws;
     try {
       ws = new WebSocket(wsUrl());
@@ -879,7 +1094,7 @@
       state.wsReady = false;
       stopWsPing();
       if (state.wsClosedByUs) {
-        connBadge("offline", "实时已断开");
+        connBadge("offline", "服务已离线");
         return;
       }
       startQueuePolling(); // 降级:WS 断开时恢复队列轮询
@@ -896,7 +1111,7 @@
           window.clearTimeout(state.wsReconnectTimer);
           state.wsReconnectTimer = null;
         }
-        connBadge("online", "实时已连接");
+        connBadge("online", "服务已连接");
         startWsPing();
         stopQueuePolling();  // WS 正常 → 暂停轮询
         break;
@@ -904,7 +1119,7 @@
         break;
       case "ticket_update":
       case "ticket_status":
-        scheduleQueueRefresh();
+        scheduleQueueRefresh(msg.ticket_id);
         break;
       case "queue_new":
         toast("有新工单进入队列", "warn");
@@ -929,7 +1144,7 @@
     for (var i = 0; i < chips.length; i += 1) chips[i].classList.remove("active");
     chip.classList.add("active");
     state.statusFilter = chip.getAttribute("data-status") || "";
-    loadQueue();
+    renderQueue(); // 全量已在本地,切换筛选无需再请求
   });
 
   /* W7-4:生成建议 + 一键填入回复框(只填入不发送,坐席可编辑) */
@@ -958,8 +1173,9 @@
 
   /* --------------------- W9-3 知识库管理(/api/kb,agent) --------------------- */
 
-  var KB_STATUS_LABELS = { draft: "草稿", active: "生效", retired: "退役" };
-  var kb = { items: [], editingId: null, loaded: false };
+  var KB_STATUS_LABELS = { draft: "草稿", active: "生效", retired: "已停用" };
+  var kb = { items: [], editingId: null, loaded: false, savedSnapshot: "" };
+  var kbFilter = { q: "", filter: "all" };
   var kbEls = {
     view: document.getElementById("kbView"),
     toggle: document.getElementById("kbToggle"),
@@ -976,7 +1192,9 @@
     newBtn: document.getElementById("kbNew"),
     cancel: document.getElementById("kbCancel"),
     reloadBtn: document.getElementById("kbReload"),
-    upload: document.getElementById("kbUpload")
+    upload: document.getElementById("kbUpload"),
+    search: document.getElementById("kbSearch"),
+    filters: document.getElementById("kbFilters")
   };
 
   function kbShow() {
@@ -1007,8 +1225,7 @@
       "共 " + stats.total + " 条",
       "生效 " + (by.active || 0),
       "草稿 " + (by.draft || 0),
-      "退役 " + (by.retired || 0),
-      "已索引 " + (stats.indexed_clauses || 0) + " 条 · 向量维 " + (stats.vector_dim || 0)
+      "已停用 " + (by.retired || 0)
     ];
     parts.forEach(function (text, idx) {
       if (idx) kbEls.stats.appendChild(document.createTextNode("  ·  "));
@@ -1028,17 +1245,33 @@
     return btn;
   }
 
+  function kbFilteredItems() {
+    var q = (kbFilter.q || "").trim().toLowerCase();
+    return kb.items.filter(function (item) {
+      if (kbFilter.filter === "RP" && !/^RP-/i.test(item.clause_id || "")) return false;
+      if (kbFilter.filter === "LP" && !/^LP-/i.test(item.clause_id || "")) return false;
+      if (kbFilter.filter === "retired" && item.status !== "retired") return false;
+      if (!q) return true;
+      var hay = [item.clause_id || "", item.title || "", item.content || ""]
+        .join("\n").toLowerCase();
+      return hay.indexOf(q) >= 0;
+    });
+  }
+
   function kbRenderList() {
     if (!kbEls.list) return;
     kbEls.list.textContent = "";
-    if (!kb.items.length) {
+    var filtered = kbFilteredItems();
+    if (!filtered.length) {
       var empty = document.createElement("div");
       empty.className = "kb-empty";
-      empty.textContent = "还没有条款。可「新建条款」或「上传 MD」自动切片。";
+      empty.textContent = kb.items.length
+        ? "没有匹配的条款，换个关键词或筛选试试。"
+        : "还没有条款。可「新建条款」或「上传 MD」自动切片。";
       kbEls.list.appendChild(empty);
       return;
     }
-    kb.items.forEach(function (item) {
+    filtered.forEach(function (item) {
       var row = document.createElement("div");
       row.className = "kb-item";
       row.setAttribute("role", "listitem");
@@ -1071,9 +1304,9 @@
       if (item.status === "draft") {
         actions.appendChild(kbActionButton("启用", "activate", item, "kb-activate"));
       } else if (item.status === "active") {
-        actions.appendChild(kbActionButton("退役", "retire", item, "kb-danger"));
+        actions.appendChild(kbActionButton("停用", "retire", item, "kb-danger"));
       } else if (item.status === "retired") {
-        actions.appendChild(kbActionButton("恢复", "restore", item, "kb-activate"));
+        actions.appendChild(kbActionButton("重新启用", "restore", item, "kb-activate"));
       }
 
       row.appendChild(head);
@@ -1083,23 +1316,52 @@
     });
   }
 
-  function kbResetForm() {
+  function kbFormState() {
+    return [
+      kbEls.clauseId ? kbEls.clauseId.value : "",
+      kbEls.title ? kbEls.title.value : "",
+      kbEls.status ? kbEls.status.value : "",
+      kbEls.content ? kbEls.content.value : ""
+    ].join("\u0001");
+  }
+
+  function kbTakeSnapshot() { kb.savedSnapshot = kbFormState(); }
+
+  /* W14 ISS-38:切换条款 / 新建前,有未保存修改先确认,避免白写。 */
+  function kbConfirmDiscard() {
+    if (!kb.savedSnapshot) return true;
+    if (kbFormState() === kb.savedSnapshot) return true;
+    return window.confirm("当前条款还有未保存的修改，确定放弃吗？");
+  }
+
+  function kbResetForm(force) {
+    if (!force && !kbConfirmDiscard()) return;
     kb.editingId = null;
-    if (kbEls.editorTitle) kbEls.editorTitle.textContent = "新建条款";
+    if (kbEls.editorTitle) kbEls.editorTitle.textContent = "新建条款 · 新建模式";
     if (kbEls.form) kbEls.form.reset();
     if (kbEls.status) kbEls.status.value = "draft";
+    if (kbEls.clauseId) kbEls.clauseId.readOnly = false;
     if (kbEls.hint) kbEls.hint.textContent = "";
+    kbTakeSnapshot();
     if (kbEls.content) kbEls.content.focus();
   }
 
   function kbEditItem(item) {
+    if (!kbConfirmDiscard()) return;
     kb.editingId = item.id;
-    if (kbEls.editorTitle) kbEls.editorTitle.textContent = "编辑 " + (item.clause_id || "");
-    if (kbEls.clauseId) kbEls.clauseId.value = item.clause_id || "";
+    if (kbEls.editorTitle) kbEls.editorTitle.textContent = "编辑条款 · 编辑模式";
+    if (kbEls.clauseId) {
+      kbEls.clauseId.value = item.clause_id || "";
+      kbEls.clauseId.readOnly = true;
+    }
     if (kbEls.title) kbEls.title.value = item.title || "";
     if (kbEls.status) kbEls.status.value = item.status || "draft";
     if (kbEls.content) kbEls.content.value = item.content || "";
-    if (kbEls.hint) kbEls.hint.textContent = "当前 v" + item.version + ";改正文保存后版本自增。";
+    if (kbEls.hint) {
+      kbEls.hint.textContent = "当前 v" + item.version +
+        "；修改标题或正文后保存会自动升版，条款号保持不变。";
+    }
+    kbTakeSnapshot();
   }
 
   async function kbRefreshStats() {
@@ -1134,21 +1396,27 @@
       status: kbEls.status.value
     };
     if (!body.clause_id) { toast("条款号不能为空", "error"); return; }
+    if (!/^(RP|LP)-\d+$/i.test(body.clause_id)) {
+      if (kbEls.hint) {
+        kbEls.hint.textContent = "条款号格式：RP-数字（退货）或 LP-数字（物流），例如 RP-20。";
+      }
+      toast("条款号格式不正确", "error");
+      return;
+    }
     try {
       if (kb.editingId) {
         var path = "/api/kb/items/" + encodeURIComponent(kb.editingId);
-        delete body.clause_id;
         await api(path, {
           method: "PATCH",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
           body: JSON.stringify(body)
         });
-        toast("已保存;改正文会自增版本,点「热更新」后检索生效", "success");
+        toast("已保存，买家端已同步", "success");
       } else {
         await postJSON("/api/kb/items", body);
-        toast("已创建(默认草稿);启用后点「热更新」参与检索", "success");
+        toast("已创建为草稿，启用后参与智能回复", "success");
       }
-      kbResetForm();
+      kbResetForm(true);
       await kbLoadAll();
     } catch (err) {
       toast("保存失败:" + errorMessage(err), "error");
@@ -1160,10 +1428,10 @@
     try {
       if (action === "retire") {
         await api(path, { method: "DELETE" });
-        toast((item.clause_id || "") + " 已退役;热更新后检索不可见", "success");
+        toast((item.clause_id || "") + " 已停用，买家端立即不再命中", "success");
       } else if (action === "restore") {
         await api(path + "/restore", { method: "POST" });
-        toast((item.clause_id || "") + " 已恢复为生效", "success");
+        toast((item.clause_id || "") + " 已重新启用", "success");
       } else if (action === "activate") {
         await api(path, {
           method: "PATCH",
@@ -1182,15 +1450,11 @@
     if (kbEls.reloadBtn) kbEls.reloadBtn.disabled = true;
     try {
       var data = await postJSON("/api/kb/reload", {});
-      toast(
-        "热更新完成:生效条款 " + data.active_clauses + " 条 · 向量维 " + data.vector_dim +
-        " · BM25 top-" + data.bm25_route_top_k,
-        "success"
-      );
+      toast("已重新发布，生效条款 " + data.active_clauses + " 条，买家端立即生效", "success");
       kb.loaded = false;
       await kbLoadAll();
     } catch (err) {
-      toast("热更新失败:" + errorMessage(err), "error");
+      toast("发布失败:" + errorMessage(err), "error");
     } finally {
       if (kbEls.reloadBtn) kbEls.reloadBtn.disabled = false;
     }
@@ -1202,8 +1466,8 @@
       var text = await file.text();
       var data = await postJSON("/api/kb/upload", { filename: file.name, content: text });
       toast(
-        "已切片:新增 " + (data.created_count || 0) + " 条草稿、覆盖 " +
-        (data.updated_count || 0) + " 条;启用后热更新生效",
+        "已导入：新增 " + (data.created_count || 0) + " 条草稿、更新 " +
+        (data.updated_count || 0) + " 条，启用后参与智能回复",
         "success"
       );
       await kbLoadAll();
@@ -1223,6 +1487,23 @@
       var file = kbEls.upload.files && kbEls.upload.files[0];
       kbUploadFile(file);
       kbEls.upload.value = "";
+    });
+  }
+  if (kbEls.search) {
+    kbEls.search.addEventListener("input", function () {
+      kbFilter.q = kbEls.search.value || "";
+      kbRenderList();
+    });
+  }
+  if (kbEls.filters) {
+    kbEls.filters.addEventListener("click", function (ev) {
+      var chip = ev.target.closest ? ev.target.closest(".filter-chip") : null;
+      if (!chip) return;
+      var chips = kbEls.filters.querySelectorAll(".filter-chip");
+      for (var i = 0; i < chips.length; i += 1) chips[i].classList.remove("active");
+      chip.classList.add("active");
+      kbFilter.filter = chip.getAttribute("data-kb-filter") || "all";
+      kbRenderList();
     });
   }
   if (kbEls.list) {

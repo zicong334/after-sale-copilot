@@ -3,20 +3,28 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>售后 Copilot · 登录</title>
+  <title>安心退 · 登录</title>
   <link rel="stylesheet" href="/style.css" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23C05621'/%3E%3Ctext x='16' y='23' font-size='16' text-anchor='middle' fill='%23fff'%3E%E5%AE%A2%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23C05621'/%3E%3Cpath d='M16 6l8 3v7c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10V9z' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M12.2 15.6l2.6 2.6 5-5' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
 </head>
 <body>
-  <!-- W8 登录页:账号口令 → JWT;按 user.role 分流到 chat.html(buyer)/ agent.html(agent)。
+  <!-- W8 登录页:账号密码 → 登录后按角色进入买家聊天或客服工作台。
        本页是唯一允许在无 token 状态下访问的业务页,浅色卡片直接复用 style.css 既有视觉令牌。 -->
   <main class="login-wrap">
     <section class="login-card" aria-labelledby="loginTitle">
       <div class="login-brand">
-        <span class="brand-mark" aria-hidden="true">客</span>
+        <span class="brand-mark brand-mark-lg" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+               stroke-linejoin="round">
+            <path d="M12 2.8 20 6v7.2c0 5.1-3.4 8.7-8 9.9-4.6-1.2-8-4.8-8-9.9V6l8-3.2Z" />
+            <path d="M8.8 12.2l2.3 2.3 4.4-4.4" />
+            <path d="M18.6 3.4l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5-1.5-.6 1.5-.6.6-1.5Z" fill="currentColor" stroke="none" />
+          </svg>
+        </span>
         <div>
-          <h1 class="login-title" id="loginTitle">售后 Copilot</h1>
-          <p class="login-sub">演示环境 · 登录后按账号角色进入买家聊天或客服工作台</p>
+          <h1 class="login-title" id="loginTitle">安心退</h1>
+          <p class="login-sub">登录后，专属售后管家将为您服务</p>
         </div>
       </div>
 
@@ -27,32 +35,33 @@
         <div class="login-field">
           <label for="username">账号</label>
           <input class="login-input" id="username" name="username" type="text"
-                 autocomplete="username" maxlength="64" placeholder="如 buyer_demo"
+                 autocomplete="username" maxlength="64" placeholder="请输入账号"
                  autocapitalize="off" spellcheck="false" required />
         </div>
         <div class="login-field">
-          <label for="password">口令</label>
+          <label for="password">密码</label>
           <input class="login-input" id="password" name="password" type="password"
                  autocomplete="current-password" maxlength="256"
-                 placeholder="演示口令 demo1234" required />
+                 placeholder="请输入密码" required />
         </div>
         <p class="login-error" id="loginError" role="alert" aria-live="polite"></p>
         <button class="btn btn-primary login-submit" id="loginBtn" type="submit">登录</button>
       </form>
 
-      <div class="login-demo">
-        <div class="login-demo-title">演示账号(口令均为 demo1234,点击一键填入)</div>
+      <details class="login-demo" open>
+        <summary class="login-demo-title">快速体验通道</summary>
+        <p class="login-demo-note">无需注册，点选以下身份即可体验（统一密码 demo1234，点选后自动填入）。</p>
         <div class="login-demo-list" id="demoList">
           <button type="button" class="btn btn-ghost btn-sm login-demo-btn"
-                  data-username="buyer_demo">买家 · buyer_demo</button>
+                  data-username="buyer_demo">体验买家 · 张三</button>
           <button type="button" class="btn btn-ghost btn-sm login-demo-btn"
-                  data-username="buyer_demo2">买家 2 · buyer_demo2</button>
+                  data-username="buyer_demo2">体验买家 · 李四</button>
           <button type="button" class="btn btn-ghost btn-sm login-demo-btn"
-                  data-username="agent_demo">坐席 · agent_demo</button>
+                  data-username="agent_demo">值班坐席 · 1001</button>
           <button type="button" class="btn btn-ghost btn-sm login-demo-btn"
-                  data-username="agent_demo2">坐席 2 · agent_demo2</button>
+                  data-username="agent_demo2">值班坐席 · 1007</button>
         </div>
-      </div>
+      </details>
     </section>
   </main>
 
@@ -128,7 +137,7 @@
       var user = session.user;
       els.hint.textContent = "";
       els.hint.appendChild(document.createTextNode(
-        "当前已登录为 " + user.username + "(" + roleLabel(user) + ")· "
+        "当前已登录为 " + (user.display_name || user.username) + "（" + roleLabel(user) + "）· "
       ));
       var enter = document.createElement("a");
       enter.href = homeOf(user);
@@ -149,7 +158,7 @@
       els.hint.classList.remove("hidden");
     })();
 
-    /* 演示账号一键填入(只填,不代替点击登录) */
+    /* 体验账号一键填入(只填,不代替点击登录) */
     els.demoList.addEventListener("click", function (ev) {
       var btn = ev.target.closest ? ev.target.closest(".login-demo-btn") : null;
       if (!btn) return;
@@ -164,7 +173,7 @@
       var username = els.username.value.trim();
       var password = els.password.value;
       if (!username || !password) {
-        setError("请输入账号与口令");
+        setError("请输入账号与密码");
         (username ? els.password : els.username).focus();
         return;
       }
@@ -210,8 +219,8 @@
         });
     });
 
-    /* 演示账号都用同一口令,页面上把口令提示出来,减少试错 */
-    els.password.title = "演示账号口令:" + DEMO_PASSWORD;
+    /* 体验账号统一密码:不写在输入框 placeholder 里,避免干扰真实登录 */
+    els.password.title = "快速体验通道密码:" + DEMO_PASSWORD;
     if (!els.username.value) els.username.focus();
   })();
   </script>

@@ -1,5 +1,5 @@
 /* ==========================================================================
-   售后 Copilot · 两页共用样式(chat.html / agent.html)
+   安心退 · 两页共用样式(chat.html / agent.html)
    视觉方向:温暖 C 端客服风(任务书 W5 修正三 指定)
    设计令牌来源:docs/任务书/W5_产品修正_静默工作台视觉.md 修正三
    与 .tmp/w5_contract.md §三 —— 数值逐字照抄,不得改值、不得自创令牌。
@@ -1626,3 +1626,239 @@ textarea:focus-visible,
 .modal-tip { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--muted); }
 .modal-card textarea { width: 100%; resize: vertical; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ==========================================================================
+   W14 前端 UI/UX 体验包(品牌拟人化 / 对客业务话术 / 交互修复 / 无障碍)
+   仅精修,不改上方 :root 令牌数值与温暖 C 端视觉方向。
+   ========================================================================== */
+
+/* ---- 品牌标识:三角色 SVG 图标 + 登录页主标 ---- */
+.brand-mark svg { width: 18px; height: 18px; display: block; }
+.brand-mark-lg {
+  width: 56px;
+  height: 56px;
+  border-radius: 17px;
+  box-shadow: 0 8px 22px rgba(192, 86, 33, .26);
+}
+.brand-mark-lg svg { width: 30px; height: 30px; }
+.assure-line { color: var(--muted); font-size: 12px; }
+
+/* ---- 顶栏:状态指示器(纯文本)/ 导航胶囊 / 退出(危险色 + 图标) ---- */
+.topbar-nav { display: flex; align-items: center; gap: 6px; }
+.nav-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 0;
+  background: rgba(192, 86, 33, .08);
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background .16s, color .16s;
+}
+.nav-pill:hover { background: rgba(192, 86, 33, .16); }
+.nav-pill[aria-current="page"], .nav-pill.active { background: var(--primary); color: #fff; }
+
+.conn-badge { border: 0; font-weight: 600; }
+.conn-badge[data-state="waiting"] { background: #FEF3C7; color: #8A5A10; }
+
+.topbar-exit {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--danger);
+  text-decoration: none;
+  padding: 5px 8px;
+  border-radius: 8px;
+}
+.topbar-exit:hover { color: #9B2C2C; background: #FFF5F5; }
+.topbar-exit svg { width: 15px; height: 15px; }
+
+/* ---- 欢迎屏:双星徽章呼吸微光 ---- */
+.empty-badge {
+  width: 78px;
+  height: 78px;
+  margin: 0 auto 18px;
+  border-radius: 24px;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(120% 120% at 30% 20%, #FFF3E2, #FDE7C8);
+  color: var(--primary);
+  box-shadow: 0 6px 20px rgba(192, 86, 33, .16);
+  animation: badge-breathe 3.6s ease-in-out infinite;
+}
+@keyframes badge-breathe {
+  0%, 100% { opacity: .92; box-shadow: 0 6px 20px rgba(192, 86, 33, .14); }
+  50% { opacity: 1; box-shadow: 0 8px 26px rgba(192, 86, 33, .26); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .empty-badge { animation: none; }
+}
+
+/* ---- 我的订单快捷卡 ---- */
+.order-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 0 24px 8px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .78);
+  border: 1px solid rgba(120, 80, 40, .10);
+}
+.order-strip-title { font-size: 12px; color: var(--muted); font-weight: 600; }
+.order-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.order-chip {
+  border: 1px solid rgba(192, 86, 33, .22);
+  background: #FFFDFA;
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 4px 11px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background .16s, border-color .16s;
+}
+.order-chip:hover { background: #FFF4E8; border-color: var(--primary); }
+
+/* ---- 气泡富文本(分段 / 加粗 / ①②③) ---- */
+.bubble-line { display: block; }
+.bubble-line + .bubble-line { margin-top: 3px; }
+.bubble-item { padding-left: 2px; }
+.bubble strong { font-weight: 700; }
+.sync-note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #7A736C;
+  letter-spacing: .1px;
+}
+
+/* ---- 队列:短单号 / 截断 / 新消息 / 计数 ---- */
+.ticket-id { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ticket-summary {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.chip-count {
+  display: inline-block;
+  min-width: 17px;
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(107, 101, 96, .12);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 17px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.filter-chip.active .chip-count { background: rgba(255, 255, 255, .28); color: #fff; }
+.new-dot {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--primary);
+  white-space: nowrap;
+}
+.ticket-item.has-new { box-shadow: inset 3px 0 0 var(--primary); }
+
+/* ---- 回复区:公开 / 内部备忘选项卡 + 独立状态下拉 + 未领取锁定 ---- */
+.reply-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 999px;
+  background: rgba(120, 80, 40, .07);
+  align-self: flex-start;
+}
+.reply-tab {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 5px 13px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .16s, color .16s;
+}
+.reply-tab.active { background: var(--card); color: var(--accent); box-shadow: 0 1px 3px rgba(120, 80, 40, .14); }
+.reply-tab:disabled { opacity: .55; cursor: not-allowed; }
+
+.reply-status-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.reply-status {
+  border: 1px solid rgba(120, 80, 40, .16);
+  border-radius: 8px;
+  background: #FBF7F1;
+  color: var(--ink);
+  font-size: 12.5px;
+  padding: 4px 8px;
+}
+.reply-status:disabled { color: var(--ink); opacity: 1; cursor: default; }
+
+.reply-locked {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 26px 16px;
+  border-radius: 12px;
+  border: 1px dashed rgba(120, 80, 40, .22);
+  background: #FFFDFA;
+  color: var(--muted);
+  text-align: center;
+}
+.reply-locked .lock-icon { font-size: 20px; line-height: 1; }
+.reply-locked .lock-text { font-size: 13px; font-weight: 600; color: var(--ink); }
+
+/* ---- 知识库:搜索 + 筛选 + 编辑表单吸顶(ISS-30) ---- */
+.kb-filterbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 0 0 10px;
+}
+.kb-search {
+  flex: 1 1 240px;
+  min-width: 0;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(120, 80, 40, .16);
+  background: var(--card);
+  font-size: 13.5px;
+  outline: none;
+  transition: border-color .16s, box-shadow .16s;
+}
+.kb-search:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(192, 86, 33, .10);
+}
+.kb-editor { top: 80px; }
+
+/* ---- 工作台全屏响应式 ---- */
+/* ISS-24:工作台按 1440px 设计宽度上限居中;视口更窄时自动铺满(100%)。 */
+.workbench { max-width: 1440px; margin: 0 auto; }
+
+/* ---- 无障碍:辅助文字对比度加深 + 最小字号 12px ---- */
+.meta { font-size: 12px; color: #5F5852; }
+.meta .mock-line { color: #6B6560; }
+.kb-hint, .reply-hint, .modal-tip, .demo-note { color: #5F5852; }
+.reply-hint, .kb-hint { font-size: 12px; }
+.meta-grid .meta-item .k { font-size: 12px; color: #5F5852; }
+.ticket-time, .ticket-sub, .kb-version, .kb-item-text { color: #5F5852; }
+.ticket-time { font-size: 12px; }
+.tmsg-head span { font-size: 12px; }

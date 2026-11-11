@@ -469,7 +469,7 @@ def test_summary_hides_internal_agent_notes(client, engine):
 def test_frontend_served_without_build_tools(client):
     root = client.get("/")
     assert root.status_code == 200
-    assert "售后 Copilot" in root.text
+    assert "安心退" in root.text
     page = client.get("/chat.html")
     assert page.status_code == 200
     assert "app.js" in page.text

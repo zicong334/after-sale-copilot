@@ -1,12 +1,13 @@
-/* 售后 Copilot · 聊天页(原生 JS,零第三方依赖 零构建)
+/* 安心退 · 买家聊天页(原生 JS,零第三方依赖 零构建)
  * SSE 协议沿用 /api/c/chat/stream;W5 新增:
- * - append_ack:转人工后的轻量系统行(不是 AI 气泡)
+ * - append_ack:转人工后的留言同步微标(不是系统气泡)
  * - handoff_notice:全流程只弹一次 3.5s toast
  * - handed_off 后每 3s 轮询会话 summary,把 author_type=agent 渲染成「人工」绿气泡
  * - W5-FIX R1:会话状态**只**由本 session 的工单驱动(`/api/c/handoff/summary?session_id=`),
  *   不再按客户取最近工单;handed_off 且工单未关闭时输入框保持可用(留言追加到工单),
  *   只有本 session 的工单 closed 才禁用输入 + 提示「工单已关闭」
- * - usage.estimated===true:小字「演示估算,非真实账单」
+ * W14 前端体验包:对客文案全部业务化——短单号、中文状态、¥金额、统一时间;
+ * trace/token 用量/英文枚举只留控制台,不再出现在页面上。
  */
 (function () {
   "use strict";
@@ -143,8 +144,9 @@
     input: document.getElementById("text"),
     send: document.getElementById("send"),
     status: document.getElementById("statusBadge"),
-    trace: document.getElementById("trace"),
     toastWrap: document.getElementById("toastWrap"),
+    orderStrip: document.getElementById("orderStrip"),
+    orderChips: document.getElementById("orderChips"),
     closedHint: document.getElementById("closedHint"),
     handoffBar: document.getElementById("handoffBar"),
     connBadge: document.getElementById("connBadge"),
@@ -165,6 +167,7 @@
     pollFails: 0,
     seenHuman: Object.create(null),
     lastText: "",
+    lastUserBubble: null, // 最近一条买家气泡,用于挂「已同步至坐席」微标
     confirmCards: Object.create(null), // confirm_token → { okBtn, noBtn, countdown },供 WS 同步
     ws: null,
     wsReady: false,
@@ -191,15 +194,60 @@
     return pad(d.getHours()) + ":" + pad(d.getMinutes());
   }
 
+  /* W14 ISS-56:全站统一时间格式(月-日 时:分),不再出现 UTC 原文/多种混排。 */
   function fmtTime(iso) {
     if (!iso) return nowTime();
     var d = new Date(iso);
     if (isNaN(d.getTime())) return nowTime();
-    return pad(d.getHours()) + ":" + pad(d.getMinutes());
+    return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+      pad(d.getHours()) + ":" + pad(d.getMinutes());
   }
 
   function scrollBottom() {
     els.stream.scrollTop = els.stream.scrollHeight;
+  }
+
+  /* W14 ISS-36:仅当用户本来就贴着底部时才自动滚底,
+   * 生成过程中上翻阅读历史不会被强行拽回。 */
+  function nearBottom() {
+    var el = els.stream;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - (el.clientHeight || 0) < 120;
+  }
+
+  /* W14 ISS-07/56:业务单号只展示后 6 位短码,不把 36 位 UUID 怼到买家脸上。 */
+  function shortCode(id) {
+    var raw = String(id || "").replace(/-/g, "");
+    if (!raw) return "—";
+    return "#" + raw.slice(-6).toUpperCase();
+  }
+
+  /* 对客文案净化:后端字段里的工具名/英文枚举不直接透传给买家。 */
+  function sanitizeCopy(text) {
+    return String(text == null ? "" : text)
+      .replace(/policy_search/g, "线上自助查询")
+      .replace(/\bverified\b/g, "已核验")
+      .replace(/\bqueued\b/g, "排队中")
+      .replace(/\bactive\b/g, "生效")
+      .replace(/\bretired\b/g, "已停用");
+  }
+
+  var RECEIPT_STATUS_TEXT = {
+    queued: "排队中",
+    pending: "处理中",
+    claimed: "跟进中",
+    confirmed: "已确认",
+    approved: "已通过",
+    active: "处理中",
+    rejected: "已拒绝",
+    refunded: "已退款",
+    failed: "处理失败",
+    expired: "已超时",
+    unknown: "待确认"
+  };
+
+  function receiptStatusText(status) {
+    return RECEIPT_STATUS_TEXT[status] || "已受理";
   }
 
   function toast(message, kind) {
@@ -230,8 +278,9 @@
     }
   }
 
+  /* W14 ISS-02/23:trace 只写浏览器控制台供排查,页面 DOM 不再出现 trace 标记。 */
   function setTrace(traceId) {
-    if (traceId) els.trace.textContent = "trace: " + traceId;
+    if (traceId && window.console && console.debug) console.debug("[trace]", traceId);
   }
 
   function hideEmpty() {
@@ -240,8 +289,39 @@
 
   /* -------------------------------- 消息渲染 -------------------------------- */
 
+  /* W14 ISS-34:回复正文的轻量格式化。
+   * 只处理三类高频内容:换行分段、**加粗**、①②③ 编号条目;
+   * 全部用 DOM 文本节点拼装,绝不用 innerHTML(避免 XSS)。
+   * 纯文本(无标记/无换行)直接 textContent,保持原有渲染路径与测试稳定。 */
+  function renderRichText(bubble, raw) {
+    var text = String(raw || "");
+    if (!/[*\n①-⑳]/.test(text)) {
+      bubble.textContent = text;
+      return;
+    }
+    bubble.textContent = "";
+    var lines = text.split(/\n+/);
+    lines.forEach(function (line) {
+      var clean = line.trim();
+      if (!clean) return;
+      var isItem = /^(①|②|③|④|⑤|⑥|⑦|⑧|⑨|⑩|[-•·]\s|\d+[.、]\s)/.test(clean);
+      var row = el("div", "bubble-line" + (isItem ? " bubble-item" : ""));
+      var parts = clean.split(/(\*\*[^*]+\*\*)/g);
+      parts.forEach(function (part) {
+        if (!part) return;
+        if (part.indexOf("**") === 0 && part.lastIndexOf("**") === part.length - 2) {
+          row.appendChild(el("strong", "", part.slice(2, -2)));
+        } else {
+          row.appendChild(document.createTextNode(part));
+        }
+      });
+      bubble.appendChild(row);
+    });
+  }
+
   function addBubble(role, text, opts) {
     opts = opts || {};
+    var stick = opts.forceScroll || role === "user" || nearBottom();
     var wrap = el("div", "msg " + role);
     var meta = el("div", "msg-meta");
     var name = opts.roleName ||
@@ -249,12 +329,25 @@
     if (role === "human") meta.appendChild(el("span", "human-badge", "人工"));
     meta.appendChild(el("span", "role-name", name));
     meta.appendChild(el("span", "msg-time", opts.time || nowTime()));
-    var bubble = el("div", "bubble", text || "");
+    var bubble = el("div", "bubble");
+    renderRichText(bubble, sanitizeCopy(text));
     wrap.appendChild(meta);
     wrap.appendChild(bubble);
     els.stream.appendChild(wrap);
-    scrollBottom();
-    return { wrap: wrap, bubble: bubble, meta: meta };
+    if (stick) scrollBottom();
+    var handle = { wrap: wrap, bubble: bubble, meta: meta };
+    if (role === "user") state.lastUserBubble = handle;
+    return handle;
+  }
+
+  /* W14 ISS-08/22:转人工后追加留言只留一条气泡底部浅灰微标,不再刷大块黄色系统气泡。 */
+  function addSyncNote(anchor, text) {
+    if (!anchor) return null;
+    var note = el("div", "sync-note", text || "✓ 留言已同步至工单");
+    note.setAttribute("role", "status");
+    anchor.wrap.appendChild(note);
+    if (nearBottom()) scrollBottom();
+    return note;
   }
 
   function addSysLine(text, closed) {
@@ -305,61 +398,69 @@
 
   /* ------------------------------ 引用 [n] 条款卡 ---------------------------- */
 
+  /* W14 ISS-37:每条引用拥有独立的条款卡;点击 [n] 只展开对应一张,
+   * 其他卡自动收起,不再把所有条款混排在同一块面板里。 */
   function renderCitations(wrap, citations) {
     if (!citations.length) return;
     var bar = el("div", "citations");
-    var panel = el("div", "clause-card");
-    var refs = [];
+    var cards = [];
     citations.forEach(function (cite, idx) {
       var n = cite.index || idx + 1;
       var ref = el("button", "citation-ref", "[" + n + "]");
       ref.type = "button";
       ref.title = "查看条款 " + (cite.clause_id || "");
       ref.setAttribute("aria-label", "展开第 " + n + " 条政策条款");
+      ref.setAttribute("aria-expanded", "false");
+      var card = el("div", "clause-card");
+      card.setAttribute("data-clause", cite.clause_id || "");
+      var body = el("div", "clause-text");
+      body.appendChild(el("mark", "", cite.snippet || "(条款原文缺失)"));
+      card.appendChild(body);
+      var version = cite.version ? " · 版本 " + cite.version : "";
+      card.appendChild(el("div", "clause-meta",
+        "条款 " + (cite.clause_id || "—") + version));
       ref.addEventListener("click", function () {
         var isSame = ref.classList.contains("active");
-        refs.forEach(function (r) { r.classList.remove("active"); });
-        panel.classList.remove("open");
+        cards.forEach(function (item) {
+          item.ref.classList.remove("active");
+          item.ref.setAttribute("aria-expanded", "false");
+          item.card.classList.remove("open");
+        });
         if (isSame) return;
         ref.classList.add("active");
-        panel.textContent = "";
-        var body = el("div", "clause-text");
-        body.appendChild(el("mark", "", cite.snippet || "(条款原文缺失)"));
-        panel.appendChild(body);
-        var version = cite.version ? " · 版本 " + cite.version : "";
-        panel.appendChild(el("div", "clause-meta",
-          "条款 " + (cite.clause_id || "—") + version + " · 点击 [n] 可收起"));
-        panel.classList.add("open");
-        scrollBottom();
+        ref.setAttribute("aria-expanded", "true");
+        card.classList.add("open");
+        if (nearBottom()) scrollBottom();
       });
-      refs.push(ref);
+      cards.push({ ref: ref, card: card });
       bar.appendChild(ref);
     });
     wrap.appendChild(bar);
-    wrap.appendChild(panel);
-    scrollBottom();
+    cards.forEach(function (item) { wrap.appendChild(item.card); });
+    if (nearBottom()) scrollBottom();
   }
 
   /* ------------------------------ 确认卡(四要素) --------------------------- */
 
+  /* W14 ISS-07/35/54:确认卡按对客语言渲染,倒计时可被正确销毁/恢复。 */
   function renderConfirmCard(card) {
     var wrap = el("div", "confirm-card");
     var head = el("div", "confirm-head");
     head.appendChild(el("span", "confirm-mark", "!"));
-    head.appendChild(el("span", "", "需要你确认后才能执行"));
+    head.appendChild(el("span", "", "需要您确认后为您办理"));
     wrap.appendChild(head);
     wrap.appendChild(el("div", "confirm-sub",
-      "确认后才会有真实写操作;超时未确认视为拒绝,草稿会保留。"));
+      "确认后立即为您办理；超时未确认将自动取消，不会产生扣款或不可逆操作。"));
 
     var table = el("div", "card-table");
     [
-      ["做什么", card.what],
-      ["影响面", card.impact],
-      ["不可逆", card.irreversibility],
-      ["替代方案", card.alternatives]
+      ["处理事项", card.what],
+      ["影响范围", card.impact],
+      ["是否可撤销", sanitizeCopy(card.irreversibility)],
+      ["其他方案", sanitizeCopy(card.alternatives)]
     ].forEach(function (pair) {
       table.appendChild(el("div", "k", pair[0]));
-      table.appendChild(el("div", "v", pair[1] || "—"));
+      table.appendChild(el("div", "v", sanitizeCopy(pair[1]) || "—"));
     });
     wrap.appendChild(table);
 
@@ -372,8 +473,8 @@
     wrap.appendChild(progress);
 
     var actions = el("div", "card-actions");
-    var okBtn = el("button", "btn btn-primary", "确认执行");
-    var noBtn = el("button", "btn btn-danger-ghost", "取消");
+    var okBtn = el("button", "btn btn-primary", "确认办理");
+    var noBtn = el("button", "btn btn-ghost", "暂不办理");
     okBtn.type = "button";
     noBtn.type = "button";
     var countdown = el("div", "countdown", "");
@@ -383,41 +484,51 @@
     wrap.appendChild(actions);
 
     els.stream.appendChild(wrap);
-    scrollBottom();
+    if (nearBottom()) scrollBottom();
 
     // W8:登记确认卡,收到 WS confirm_status(含其他标签页确认)时同步最终态
-    state.confirmCards[card.confirm_token] = {
+    var entry = {
       okBtn: okBtn,
       noBtn: noBtn,
       countdown: countdown,
+      timer: null,
       stopped: false // 终态(已提交 / WS 同步)后停掉倒计时,避免覆盖最终文案
     };
+    state.confirmCards[card.confirm_token] = entry;
+
+    function stopTick() {
+      if (entry.timer) {
+        window.clearTimeout(entry.timer);
+        entry.timer = null;
+      }
+    }
 
     function tick() {
-      var entry = state.confirmCards[card.confirm_token];
-      if (entry && entry.stopped) return;
+      if (entry.stopped) return;
       if (left <= 0) {
-        countdown.textContent = "已超时 = 自动拒绝(草稿保留)";
+        countdown.textContent = "已超时 · 已自动取消（未执行任何操作）";
         bar.style.width = "0%";
         okBtn.disabled = true;
         noBtn.disabled = true;
+        stopTick();
         return;
       }
       var m = Math.floor(left / 60);
       var s = left % 60;
-      countdown.textContent = "剩余 " + m + ":" + pad(s) + " · 超时视为拒绝";
+      countdown.textContent = "剩余 " + m + ":" + pad(s) + " · 超时自动取消";
       bar.style.width = Math.max(0, (left / total) * 100).toFixed(2) + "%";
       left -= 1;
-      window.setTimeout(tick, 1000);
+      entry.timer = window.setTimeout(tick, 1000);
     }
     tick();
 
     function decide(kind) {
-      var entry = state.confirmCards[card.confirm_token];
-      if (entry) entry.stopped = true;
+      /* ISS-35:点确认/拒绝即销毁倒计时,避免它继续覆盖结果文案。 */
+      entry.stopped = true;
+      stopTick();
       okBtn.disabled = true;
       noBtn.disabled = true;
-      countdown.textContent = "已提交…";
+      countdown.textContent = "正在为您办理…";
       apiFetch("/api/c/confirm/" + encodeURIComponent(card.confirm_token) + "/" + kind, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -433,18 +544,24 @@
         .then(function (out) {
           countdown.textContent = "";
           if (out.status >= 400 || out.json.ok === false) {
-            countdown.textContent = "失败:" +
-              ((out.json.error && out.json.error.message) || out.status);
+            countdown.textContent = "暂时没能办成，请稍后再试或联系人工坐席";
+            /* ISS-54:失败不能把卡留在「已停止」的死锁里,恢复按钮与倒计时。 */
+            entry.stopped = false;
             okBtn.disabled = false;
             noBtn.disabled = false;
+            if (left > 0) tick();
             return;
           }
+          stopTick();
           renderDecision(out.json);
         })
         .catch(function (err) {
-          countdown.textContent = "失败:" + err.message;
+          countdown.textContent = "网络不稳定，请稍后再试";
+          entry.stopped = false;
           okBtn.disabled = false;
           noBtn.disabled = false;
+          if (left > 0) tick();
+          console.warn("[confirm]", err);
         });
     }
 
@@ -452,79 +569,54 @@
     noBtn.addEventListener("click", function () { decide("reject"); });
   }
 
+  /* W14 ISS-07/56:回执只讲业务结果——短码、金额、中文状态、统一时间;
+   * verified/trace 等调试字段留在后端与日志,不再出现在买家页面。 */
   function renderDecision(result) {
     var receipt = result.receipt;
     var box = el("div", "receipt");
     if (result.decision === "confirmed") {
-      var badge = el("span", "badge",
-        receipt && receipt.status === "unknown" ? "未执行" : "回执 verified");
-      box.appendChild(badge);
+      var ok = !receipt || receipt.status !== "unknown";
+      box.appendChild(el("span", "badge", ok ? "已办理" : "暂未办理"));
       var id = (receipt && (receipt.refund_request_id || receipt.ticket_id)) || "—";
-      box.appendChild(el("span", "row", "业务单号:" + id));
+      box.appendChild(el("span", "row", "业务单号 " + shortCode(id)));
       if (receipt && receipt.amount_cents !== undefined && receipt.amount_cents !== null) {
         box.appendChild(el("span", "row",
-          "金额:" + (receipt.amount_cents / 100).toFixed(2) + " 元(" +
-          receipt.amount_cents + " 分)"));
+          "退款金额 ¥" + (receipt.amount_cents / 100).toFixed(2)));
       }
       if (receipt) {
         box.appendChild(el("span", "row",
-          "状态:" + receipt.status + " · 时间:" + (receipt.occurred_at_utc || "")));
-        box.appendChild(el("span", "row",
-          "verified:" + receipt.verified + " · trace:" + (receipt.trace_id || "")));
+          "当前状态 " + receiptStatusText(receipt.status) +
+          " · 办理时间 " + fmtTime(receipt.occurred_at_utc)));
       }
     } else if (result.decision === "rejected") {
       box.classList.add("rejected");
-      box.appendChild(el("span", "badge", result.timeout ? "超时 = 拒绝" : "已拒绝"));
-      box.appendChild(el("span", "row", "未执行任何写操作;草稿已保留在确认卡。"));
+      box.appendChild(el("span", "badge", result.timeout ? "已超时自动取消" : "已取消"));
+      box.appendChild(el("span", "row", "未执行任何操作，您的订单不受影响。"));
     } else {
       box.classList.add("rejected");
-      box.appendChild(el("span", "badge", "未执行"));
-      box.appendChild(el("span", "row", "执行失败,详见回执 error 字段。"));
+      box.appendChild(el("span", "badge", "暂未办理"));
+      box.appendChild(el("span", "row", "这次没能办成，请稍后再试或联系人工坐席。"));
     }
-    if (result.reply) box.appendChild(el("span", "row", result.reply));
+    if (result.reply) box.appendChild(el("span", "row", sanitizeCopy(result.reply)));
     els.stream.appendChild(box);
-    scrollBottom();
+    if (nearBottom()) scrollBottom();
   }
 
-  /* --------------------------------- 用量 -------------------------------- */
-
-  function renderUsage(wrap, usage) {
-    if (!usage) return;
-    var parts = [];
-    if (usage.tokens_in !== undefined && usage.tokens_in !== null) {
-      parts.push("token " + usage.tokens_in + " in / " + usage.tokens_out + " out");
-    }
-    if (usage.cost_usd !== undefined && usage.cost_usd !== null) {
-      parts.push("$" + Number(usage.cost_usd).toFixed(6));
-    }
-    if (usage.latency_ms !== undefined && usage.latency_ms !== null) {
-      parts.push(usage.latency_ms + " ms");
-    }
-    if (!parts.length) return;
-    var line = el("div", "usage", parts.join(" · "));
-    if (usage.estimated === true) {
-      line.appendChild(document.createTextNode(" · "));
-      line.appendChild(el("span", "estimate-note", "演示估算,非真实账单"));
-    }
-    wrap.appendChild(line);
-    scrollBottom();
-  }
+  /* W14 ISS-02/03:token 用量/费用/耗时属于调试信息,不再展示给买家;
+   * usage 帧仍被收集进 meta(供后端指标与测试断言),只是不渲染 DOM。 */
 
   /* ---------------------------- 转人工 / 轮询闭环 --------------------------- */
 
   function markHandedOff(withToast) {
-    var first = !state.handedOff;
     state.handedOff = true;
     renderStatus();
+    if (state.wsReady) connBadge("waiting", "等待坐席接入中…");
     applyHandoffUi();
     if (withToast && !state.handoffToastShown) {
       state.handoffToastShown = true;
-      toast("已转人工:AI 已停止自动回复,坐席会尽快跟进。", "warn");
+      toast("已为您转接人工坐席，专属坐席会尽快回复。", "warn");
     }
-    if (first && !state.handoffLineShown) {
-      state.handoffLineShown = true;
-      addSysLine("已转人工,AI 已停止自动回复,坐席会尽快跟进。");
-    }
+    /* W14 ISS-08:转人工提示由顶部常驻 handoffBar 承担,不再往对话流里塞系统气泡。 */
     startPolling();
   }
 
@@ -538,7 +630,7 @@
     els.form.classList.remove("is-closed");
     els.input.disabled = false;
     els.send.disabled = state.busy;
-    els.input.placeholder = "留言将追加到人工工单…(Enter 发送,Shift+Enter 换行)";
+    els.input.placeholder = "留言将追加到人工工单…（Enter 发送，Shift+Enter 换行）";
   }
 
   function startPolling() {
@@ -588,6 +680,7 @@
           (String(msg.created_at_utc || "") + "|" + String(msg.content || ""));
         if (state.seenHuman[key]) return;
         state.seenHuman[key] = true;
+        hideEmpty(); // W14 ISS-51:渲染人工消息前先收起欢迎屏
         addBubble("human", msg.content || "", { time: fmtTime(msg.created_at_utc) });
       });
       // 只有「本会话的工单」关闭才禁用输入;同客户历史 closed 工单不再参与判断。
@@ -682,7 +775,7 @@
       state.wsReconnectTimer = null;
       connectWs();
     }, wait);
-    connBadge("offline", "实时已断开 · " + Math.round(wait / 1000) + "s 后重连");
+    connBadge("offline", "服务暂时离线 · 正在为您重连…");
   }
 
   function connectWs() {
@@ -695,7 +788,7 @@
       return;
     }
     state.wsClosedByUs = false;
-    connBadge("connecting", "实时连接中…");
+    connBadge("connecting", "正在连接服务…");
     var ws;
     try {
       ws = new WebSocket(wsUrl());
@@ -720,7 +813,7 @@
       state.wsReady = false;
       stopWsPing();
       if (state.closed || state.wsClosedByUs) {
-        connBadge("offline", "实时已断开");
+        connBadge("offline", "服务已离线");
         return;
       }
       if (state.handedOff) startPolling(); // 降级:WS 断开时恢复旧轮询
@@ -737,7 +830,9 @@
           window.clearTimeout(state.wsReconnectTimer);
           state.wsReconnectTimer = null;
         }
-        connBadge("online", "实时已连接");
+        /* W14 ISS-25/31:对客只讲业务状态,不暴露「WebSocket 已连接」这类实现细节。 */
+        if (state.handedOff) connBadge("waiting", "等待坐席接入中…");
+        else connBadge("online", "在线服务中");
         startWsPing();
         pollSummary();  // 先补一次状态,避免 ready 与首帧事件之间漏状态
         stopPolling();  // WS 正常 → 暂停轮询
@@ -790,12 +885,17 @@
     if (!msg || !msg.token) return;
     var card = state.confirmCards[msg.token];
     if (!card) return;
+    /* W14 ISS-35:外部已裁决,先销毁本地倒计时,避免 tick 还在跑。 */
     card.stopped = true;
+    if (card.timer) {
+      window.clearTimeout(card.timer);
+      card.timer = null;
+    }
     var confirmed = msg.status === "confirmed";
     card.okBtn.disabled = true;
     card.noBtn.disabled = true;
-    card.countdown.textContent = confirmed ? "已确认(实时同步)" : "已拒绝(实时同步)";
-    toast(confirmed ? "确认卡已确认" : "确认卡已拒绝", confirmed ? "success" : "warn");
+    card.countdown.textContent = confirmed ? "已为您办理" : "已取消办理";
+    toast(confirmed ? "已按您的选择办理" : "已取消本次办理", confirmed ? "success" : "warn");
   }
 
   /* --------------------------------- 输入区 ------------------------------- */
@@ -890,6 +990,9 @@
       case "confirm_request":
         removeNode(ui.loading);
         ui.loading = null;
+        /* W14 ISS-68:确认卡永远排在本轮 AI 气泡下方;先确保气泡存在,
+         * 避免「确认卡在上、AI 回复在下」的错序。 */
+        if (ui.ensureAi) ui.ensureAi();
         renderConfirmCard(data);
         break;
       case "handoff_notice":
@@ -899,7 +1002,8 @@
         removeNode(ui.loading);
         ui.loading = null;
         meta.acked = true;
-        if (data.ack) addSysLine(data.ack);
+        /* W14 ISS-08/22:只留气泡底部浅灰微标,不刷大块黄色系统气泡。 */
+        addSyncNote(state.lastUserBubble, "✓ 已同步至坐席");
         if (data.session_status && data.session_status !== "active") markHandedOff(false);
         break;
       case "usage":
@@ -908,13 +1012,13 @@
       case "done":
         meta.done = data;
         // W10:done.reply 是权威最终文案 → 覆盖 AI 气泡(完成后整卡重渲)。
-        // meta.reply 同步为最终文案,保证「本轮无自动回复」等收尾判断用的是权威文本。
+        // meta.reply 同步为最终文案,保证收尾判断用的是权威文本。
         if (typeof data.reply === "string" && data.reply.length) {
           meta.reply = data.reply;
           if (ui.ensureAi) {
             var doneAi = ui.ensureAi();
-            doneAi.bubble.textContent = data.reply;
-            scrollBottom();
+            renderRichText(doneAi.bubble, sanitizeCopy(data.reply));
+            if (nearBottom()) scrollBottom();
           }
         }
         if (data.session_id) {
@@ -932,12 +1036,9 @@
         }
         if (data.ack && !meta.acked) {
           meta.acked = true;
-          addSysLine(data.ack);
+          addSyncNote(state.lastUserBubble, "✓ 已同步至坐席");
         }
-        if (data.ai_replied === false && !meta.reply) {
-          removeNode(ui.loading);
-          ui.loading = null;
-        }
+        /* W14 ISS-68:未回复时不再渲染空壳气泡。 */
         break;
       default:
         break;
@@ -1038,8 +1139,12 @@
 
       var ai = ui.getAi();
       if (meta.citations.length && ai) renderCitations(ai.wrap, meta.citations);
-      if (meta.usage && ai) renderUsage(ai.wrap, meta.usage);
-      if (ai && !meta.reply.trim()) ai.bubble.textContent = "(本轮无自动回复)";
+      if (ai && meta.reply.trim()) {
+        renderRichText(ai.bubble, sanitizeCopy(meta.reply));
+      } else if (ai) {
+        /* 没有正文就不再留一个空气泡(ISS-68)。 */
+        removeNode(ai.wrap);
+      }
     } catch (err) {
       removeNode(ui.loading);
       ui.loading = null;
@@ -1052,6 +1157,72 @@
       els.input.disabled = state.closed;
       if (state.handedOff && !state.closed) applyHandoffUi();
       els.input.focus();
+    }
+  }
+
+  /* --------------------------- 我的订单 / 刷新恢复 --------------------------- */
+
+  var ORDER_STATUS_TEXT = {
+    created: "待付款",
+    paid: "待发货",
+    shipped: "待收货",
+    delivered: "已完成",
+    refunded: "已退款",
+    cancelled: "已取消"
+  };
+
+  function orderStatusText(status) {
+    return ORDER_STATUS_TEXT[status] || "处理中";
+  }
+
+  /* W14 ISS-41:登录后顶部给出「我的订单」快捷入口,一键带单号发起售后。 */
+  async function loadMyOrders() {
+    if (TEST_MODE || !CUSTOMER_ID || !els.orderStrip || !els.orderChips) return;
+    try {
+      var data = await apiFetch("/orders");
+      var list = Array.isArray(data) ? data : (data && data.items) || [];
+      var mine = list.filter(function (o) {
+        return o && o.customer_id === CUSTOMER_ID;
+      }).slice(0, 3);
+      if (!mine.length) {
+        els.orderStrip.classList.add("hidden");
+        return;
+      }
+      els.orderChips.textContent = "";
+      mine.forEach(function (o) {
+        var btn = el("button", "order-chip");
+        btn.type = "button";
+        btn.textContent = "订单 " + shortCode(o.id) + " · ¥" +
+          (Number(o.total_cents || 0) / 100).toFixed(2) + " · " + orderStatusText(o.status);
+        btn.addEventListener("click", function () {
+          els.input.value = "我想咨询订单 " + shortCode(o.id) + " 的售后问题";
+          autoResize();
+          els.input.focus();
+        });
+        els.orderChips.appendChild(btn);
+      });
+      els.orderStrip.classList.remove("hidden");
+    } catch (err) {
+      /* 订单列表失败不打扰买家,输入框仍可用 */
+    }
+  }
+
+  /* W14 ISS-51:刷新页面后若还有未处理的确认卡,恢复出来继续办理。 */
+  async function restorePendingConfirm() {
+    if (TEST_MODE || !state.sessionId) return;
+    try {
+      var data = await apiFetch(
+        "/api/c/confirm/pending?thread_id=" + encodeURIComponent(state.sessionId));
+      if (!data || !data.ok || !data.card || !data.confirm_token) return;
+      var card = Object.assign({}, data.card, {
+        confirm_token: data.confirm_token,
+        thread_id: data.thread_id || state.sessionId,
+        expires_in_seconds: data.expires_in_seconds
+      });
+      hideEmpty();
+      renderConfirmCard(card);
+    } catch (err) {
+      /* 没有待办确认时接口会报错,静默即可 */
     }
   }
 
@@ -1077,10 +1248,13 @@
     /* W8:恢复本买家上次的会话 id → 先跑旧轮询,再连 WS 主通道(WS 就绪后轮询自动暂停) */
     (function bootSession() {
       var saved = loadSession();
+      /* ISS-41:订单快捷卡与会话无关,首次进入也先拉取。 */
+      loadMyOrders();
       if (!saved) return;
       state.sessionId = saved;
       startPolling();
       connectWs();
+      restorePendingConfirm();
     })();
   }
 
@@ -1100,7 +1274,6 @@
       handleFrame: handleFrame,
       addBubble: addBubble,
       renderCitations: renderCitations,
-      renderUsage: renderUsage,
       state: state,
       // 以下两项是给测试用的工厂:与 sendTurn 共用同一份状态/句柄结构,避免测试与线上漂移
       createTurnMeta: createTurnMeta,

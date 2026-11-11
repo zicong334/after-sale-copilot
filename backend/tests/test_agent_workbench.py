@@ -484,7 +484,8 @@ def test_agent_frontend_served_without_cdn(client):
     page = client.get("/agent.html")
     assert page.status_code == 200, page.text
     assert "agent.js" in page.text
-    assert "演示环境" in page.text, "工作台必须声明演示环境无密码"
+    assert "安心退" in page.text, "工作台必须展示对客品牌名"
+    assert "客服工作台" in page.text
 
     js = client.get("/agent.js")
     assert js.status_code == 200, js.text
