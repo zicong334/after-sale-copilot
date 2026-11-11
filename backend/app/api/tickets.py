@@ -150,20 +150,59 @@ def add_message(
     )
 
 
-@router.get("/tickets/{ticket_id}/messages", response_model=list[TicketMessageOut])
+@router.get("/tickets/{ticket_id}/messages")
 def list_messages(
     ticket_id: str,
     db: Session = Depends(get_db),
     identity: Identity = Depends(current_identity),
-) -> list[TicketMessage]:
+) -> list[dict]:
+    """工单消息 + 转人工前聊天记录(W13-ISS-13 全量穿透)。
+
+    返回结构在 ``TicketMessageOut`` 字段基础上追加 ``source``/``author_label``:
+    ``source="chat"`` 的是转人工前的买家提问/AI 答复(前端用灰色机器人角标),
+    ``source="ticket"`` 的是转人工后的工单消息。两者合并后按时间升序。
+    """
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         raise NotFoundError(f"工单不存在: {ticket_id}")
     _assert_tenant(identity, ticket)
-    return list(
+    items: list[dict] = []
+    for row in ticket_svc.chat_prefix(db, ticket):
+        items.append(
+            {
+                "id": f"chat:{row.id}",
+                "ticket_id": ticket_id,
+                "author_type": row.role,
+                "author_label": "AI 助手" if row.role == "assistant" else "买家",
+                "content": row.content,
+                "is_internal": False,
+                "created_at": row.created_at,
+                "source": "chat",
+            }
+        )
+    rows = list(
         db.execute(
             select(TicketMessage)
             .where(TicketMessage.ticket_id == ticket_id)
             .order_by(TicketMessage.created_at)
         ).scalars()
     )
+    for row in rows:
+        items.append(
+            {
+                "id": row.id,
+                "ticket_id": row.ticket_id,
+                "author_type": row.author_type,
+                "author_label": {
+                    "user": "买家",
+                    "agent": "人工客服",
+                    "system": "系统",
+                }.get(row.author_type, row.author_type),
+                "content": row.content,
+                "is_internal": bool(row.is_internal),
+                "created_at": row.created_at,
+                "source": "ticket",
+            }
+        )
+    items.sort(key=lambda item: (item["created_at"], item["id"]))
+    return items

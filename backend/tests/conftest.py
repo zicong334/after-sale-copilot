@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app import security
+from app.cache import semantic_cache
 from app.db import create_db_engine
 from app.models import Base
 
@@ -50,7 +51,11 @@ def w8_security_defaults(monkeypatch):
     monkeypatch.setattr(security, "RATE_LIMIT_ENABLED", False)
     monkeypatch.setattr(security, "REPLAY_GUARD_ENABLED", False)
     security.reset_security_state()
+    # W13:SemanticCache 是进程级单例,chat 读路径接入后必须逐用例清空,
+    # 否则前一个用例的问答会被后一个用例命中(跨用例污染)。
+    semantic_cache.clear()
     yield
+    semantic_cache.clear()
     security.reset_security_state()
 
 

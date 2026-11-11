@@ -823,3 +823,107 @@ def strip_commitment_sentences(text: str) -> str:
     """
     kept = [part for part in split_sentences(text) if not has_commitment_claim(part)]
     return "".join(kept).strip()
+
+
+# ---------------------------------------------------------------------------
+# W13-ISS-21:对客话术脱敏(内部条款代号 / 英文状态枚举 → 客户可读中文)
+# ---------------------------------------------------------------------------
+
+#: 内部条款代号(RP-xx 退货政策 / LP-xx 物流政策),禁止出现在买家可见文本里。
+CLAUSE_CODE_RE = re.compile(r"\b(?:RP|LP)-\d{2}\b")
+
+#: 条款代号 → 客户可读标题(镜像 data/policies/*.md 的二级标题,便于审计)。
+CLAUSE_TITLES: dict[str, str] = {
+    "LP-01": "发货时效",
+    "LP-02": "包邮门槛",
+    "LP-03": "偏远地区运费",
+    "LP-04": "物流破损处理",
+    "LP-05": "修改收货地址",
+    "LP-06": "拒收与包裹退回",
+    "RP-01": "七天无理由退货",
+    "RP-02": "七天无理由退货运费承担",
+    "RP-03": "十五天质量问题退换",
+    "RP-04": "质量问题退换运费承担",
+    "RP-05": "尺码不符换货",
+    "RP-06": "退款到账时效",
+    "RP-07": "退款金额计算",
+    "RP-08": "不予退货情形(影响二次销售)",
+    "RP-09": "不予退货情形(贴身衣物与食品)",
+    "RP-10": "换货流程与时效",
+    "RP-11": "运费险与运费补贴",
+    "RP-12": "拒收与超期退回",
+}
+
+#: 订单状态英文枚举 → 对客中文标签(seed 订单状态见 models/orders.py)。
+ORDER_STATUS_LABELS: dict[str, str] = {
+    "created": "待付款",
+    "paid": "待发货",
+    "shipped": "运输中",
+    "delivered": "已签收",
+    "closed": "已关闭",
+    "refunded": "已退款",
+}
+
+
+def order_status_label(status: Any) -> str:
+    """订单状态英文枚举 → 中文标签;未知值原样返回(由 sanitize 兜底不外泄)。"""
+    raw = str(status or "").strip()
+    return ORDER_STATUS_LABELS.get(raw.lower(), raw)
+
+
+def sanitize_customer_text(
+    text: str, *, clause_titles: Mapping[str, str] | None = None
+) -> str:
+    """把买家可见文本里的内部条款代号替换为条款标题。
+
+    - ``RP-xx`` / ``LP-xx`` 一律不外泄;优先用调用方给的 ``clause_titles``
+      (来自本轮检索到的条款),缺失时回退模块内 ``CLAUSE_TITLES``,
+      再缺失则替换为"相关规定",保证任何情况下不残留代号。
+    """
+    body = str(text or "")
+    if not body:
+        return body
+    titles: dict[str, str] = dict(CLAUSE_TITLES)
+    for key, value in (clause_titles or {}).items():
+        title = str(value or "").strip()
+        if key and title:
+            titles[str(key)] = title
+
+    def _replace(match: re.Match[str]) -> str:
+        return titles.get(match.group(0), "相关规定")
+
+    return CLAUSE_CODE_RE.sub(_replace, body)
+
+
+# ---------------------------------------------------------------------------
+# W13-ISS-20:人工会话的逆向路由(买家要求 "退出人工 / 转回 AI" 时 AI 重新接管)
+# ---------------------------------------------------------------------------
+
+#: 逆向路由关键词(去空白 + 小写后做包含匹配):明确表达"结束人工、要机器人"。
+RESUME_AI_PATTERNS: tuple[str, ...] = (
+    "退出人工",
+    "结束人工",
+    "离开人工",
+    "取消人工",
+    "转回ai",
+    "回到ai",
+    "恢复ai",
+    "转ai客服",
+    "转回机器人",
+    "回到机器人",
+    "返回机器人",
+    "ai接管",
+    "让ai服务",
+)
+
+
+def is_resume_ai_request(text: str) -> bool:
+    """买家是否明确要求"退出人工、由 AI 继续服务"(ISS-20)。
+
+    只做强匹配(短语包含),避免把"人工怎么转"之类的咨询误判成退出:
+    必须同时出现"退出/结束/转回/返回"等动作 + 人工/AI/机器人目标。
+    """
+    compact = re.sub(r"\s+", "", str(text or "")).lower()
+    if not compact:
+        return False
+    return any(pattern in compact for pattern in RESUME_AI_PATTERNS)

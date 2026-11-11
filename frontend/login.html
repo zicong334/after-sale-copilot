@@ -58,14 +58,15 @@
 
   <script>
   /* W8 登录脚本(原生 JS,零依赖、零构建)
-   * - 成功:localStorage 写 sc_token / sc_user,按 user.role 跳转
+   * - 成功:按 user.role 写 sc_agent_token/user 或 sc_buyer_token/user,再跳转
    * - 失败:错误体 {"ok":false,"error":{code,message}} 取 message 展示
-   * - localStorage 键名与 app.js / agent.js 共用,禁止单独改名 */
+   * - W13 ISS-19/45:买家与客服凭证分槽;跨角色登录/退出只动本角色槽位 */
   (function () {
     "use strict";
 
-    var TOKEN_KEY = "sc_token";
-    var USER_KEY = "sc_user";
+    /* W13 ISS-19/45:按角色分槽保存,登录/退出只动本角色,不清对方凭证。 */
+    var TOKEN_KEYS = { agent: "sc_agent_token", buyer: "sc_buyer_token" };
+    var USER_KEYS = { agent: "sc_agent_user", buyer: "sc_buyer_user" };
     var DEMO_PASSWORD = "demo1234";
 
     var els = {
@@ -82,28 +83,38 @@
       els.error.textContent = message || "";
     }
 
-    function readUser() {
-      try {
-        var raw = window.localStorage.getItem(USER_KEY);
-        return raw ? JSON.parse(raw) : null;
-      } catch (err) {
-        return null;
+    function slotOf(user) {
+      return user && user.role === "agent" ? "agent" : "buyer";
+    }
+
+    /* 两槽都读(客服优先),只返回一份有效登录态 */
+    function readSession() {
+      var roles = ["agent", "buyer"];
+      for (var i = 0; i < roles.length; i += 1) {
+        var role = roles[i];
+        try {
+          var token = window.localStorage.getItem(TOKEN_KEYS[role]) || "";
+          var raw = window.localStorage.getItem(USER_KEYS[role]);
+          var user = raw ? JSON.parse(raw) : null;
+          if (token && user && user.username) return { token: token, user: user, role: role };
+        } catch (err) { /* 损坏值忽略 */ }
       }
+      return null;
     }
 
-    function readToken() {
-      try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (err) { return ""; }
-    }
-
-    function clearAuth() {
+    function clearSession(user) {
+      var role = slotOf(user);
       try {
-        window.localStorage.removeItem(TOKEN_KEY);
-        window.localStorage.removeItem(USER_KEY);
+        window.localStorage.removeItem(TOKEN_KEYS[role]);
+        window.localStorage.removeItem(USER_KEYS[role]);
       } catch (err) { /* 隐私模式忽略 */ }
     }
 
     function homeOf(user) {
-      return user && user.role === "agent" ? "/agent.html" : "/chat.html";
+      var base = user && user.role === "agent" ? "/agent.html" : "/chat.html";
+      /* W13 ISS-19:透传 merchant_id(页面身份仍以 token 为准,参数仅作可读提示)。 */
+      var merchantId = user && user.merchant_id ? String(user.merchant_id) : "";
+      return merchantId ? base + "?merchant_id=" + encodeURIComponent(merchantId) : base;
     }
 
     function roleLabel(user) {
@@ -112,9 +123,9 @@
 
     /* 已有登录态:提示可直接进入或退出换账号,不自动跳转(避免无法切换账号) */
     (function showExistingSession() {
-      var token = readToken();
-      var user = readUser();
-      if (!token || !user || !user.username) return;
+      var session = readSession();
+      if (!session) return;
+      var user = session.user;
       els.hint.textContent = "";
       els.hint.appendChild(document.createTextNode(
         "当前已登录为 " + user.username + "(" + roleLabel(user) + ")· "
@@ -130,7 +141,7 @@
       logout.className = "login-hint-link login-hint-btn";
       logout.textContent = "退出该账号";
       logout.addEventListener("click", function () {
-        clearAuth();
+        clearSession(user);
         els.hint.classList.add("hidden");
         setError("");
       });
@@ -181,8 +192,9 @@
             return;
           }
           try {
-            window.localStorage.setItem(TOKEN_KEY, data.token);
-            window.localStorage.setItem(USER_KEY, JSON.stringify(data.user || {}));
+            var role = slotOf(data.user);
+            window.localStorage.setItem(TOKEN_KEYS[role], data.token);
+            window.localStorage.setItem(USER_KEYS[role], JSON.stringify(data.user || {}));
           } catch (err) {
             setError("浏览器禁用了本地存储,无法保存登录态");
             return;

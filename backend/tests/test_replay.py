@@ -159,15 +159,15 @@ def test_replayed_nonce_409(client: TestClient):
     assert error_code(second) == "REPLAY_DETECTED"
 
 
-def test_stale_timestamp_401(client: TestClient):
-    """时间戳超出 ±5 分钟窗口 → 401 REPLAY_TIMESTAMP_INVALID。"""
+def test_stale_timestamp_400(client: TestClient):
+    """时间戳超出 ±5 分钟窗口 → 400 REPLAY_TIMESTAMP_INVALID(W13-ISS-65:时钟偏差不再返 401)。"""
     stale = int(time.time()) - (security.REPLAY_WINDOW_SECONDS + 60)
     resp = client.post(
         CLAIM_URL,
         headers={**agent_headers(client), **replay_headers(timestamp=stale)},
         json={},
     )
-    assert resp.status_code == 401, resp.text
+    assert resp.status_code == 400, resp.text
     assert error_code(resp) == "REPLAY_TIMESTAMP_INVALID"
 
 

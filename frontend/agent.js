@@ -12,8 +12,9 @@
 (function () {
   "use strict";
 
-  var TOKEN_KEY = "sc_token";
-  var USER_KEY = "sc_user";
+  /* W13 ISS-45/19:客服与买家各用独立 localStorage 槽位,跨角色打开互不删除。 */
+  var TOKEN_KEY = "sc_agent_token";
+  var USER_KEY = "sc_agent_user";
   var WS_RETRY_STEPS = [1000, 2000, 5000]; // 断线退避:1s → 2s → 5s(之后保持 5s)
   var WS_PING_MS = 25000;
   var QUEUE_POLL_MS = 5000;                // WS 断线降级时的队列轮询间隔
@@ -107,8 +108,11 @@
       var user = data && data.user;
       if (!user) return;
       if (user.id !== ME.id || user.role !== ME.role) {
-        try { window.localStorage.setItem(USER_KEY, JSON.stringify(user)); } catch (err) { /* 隐私模式忽略 */ }
-        location.reload();
+        var saved = false;
+        try { window.localStorage.setItem(USER_KEY, JSON.stringify(user)); saved = true; } catch (err) { /* 隐私模式忽略 */ }
+        /* W13 ISS-69:仅角色变化(需重新派生权限)且缓存写入成功时才刷新;
+         * 同角色仅 id/昵称变化就地沿用,不做无条件 reload。 */
+        if (saved && user.role !== ME.role) location.reload();
       }
     } catch (err) { /* 网络异常:保留缓存身份 */ }
   })();
@@ -417,6 +421,7 @@
       head.appendChild(el("span", "role-name",
         msg.author_label || (role === "agent" ? "人工客服" : role === "user" ? "买家" : "系统")));
       if (msg.is_internal) head.appendChild(el("span", "internal-badge", "内部"));
+      else if (msg.author_type === "assistant") head.appendChild(el("span", "internal-badge", "机器人"));
       head.appendChild(el("span", "", fmtDateTime(msg.created_at_utc)));
       row.appendChild(head);
       row.appendChild(el("div", "tmsg-bubble", msg.content || ""));
@@ -425,7 +430,7 @@
     return wrap;
   }
 
-  function renderDetail(ticket, messages) {
+  function renderDetail(ticket, messages, chatTranscript) {
     els.detailEmpty.classList.add("hidden");
     els.detailBody.classList.remove("hidden");
     els.detailBody.textContent = "";
@@ -465,7 +470,7 @@
     var summary = el("div", "summary-block");
     summary.appendChild(el("span", "block-label", "诉求摘要"));
     summary.appendChild(el("span", "summary-text" + (ticket.summary ? "" : " empty-text"),
-      ticket.summary || "暂无摘要(转人工时未生成)"));
+      ticket.summary || ticket.last_message || "转人工前对话见上方转录"));
     els.detailBody.appendChild(summary);
 
     var grid = el("div", "meta-grid");
@@ -481,6 +486,23 @@
     }
     els.detailBody.appendChild(grid);
 
+    if (chatTranscript && chatTranscript.length) {
+      els.detailBody.appendChild(el("div", "section-title", "转人工前 AI 问答(只读)"));
+      var chatWrap = el("div", "transcript chat-prefix");
+      chatTranscript.forEach(function (item) {
+        var role = item.author_type === "user" ? "user" : "system";
+        var row = el("div", "tmsg " + role);
+        var head = el("div", "tmsg-head");
+        head.appendChild(el("span", "role-name",
+          item.author_label || (role === "user" ? "买家" : "AI 助手")));
+        if (role !== "user") head.appendChild(el("span", "internal-badge", "机器人"));
+        head.appendChild(el("span", "", fmtDateTime(item.created_at_utc)));
+        row.appendChild(head);
+        row.appendChild(el("div", "tmsg-bubble", item.content || ""));
+        chatWrap.appendChild(row);
+      });
+      els.detailBody.appendChild(chatWrap);
+    }
     els.detailBody.appendChild(el("div", "section-title", "会话转录"));
     els.detailBody.appendChild(renderTranscript(messages));
 
@@ -537,7 +559,15 @@
       var data = await api("/api/b/tickets/" + encodeURIComponent(ticketId));
       if (state.selectedId !== ticketId) return;
       state.selectedTicket = data.ticket || null;
-      renderDetail(data.ticket || {}, Array.isArray(data.messages) ? data.messages : []);
+      /* W13 ISS-13:先渲染转人工前的 AI 问答(chat_message),再渲染工单消息;
+       * messages 里已含的 chat 条目(assistant)按 id 去重,避免同一句出现两次。 */
+      var shownChatIds = {};
+      (Array.isArray(data.messages) ? data.messages : []).forEach(function (m) {
+        if (m && m.id) shownChatIds[m.id] = true;
+      });
+      var chatTranscript = (Array.isArray(data.chat_transcript) ? data.chat_transcript : [])
+        .filter(function (m) { return m && m.source === "chat" && !shownChatIds[m.id]; });
+      renderDetail(data.ticket || {}, Array.isArray(data.messages) ? data.messages : [], chatTranscript);
     } catch (err) {
       if (state.selectedId !== ticketId) return;
       els.detailBody.textContent = "";
@@ -579,7 +609,7 @@
       var data = await postJSON(
         "/api/b/tickets/" + encodeURIComponent(ticket.ticket_id) + "/suggest", {});
       var payload = data.data || {};
-      els.suggestSummary.textContent = payload.summary || "暂无摘要";
+      els.suggestSummary.textContent = payload.summary || "未提取到摘要,请查看会话转录";
       els.suggestSummary.classList.remove("empty-text");
       els.suggestReply.value = payload.suggested_reply || "";
       els.fillReplyBtn.disabled = !els.suggestReply.value;
@@ -656,13 +686,59 @@
     }
   }
 
+  /* W13 ISS-26:关单前弹确认框并收集结单原因,替代静默 window.confirm。 */
+  function askCloseReason(ticket) {
+    return new Promise(function (resolve) {
+      var modal = document.getElementById("closeModal");
+      var input = document.getElementById("closeReason");
+      var confirmBtn = document.getElementById("closeConfirm");
+      var cancelBtn = document.getElementById("closeCancel");
+      var idBox = document.getElementById("closeTicketId");
+      if (!modal || !input || !confirmBtn || !cancelBtn) {
+        var text = window.prompt("请填写结单原因(取消则不关单)", "已为买家解决");
+        resolve(text === null ? null : text);
+        return;
+      }
+      if (idBox) idBox.textContent = "#" + ticket.ticket_id;
+      input.value = "";
+      modal.classList.remove("hidden");
+      input.focus();
+      function cleanup() {
+        modal.classList.add("hidden");
+        confirmBtn.removeEventListener("click", onOk);
+        cancelBtn.removeEventListener("click", onCancel);
+        input.removeEventListener("keydown", onKey);
+      }
+      function onOk() {
+        var value = input.value.trim();
+        if (!value) { input.focus(); return; }
+        cleanup();
+        resolve(value);
+      }
+      function onCancel() { cleanup(); resolve(null); }
+      function onKey(ev) {
+        if (ev.key === "Enter") { ev.preventDefault(); onOk(); }
+        else if (ev.key === "Escape") { onCancel(); }
+      }
+      confirmBtn.addEventListener("click", onOk);
+      cancelBtn.addEventListener("click", onCancel);
+      input.addEventListener("keydown", onKey);
+    });
+  }
+
   async function closeTicket(ticket, btn) {
-    var ok = window.confirm("确认关闭工单 #" + ticket.ticket_id + "?关闭后买家侧将停止输入。");
-    if (!ok) return;
+    var reason = await askCloseReason(ticket);
+    if (reason === null) return;
     btn.disabled = true;
     var original = btn.textContent;
     btn.textContent = "关闭中…";
     try {
+      /* 结单原因落内部备注(CloseIn 契约不变),再关单。 */
+      await postJSON("/api/b/tickets/" + encodeURIComponent(ticket.ticket_id) + "/messages", {
+        service_id: currentAgent(),
+        content: "结单原因:" + reason,
+        is_internal: true
+      });
       await postJSON("/api/b/tickets/" + encodeURIComponent(ticket.ticket_id) + "/close", {
         service_id: currentAgent()
       });
@@ -678,7 +754,7 @@
 
   /* ------------------- W8:WS 主通道 + 队列轮询降级 -------------------- */
   /*
-   * 主通道:GET /ws/agent/{service_id}?token=,服务端订阅
+   * 主通道:GET /ws/agent/{service_id},连上后首帧 auth(不把 token 拼 URL);服务端订阅
    * agent:<service_id> + queue:<merchant_id>;事件:ticket_update / queue_new
    * (ticket_status 防御性处理)。心跳 {"type":"ping"} → pong。
    * 降级:WS 正常时暂停队列轮询;onclose 后恢复轮询并 1s/2s/5s 退避重连。
@@ -694,7 +770,8 @@
   function wsUrl() {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
     return proto + "//" + location.host + "/ws/agent/" +
-      encodeURIComponent(SERVICE_ID) + "?token=" + encodeURIComponent(readToken());
+      encodeURIComponent(SERVICE_ID);
+    /* W13 ISS-67:token 不再拼进 URL(避免落入访问日志),改连上后首帧 auth。 */
   }
 
   function startWsPing() {
@@ -788,6 +865,9 @@
       return;
     }
     state.ws = ws;
+    ws.onopen = function () {
+      try { ws.send(JSON.stringify({ type: "auth", token: readToken() })); } catch (err) { /* onclose 处理 */ }
+    };
     ws.onmessage = function (ev) {
       var msg = null;
       try { msg = JSON.parse(ev.data); } catch (err) { return; }

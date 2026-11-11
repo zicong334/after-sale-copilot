@@ -149,13 +149,20 @@ def _active_refund(ctx: ToolContext, order_id: str) -> RefundRequest | None:
     ).scalars().first()
 
 
-def _policy_gate_passed(ctx: ToolContext) -> bool:
+def _policy_gate_passed(
+    ctx: ToolContext, args: dict[str, Any], order: Any
+) -> bool:
     """FIX-2 前置策略门:同一 trace 内已有 eligible=True 的 policy__check_return。
 
     ``tool_events`` 只持久化调用入参(payload["args"]),不存读工具返回结果,所以
     这里用 policy__check_return handler 的同一个纯函数 ``_check_return`` 按入参
     重算判定——与工具自身结果同源、可复核,且只读不写库。取 step 最大的一条:
     最近一次核验为准,先 eligible 后 ineligible 时以最新结论拒绝。
+
+    W13-ISS-64:核验入参必须与本轮退款诉求一致——``check_args["reason"]``
+    必须等于本次退款原因、``check_args["order_status"]`` 必须等于本次解析出的
+    订单当前状态。否则"用 A 订单/别的原因核验出的 eligible"就能给 B 订单开门,
+    策略门形同虚设(参数错配是审计里最常见的绕过手法)。
     """
     if not ctx.trace_id:
         return False
@@ -174,6 +181,20 @@ def _policy_gate_passed(ctx: ToolContext) -> bool:
     try:
         payload = json.loads(event.payload)
         check_args = payload["args"]
+        if str(check_args["reason"]) != str(args.get("reason")):
+            logger.warning(
+                "refund__create 策略门:核验原因(%s)与退款原因(%s)不一致,拒绝",
+                check_args.get("reason"),
+                args.get("reason"),
+            )
+            return False
+        if str(check_args["order_status"]) != str(getattr(order, "status", "")):
+            logger.warning(
+                "refund__create 策略门:核验订单状态(%s)与订单当前状态(%s)不一致,拒绝",
+                check_args.get("order_status"),
+                getattr(order, "status", None),
+            )
+            return False
         verdict = _check_return(
             str(check_args["order_status"]),
             str(check_args["reason"]),
@@ -193,7 +214,8 @@ def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """invoke 路径:resolve + 策略门 + 业务规则 + 确认卡四要素,不落业务数据。"""
     order = _resolve(args, ctx)
     # FIX-2:业务规则层前置策略门——无同 trace 的 eligible 核验时不出确认卡。
-    if not _policy_gate_passed(ctx):
+    # W13-ISS-64:核验必须与本单/本原因严格对应。
+    if not _policy_gate_passed(ctx, args, order):
         raise ToolExecutionError(
             CODE_BUSINESS_REJECT,
             "需先核验退货资格",

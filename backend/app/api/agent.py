@@ -38,9 +38,16 @@ from app.errors import AppError, NotFoundError, StateConflictError
 from app.guardrails import (
     handoff_reason_label,
     has_commitment_claim,
+    sanitize_customer_text,
     strip_commitment_sentences,
 )
-from app.models import KB_STATUS_ACTIVE, KnowledgeItem, Ticket, TicketMessage
+from app.models import (
+    KB_STATUS_ACTIVE,
+    ChatMessage,
+    KnowledgeItem,
+    Ticket,
+    TicketMessage,
+)
 from app.retrieval.base import RetrievedChunk
 from app.retrieval.bm25_backend import DEFAULT_THRESHOLD, BM25Backend
 from app.retrieval.chunker import PolicyChunk
@@ -68,6 +75,71 @@ _AUTHOR_LABELS: dict[str, str] = {
     "agent": "人工客服",
     "system": "系统",
 }
+
+#: W13-ISS-13:chat_message 投影到工作台转录时补的机器人标签( ticket_message
+#: 的 author_type 没有 assistant,只在转录视图里出现)。
+_CHAT_AUTHOR_LABELS: dict[str, str] = {
+    "user": "买家",
+    "assistant": "AI 助手",
+    "system": "系统",
+}
+
+
+def _chat_message_dict(
+    message: ChatMessage, *, ticket_id: str
+) -> dict[str, Any]:
+    """chat_message → 工作台转录条目(ISS-13:前序 AI 问答穿透)。"""
+    return {
+        "id": f"chat:{message.id}",
+        "ticket_id": ticket_id,
+        "author_type": str(message.role or "user"),
+        "author_label": _CHAT_AUTHOR_LABELS.get(str(message.role or ""), "AI 助手"),
+        "content": message.content,
+        "is_internal": False,
+        "created_at_utc": _iso(message.created_at),
+        "source": "chat",
+    }
+
+
+def _chat_transcript(db: Session, ticket: Ticket) -> list[dict[str, Any]]:
+    """工单会话的前序聊天记录(按 session_id 联查 chat_message,ISS-13)。
+
+    取数口径统一在 ``ticket_svc.chat_prefix``(只取工单创建前):转人工后的
+    买家留言已由 ``build_blocked_turn`` 追加进 ticket_message,再取一次会重复。
+    """
+    return [
+        _chat_message_dict(row, ticket_id=ticket.id)
+        for row in ticket_svc.chat_prefix(db, ticket)
+    ]
+
+
+def _ticket_messages(db: Session, ticket_id: str) -> list[TicketMessage]:
+    return list(
+        db.scalars(
+            select(TicketMessage)
+            .where(TicketMessage.ticket_id == ticket_id)
+            .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
+        ).all()
+    )
+
+
+def _merged_transcript(
+    db: Session, ticket: Ticket
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """合并转录:``(messages, chat_transcript)``。
+
+    - ``chat_transcript``:转人工前的完整聊天(买家 + AI),前端用灰色/机器人
+      角标单独展示;
+    - ``messages``:ticket_message 全量 + 前序 **AI 回复**(assistant 角色)。
+      不再把前序买家提问塞进 ``messages``:转人工后的买家消息已经在 ticket 里,
+      而重排前序买家消息会改变工作台既有的消息口径(回归红线)。
+    """
+    ticket_rows = _ticket_messages(db, ticket.id)
+    chat_rows = _chat_transcript(db, ticket)
+    merged = [dict(_message_dict(row), source="ticket") for row in ticket_rows]
+    merged.extend(item for item in chat_rows if item["author_type"] == "assistant")
+    merged.sort(key=lambda item: (item.get("created_at_utc") or "", item["id"]))
+    return merged, chat_rows
 
 
 class ClaimIn(BaseModel):
@@ -296,24 +368,23 @@ def ticket_detail(
     db: Session = Depends(get_db),
     identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
-    """工单详情:工单结构 + 全量消息(created_at asc);enforce 下校验租户归属。"""
+    """工单详情:工单结构 + 全量消息(created_at asc);enforce 下校验租户归属。
+
+    W13-ISS-13:按 ``ticket.session_id`` 联查 ``chat_message``,把转人工前的
+    买家提问 / AI 回复一起穿透给坐席(``chat_transcript``),完整复原案发现场。
+    """
     ident = security.effective_identity(identity, "agent")
     ticket = _scope_ticket(_get_ticket(db, ticket_id), identity, ident)
-    messages = list(
-        db.scalars(
-            select(TicketMessage)
-            .where(TicketMessage.ticket_id == ticket_id)
-            .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
-        ).all()
-    )
+    messages, chat_transcript = _merged_transcript(db, ticket)
     return {
         "ok": True,
         "ticket": _ticket_dict(
             ticket,
             message_count=len(messages),
-            last_message=(messages[-1].content if messages else None),
+            last_message=(messages[-1]["content"] if messages else None),
         ),
-        "messages": [_message_dict(message) for message in messages],
+        "messages": messages,
+        "chat_transcript": chat_transcript,
     }
 
 
@@ -573,6 +644,12 @@ def suggest_reply(
     suggested_reply = str(draft.get("suggested_reply") or "").strip()
     if has_commitment_claim(suggested_reply):
         suggested_reply = strip_commitment_sentences(suggested_reply)
+    # ISS-21:Copilot 对客话术强制剔除内部条款代号(RP-xx / LP-xx),
+    # 转成条款标题;summary 是坐席内部视图,保留条款号便于溯源。
+    suggested_reply = sanitize_customer_text(
+        suggested_reply,
+        clause_titles={chunk.clause_id: getattr(chunk, "title", "") for chunk in citations},
+    )
     suggested_reply = suggested_reply or _SUGGEST_FALLBACK_REPLY
 
     data: dict[str, Any] = {

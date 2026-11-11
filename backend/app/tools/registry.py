@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -143,8 +143,13 @@ def _write_event(
     error_code: str | None,
     payload: Any,
 ) -> ToolEvent:
-    """写一条 append-only 工具调用事件(调用方负责 commit)。"""
-    return write_event(
+    """写一条 append-only 工具调用事件(调用方负责 commit)。
+
+    W13-ISS-63:写完立刻 flush。``_next_step`` 用 ``max(step)+1`` 取号,若上一条
+    事件还停留在 Session 的身份映射里未 flush,同事务内连续两次调用会拿到
+    相同的 step(step 是审计顺序,不允许撞号)。
+    """
+    event = write_event(
         ctx.session,
         trace_id=ctx.trace_id,
         step=_next_step(ctx.session, ctx.trace_id),
@@ -153,6 +158,8 @@ def _write_event(
         error_code=error_code,
         payload=payload,
     )
+    ctx.session.flush()
+    return event
 
 
 def _invoke_impl(name: str, args: Any, ctx: ToolContext) -> ToolResult:
@@ -268,19 +275,38 @@ def invoke(name: str, args: Any, ctx: ToolContext) -> ToolResult:
     return _invoke_impl(name, args, ctx)
 
 
+def _invoke_in_worker(name: str, args: Any, ctx: ToolContext) -> ToolResult:
+    """在 ``asyncio.to_thread`` 的工作线程里执行,使用独立 Session(W13-ISS-62)。
+
+    ``Session`` 不是线程安全的:请求级 Session 属于事件循环线程,直接丢进
+    worker 线程会出现交叉事务/连接复用。这里用同一 engine(``get_bind()``,
+    不依赖进程 env)新开一个短期 Session,执行完即 close;工作线程里的提交
+    对调用方事务可见(SQLite 同库)。
+    """
+    worker_session = Session(bind=ctx.session.get_bind())
+    try:
+        worker_ctx = replace(ctx, session=worker_session)
+        return _invoke_impl(name, args, worker_ctx)
+    finally:
+        worker_session.close()
+
+
 async def ainvoke(name: str, args: Any, ctx: ToolContext) -> ToolResult:
     """统一调用入口(异步):用注册表 ``timeout_s`` 包 ``asyncio.wait_for``。
 
     超时 → ``UNKNOWN_OUTCOME``(retryable:false,先查幂等台账)。handler 是纯只读
     校验(写工具的真实落库在 ``execute``,W3 用),超时后孤儿线程只跑无副作用的
     handler,不会写出脏事件。
+
+    W13-ISS-62:线程体内不再共享 ``ctx.session``,改用 ``_invoke_in_worker``
+    在 worker 线程内自建独立 Session。
     """
     entry = _REGISTRY.get(name)
     if entry is None:
         return _invoke_impl(name, args, ctx)
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_invoke_impl, name, args, ctx),
+            asyncio.to_thread(_invoke_in_worker, name, args, ctx),
             timeout=entry.spec.timeout_s,
         )
     except asyncio.TimeoutError:

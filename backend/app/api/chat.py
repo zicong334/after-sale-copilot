@@ -43,7 +43,9 @@ from sqlalchemy.orm import Session
 
 from app import security
 from app.api import get_db
+from app.cache import semantic_cache
 from app.errors import AppError, NotFoundError
+from app.guardrails import is_resume_ai_request, sanitize_customer_text
 from app.models import ChatMessage, ChatSession, Ticket
 from app.graph import runner
 from app.llm import LLMError, build_llm
@@ -220,44 +222,75 @@ def _run_turn(
     started = time.monotonic()
     llm = None
     degraded = False
-    if session_status != "active":
+    cache_hit = False
+    resumed = False
+    if session_status != "active" and is_resume_ai_request(percept.text):
+        # W13-ISS-20:handed_off 下买家主动"退出人工/转回 AI"→ 释放工单 +
+        # 会话回 active + AI 接管,不再把这句话当留言塞进工单。
+        result = runner.build_resume_turn(
+            session=db, session_row=session_row, trace_id=trace_id, text=percept.text
+        )
+        resumed = True
+        session_status = "active"
+    elif session_status != "active":
         # 会话已被人工接手/关闭:记录一条拦截事件后停止自动回复。
         result = runner.build_blocked_turn(
             session=db, session_row=session_row, trace_id=trace_id, text=percept.text
         )
     else:
-        # W4-C:按进程环境自动选真实/Fake(本函数不读 .env;S6 由启动器注入环境,
-        # 测试环境无 LLM_API_KEY 时仍是 FakeLLM,D-05 密封不变)
-        # W7-1:只在 chat 层包一层 MaskingLLM(不改 build_llm 默认返回值),
-        # 出网消息 mask、回包 restore;编排层与工具看到的是占位符文本。
-        llm = MaskingLLM(build_llm(), masker)
-        # W7-2:SAVEPOINT 包裹本轮图执行,LLM 故障时可回滚本轮未提交写入;
-        # 工具内部会自行 commit(此后 savepoint 失效),已提交的 user 消息保留。
-        savepoint = db.begin_nested()
-        try:
-            result = runner.handle_turn(
-                session=db,
-                session_row=session_row,
-                percept_text=masked_text,
-                context=payload.context,
-                trace_id=trace_id,
-                llm=llm,
+        # W10/ISS-46+55:语义缓存读路径。写意图/订单号/PII 由 is_cacheable
+        # 挡在缓存外(lookup 内部判定),跨租户按 merchant_id 隔离;
+        # 命中则跳过图执行与 LLM 调用,但仍照常落 user/assistant 两条消息。
+        cached = semantic_cache.lookup(percept.text, merchant_id=ident.merchant_id)
+        if cached is not None:
+            cache_hit = True
+            result = runner.TurnResult(
+                intent=cached.intent or "policy_qa",
+                confidence=float(cached.confidence or 0.0),
+                intent_reason=cached.intent_reason or "语义缓存命中",
+                classification_path="semantic_cache",
+                reply=cached.reply,
+                citations=[dict(item) for item in cached.citations],
             )
-            if savepoint.is_active:
-                savepoint.commit()
-        except LLMError as exc:
-            if savepoint.is_active:
-                savepoint.rollback()
-            else:
-                db.rollback()
-            degraded = True
-            result = _degraded_result(
-                db=db,
-                trace_id=trace_id,
-                session_status=session_status,
-                error=exc,
-                model_name=str(getattr(llm, "model_name", "")),
-            )
+        else:
+            # W4-C:按进程环境自动选真实/Fake(本函数不读 .env;S6 由启动器注入环境,
+            # 测试环境无 LLM_API_KEY 时仍是 FakeLLM,D-05 密封不变)
+            # W7-1:只在 chat 层包一层 MaskingLLM(不改 build_llm 默认返回值),
+            # 出网消息 mask、回包 restore;编排层与工具看到的是占位符文本。
+            base_llm = build_llm()
+            # W13:build_llm 接 ModelRouter 时把 trace 附到路由层,故障切换可审计;
+            # FakeLLM 没有 attach_trace,保持原样。
+            attach_trace = getattr(base_llm, "attach_trace", None)
+            if callable(attach_trace):
+                attach_trace(db, trace_id)
+            llm = MaskingLLM(base_llm, masker)
+            # W7-2:SAVEPOINT 包裹本轮图执行,LLM 故障时可回滚本轮未提交写入;
+            # 工具内部会自行 commit(此后 savepoint 失效),已提交的 user 消息保留。
+            savepoint = db.begin_nested()
+            try:
+                result = runner.handle_turn(
+                    session=db,
+                    session_row=session_row,
+                    percept_text=masked_text,
+                    context=payload.context,
+                    trace_id=trace_id,
+                    llm=llm,
+                )
+                if savepoint.is_active:
+                    savepoint.commit()
+            except LLMError as exc:
+                if savepoint.is_active:
+                    savepoint.rollback()
+                else:
+                    db.rollback()
+                degraded = True
+                result = _degraded_result(
+                    db=db,
+                    trace_id=trace_id,
+                    session_status=session_status,
+                    error=exc,
+                    model_name=str(getattr(llm, "model_name", "")),
+                )
     latency_ms = int((time.monotonic() - started) * 1000)
 
     # W7-1:展示/落库前把占位符换回原文(回复可能已由 MaskingLLM 反解,幂等)。
@@ -266,6 +299,28 @@ def _run_turn(
         snippet = citation.get("snippet")
         if isinstance(snippet, str):
             citation["snippet"] = masker.restore(snippet)
+    # W13:成功的正常轮才回写语义缓存。降级话术/真静默/待确认卡/本条已是
+    # 缓存命中/转人工相关轮一律不写,避免把确定性兜底或需人工决策的上下文
+    # 当标准答案复用。
+    if (
+        not degraded
+        and not cache_hit
+        and not resumed
+        and result.ai_replied
+        and result.pending_confirm is None
+        and result.session_status == "active"
+    ):
+        semantic_cache.store(
+            percept.text,
+            {
+                "reply": result.reply,
+                "citations": result.citations,
+                "intent": result.intent,
+                "confidence": result.confidence,
+                "intent_reason": result.intent_reason,
+            },
+            merchant_id=ident.merchant_id,
+        )
     if not degraded:
         user_msg.intent = result.intent
     # W5 真静默:blocked 轮 AI 零吐字(reply=""),不落空 assistant 消息;
@@ -284,10 +339,21 @@ def _run_turn(
         )
         db.add(assistant_msg)
     # W8:本轮计量在 commit 前累加(record_token_usage 不自行 commit);
-    # blocked 轮没有 AI 生成,不计费也不写用量。
-    usage: dict[str, Any] | None = (
-        None if blocked else _usage(percept.text, result.reply, latency_ms, llm=llm)
-    )
+    # blocked 轮没有 AI 生成,不计费也不写用量;转回 AI 的固定话术同理不计费;
+    # 语义缓存命中是零 token 复用,显式给 0 而不是按字符估一笔假账。
+    if cache_hit:
+        usage: dict[str, Any] | None = {
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "cost_usd": 0.0,
+            "latency_ms": latency_ms,
+            "estimated": True,
+            "estimation": "语义缓存命中,零 token",
+        }
+    elif blocked or resumed:
+        usage = None
+    else:
+        usage = _usage(percept.text, result.reply, latency_ms, llm=llm)
     if usage is not None:
         security.record_token_usage(
             db, ident.sub, usage["tokens_in"], usage["tokens_out"]
@@ -311,6 +377,8 @@ def _run_turn(
             "ok": True,
             "session_id": session_id,
             "trace_id": trace_id,
+            # W13:本轮是否由语义缓存直接命中(命中时零 LLM 开销)。
+            "cache_hit": cache_hit,
             "truncated": percept.truncated,
             "original_length": percept.original_length,
             # W7-1:占位符 → 原文映射,供前端把回复里的占位符换回原文;无 PII 时为 {}。
@@ -476,11 +544,20 @@ def _stream_frames(
     thread = threading.Thread(target=_worker, name="chat-stream", daemon=True)
     thread.start()
 
+    # W13-ISS-21:增量帧也必须过对客话术清洗(条款代号 RP-xx/LP-xx 不得外泄)。
+    # 条款代号最长 5 字符(RP-12/LP-12),尾部留 6 字符缓冲,避免代号被切半后
+    # 正则匹配不到而漏出;收尾时把剩余缓冲一并清洗后吐出。
+    pending = ""
     while True:
         item = deltas.get()
         if item is _STREAM_DONE:
             break
-        yield _sse("delta", {"delta": str(item)})
+        pending += str(item)
+        if len(pending) > 6:
+            safe, pending = pending[:-6], pending[-6:]
+            yield _sse("delta", {"delta": sanitize_customer_text(safe)})
+    if pending:
+        yield _sse("delta", {"delta": sanitize_customer_text(pending)})
 
     error = outcome.get("error")
     if error is not None:

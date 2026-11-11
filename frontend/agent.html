@@ -143,6 +143,19 @@
     </footer>
   </div>
 
+  <!-- W13 ISS-26:关单确认弹窗;结单原因以内部备注写回工单 -->
+  <div class="modal-mask hidden" id="closeModal" role="dialog" aria-modal="true" aria-labelledby="closeModalTitle">
+    <div class="modal-card">
+      <h3 class="modal-title" id="closeModalTitle">关闭工单 <span id="closeTicketId"></span></h3>
+      <p class="modal-tip">请填写结单原因;原因会写入工单内部备注,买家不可见。</p>
+      <textarea id="closeReason" rows="3" aria-label="结单原因" placeholder="例如:已为买家办理退款,双方确认完结"></textarea>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" type="button" id="closeCancel">取消</button>
+        <button class="btn btn-danger-ghost" type="button" id="closeConfirm">确认关闭</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/agent.js"></script>
 </body>
 </html>

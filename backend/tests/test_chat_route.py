@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -151,7 +152,10 @@ def test_policy_qa_returns_real_clause_citations(client, engine):
     for citation in data["citations"]:
         assert citation["clause_id"] in known
     assert "[1]" in data["reply"]
-    assert data["citations"][0]["clause_id"] in data["reply"]
+    # W13 ISS-21:对客话术必须剔除条款代号(RP-xx/LP-xx);条款身份只保留在 citations,
+    # 原断言"clause_id 必须出现在 reply"与新验收口径冲突,按新口径改为断言相反。
+    assert data["citations"][0]["clause_id"] not in data["reply"]
+    assert not re.search(r"(?:RP|LP)-\d{2}", data["reply"])
     assert "7" in data["reply"] and "无理由" in data["reply"]
     # 禁止话术:不得承诺"随时可退/无限期"
     for phrase in ("随时可退", "无限期"):

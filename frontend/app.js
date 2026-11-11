@@ -11,8 +11,9 @@
 (function () {
   "use strict";
 
-  var TOKEN_KEY = "sc_token";
-  var USER_KEY = "sc_user";
+  /* W13 ISS-45/19:买家独立凭证槽,与客服页(sc_agent_*)互不影响。 */
+  var TOKEN_KEY = "sc_buyer_token";
+  var USER_KEY = "sc_buyer_user";
   var POLL_MS = 3000;
   var TOAST_MS = 3500;
   var WS_RETRY_STEPS = [1000, 2000, 5000]; // 断线退避:1s → 2s → 5s(之后保持 5s)
@@ -126,8 +127,10 @@
       var user = data && data.user;
       if (!user) return;
       if (user.id !== ME.id || user.role !== ME.role) {
-        try { window.localStorage.setItem(USER_KEY, JSON.stringify(user)); } catch (err) { /* 隐私模式忽略 */ }
-        location.reload();
+        var saved = false;
+        try { window.localStorage.setItem(USER_KEY, JSON.stringify(user)); saved = true; } catch (err) { /* 隐私模式忽略 */ }
+        /* W13 ISS-69:仅角色变化且写入成功才刷新,避免每次进页都无条件 reload。 */
+        if (saved && user.role !== ME.role) location.reload();
       }
     } catch (err) { /* 网络异常:保留缓存身份 */ }
   })();
@@ -618,7 +621,7 @@
 
   /* ------------------------- W8:WS 主通道(实时推送) ------------------------ */
   /*
-   * 主通道:GET /ws/buyer/{session_id}?token=(session_id 来自聊天返回/本地保存)。
+   * 主通道:GET /ws/buyer/{session_id},连上后首帧 auth(session_id 来自聊天返回/本地保存)。
    * 事件:ready / agent_message / ticket_status / confirm_status / assistant_message;
    * 心跳:客户端发 {"type":"ping"} → 服务端回 pong。
    * 降级:onclose 按 1s/2s/5s 退避重连,重连期间恢复 pollSummary 轮询。
@@ -633,7 +636,8 @@
   function wsUrl() {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
     return proto + "//" + location.host + "/ws/buyer/" +
-      encodeURIComponent(state.sessionId) + "?token=" + encodeURIComponent(readToken());
+      encodeURIComponent(state.sessionId);
+    /* W13 ISS-67:token 不拼 URL,连接建立后首帧 auth。 */
   }
 
   function startWsPing() {
@@ -702,7 +706,8 @@
     state.ws = ws;
     state.wsSession = state.sessionId;
     ws.onopen = function () {
-      // 连接建立后仍等服务端 ready 帧(先鉴权再订阅频道)
+      // W13 ISS-67:先发首帧 auth,再等服务端 ready 帧(不把 token 拼进 URL)。
+      try { ws.send(JSON.stringify({ type: "auth", token: readToken() })); } catch (err) { /* onclose 统一处理 */ }
     };
     ws.onmessage = function (ev) {
       var msg = null;

@@ -272,9 +272,9 @@ class FakeLLM(LLMClient):
             return (
                 f"已核对订单 {facts.get('order_id')}(状态:{facts.get('status')},"
                 f"实付 ¥{amount / 100:.2f})。判定:{facts.get('verdict_reason')}。"
-                f"依据条款 {citation}。"
-                f"已生成退款申请确认卡:退款金额 ¥{amount / 100:.2f}({amount} 分),"
-                f"原因「{facts.get('reason_text')}」。需要您确认后才会真正提交,请回复确认。"
+                + (f"依据条款 {citation}。" if citation else "")
+                + f"已生成退款申请确认卡:退款金额 ¥{amount / 100:.2f}({amount} 分),"
+                + f"原因「{facts.get('reason_text')}」。需要您确认后才会真正提交,请回复确认。"
             ).strip()
 
         if kind == "order_verdict_refused":
@@ -286,8 +286,9 @@ class FakeLLM(LLMClient):
             )
             return (
                 f"已核对订单 {facts.get('order_id')}(状态:{facts.get('status')})。"
-                f"判定:{facts.get('verdict_reason')}。依据条款 {citation}。"
-                "该判定下无法直接受理退款;若您对判定有异议,可以申请人工复核。"
+                f"判定:{facts.get('verdict_reason')}。"
+                + (f"依据条款 {citation}。" if citation else "")
+                + "该判定下无法直接受理退款;若您对判定有异议,可以申请人工复核。"
             ).strip()
 
         if kind == "order_not_found":

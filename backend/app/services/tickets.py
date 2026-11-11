@@ -6,12 +6,12 @@
 """
 from __future__ import annotations
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.db import utc_now
 from app.errors import NotFoundError, StateConflictError
-from app.models import Ticket, TicketMessage
+from app.models import ChatMessage, Ticket, TicketMessage
 
 _CLOSABLE = ("queued", "claimed", "waiting_customer")
 
@@ -89,3 +89,24 @@ def add_message(
     session.commit()
     session.refresh(message)
     return message
+
+
+def chat_prefix(session: Session, ticket: Ticket) -> list[ChatMessage]:
+    """工单创建前的聊天记录(W13-ISS-13 转录穿透)。
+
+    按 ``ticket.session_id`` 联查 ``chat_message``,只取 ``created_at <=
+    ticket.created_at``:转人工后的买家留言已由路由守卫追加进
+    ``ticket_message``,再取一次会重复。工单无 session_id(历史数据)时返回空。
+    """
+    if not ticket.session_id:
+        return []
+    return list(
+        session.scalars(
+            select(ChatMessage)
+            .where(
+                ChatMessage.session_id == ticket.session_id,
+                ChatMessage.created_at <= ticket.created_at,
+            )
+            .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        ).all()
+    )

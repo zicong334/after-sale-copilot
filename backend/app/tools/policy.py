@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.guardrails import order_status_label
 from app.retrieval.hybrid import get_retriever
 from app.tools.registry import ToolSpec, clean_schema, register
 from app.tools.results import ToolContext
@@ -154,14 +155,43 @@ CHECK_SPEC = ToolSpec(
 )
 
 
+#: 未发货/不可退状态 → 对客中文引导(不出现英文枚举,不硬邦邦驳回)。
+NON_REFUNDABLE_GUIDANCE: dict[str, str] = {
+    "created": (
+        "订单当前为待付款状态,尚未发货,无需申请退货退款;"
+        "如果不想买了,可直接在订单页取消订单,已支付金额将原路退回。"
+        "如已完成付款或对订单有疑问,请核对订单号后告知我。"
+    ),
+    "paid": (
+        "订单当前为待发货状态,尚未出库;如需取消,可在订单页取消并申请退款。"
+        "如已发货,请提供订单号,我帮您核对物流进度。"
+    ),
+    "shipped": (
+        "订单当前为运输中状态,请等待签收后再申请退货退款;"
+        "若商品在途破损,请按物流破损流程处理并核对订单号。"
+    ),
+    "closed": "订单已关闭,无需退货退款;如对订单有疑问,请核对订单号后告知我。",
+    "refunded": (
+        "该订单此前已退款,不支持重复申请退款;若退款未到账,请核对订单号后告知我,我帮您查询进度。"
+    ),
+}
+
+
 def _check_return(order_status: str, reason: str, days_since_delivery: int) -> dict[str, Any]:
-    """可退性判定(纯函数,规则来自 data/policies/*.md)。"""
+    """可退性判定(纯函数,规则来自 data/policies/*.md)。
+
+    W13-ISS-05:对客文案一律中文,不出现 created/delivered 等英文枚举;
+    未发货订单给"取消订单/核对订单号"的可执行引导,而不是生硬驳回。
+    """
     if order_status not in REFUNDABLE_STATUSES:
-        return {
-            "eligible": False,
-            "clause_id": "",
-            "reason": f"订单状态 {order_status} 不支持退货退款(仅已签收 delivered 可退)",
-        }
+        guidance = NON_REFUNDABLE_GUIDANCE.get(str(order_status or "").strip().lower())
+        if guidance is None:
+            label = order_status_label(order_status) or "未知"
+            guidance = (
+                f"订单当前状态为{label},暂不支持退货退款;"
+                "请核对订单号是否正确,如需帮助可申请人工客服。"
+            )
+        return {"eligible": False, "clause_id": "", "reason": guidance}
     rule = RETURN_RULES.get(reason)
     if rule is None:
         return {"eligible": False, "clause_id": "", "reason": f"不支持的原因类型:{reason}"}
@@ -169,12 +199,12 @@ def _check_return(order_status: str, reason: str, days_since_delivery: int) -> d
         return {
             "eligible": False,
             "clause_id": OVERDUE_CLAUSE_ID,
-            "reason": f"已超 {rule['max_days']} 天期限,原则上不予受理(RP-12 拒收与超期退回)",
+            "reason": f"已超 {rule['max_days']} 天期限,原则上不予受理",
         }
     return {
         "eligible": True,
         "clause_id": rule["clause_id"],
-        "reason": f"符合{reason}政策(条款 {rule['clause_id']})",
+        "reason": f"符合{reason}政策,可按流程为您办理",
     }
 
 

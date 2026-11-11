@@ -33,6 +33,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "backend"
+
+
+def _rel_path(path: str | Path | None) -> str | None:
+    """报告里的路径一律相对 ROOT(W13-ISS-70)。
+
+    绝对路径会把作者机器的目录结构写进评测报告,换机器就失效、也无法在
+    CI 里做 golden 对比。ROOT 之外的路径用 ``os.path.relpath`` 兜底(仍能
+    用,但不会被误认为项目内文件)。
+    """
+    if path is None:
+        return None
+    candidate = Path(path)
+    try:
+        return candidate.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return Path(os.path.relpath(candidate, ROOT)).as_posix()
+
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
@@ -391,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     meta: dict = {
-        "cases_file": str(cases_path),
+        "cases_file": _rel_path(cases_path),
         "eval_set_version": version.get("eval_set_version"),
         "rubric_version": rubric_version,
         "repeat": repeat,
@@ -440,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "judge_fallback_count": judge_fallback_count,
                 "judge_same_source_risk": True,
-                "capture": str(capture_path) if capture_path else None,
+                "capture": _rel_path(capture_path),
             }
         )
 

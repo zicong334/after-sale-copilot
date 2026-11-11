@@ -306,17 +306,28 @@ def _order_summary(order: dict[str, Any] | None) -> dict[str, Any] | None:
 def _handoff_summary(
     *, reason: str, order: dict[str, Any] | None, text: str, context: dict[str, Any]
 ) -> str:
-    parts = [f"转接原因:{reason}"]
+    """转人工摘要(ISS-14):规则提取买家诉求 + 订单 + 涉诉原因,保证永不空。
+
+    只做本地规则提取(不额外调用 LLM,避免转人工再烧一次钱):
+    1. 买家诉求 = 本轮进线文本(压缩空白后截断),空则回退会话上下文里的订单诉求;
+    2. 转接原因 = 中文标签(不把内部枚举甩给坐席);
+    3. 订单号 + 中文状态 + 实付金额(有订单时);
+    4. 已连续 N 轮未解决(context 提供时)。
+    """
+    demand = re.sub(r"\s+", " ", str(text or "")).strip()[:120]
+    if not demand:
+        demand = "买家未提供具体描述(转人工前无有效文本)"
+    parts = [f"买家诉求:{demand}", f"转接原因:{_friendly_reason(reason)}"]
     if order:
         parts.append(
-            f"订单 {order.get('order_id')} 状态 {order.get('status')},"
+            f"涉诉订单 {order.get('order_id')} 状态 "
+            f"{guardrails.order_status_label(order.get('status'))},"
             f"实付 {order.get('total_cents')} 分"
         )
     rounds = context.get("unresolved_rounds")
     if rounds:
         parts.append(f"已连续 {rounds} 轮未解决")
-    parts.append(f"客户原话:{text[:120]}")
-    return ";".join(parts)
+    return ";".join(parts)[:500]
 
 
 def _call_record(name: str, result: Any, note: str | None = None) -> dict[str, Any]:
@@ -1197,6 +1208,17 @@ def make_nodes(
                 out = {"draft": draft, "confirm": {**confirm, "replied": True}}
             else:
                 out = {"draft": draft}
+        # W13-ISS-21:买家可见文本统一脱敏——内部条款代号 RP-xx/LP-xx 一律换成条款标题。
+        # 放在所有确定性守卫之后,保证追加的条款原文同样不泄漏内部代号。
+        if isinstance(out.get("draft"), str):
+            titles = {
+                str(item.get("clause_id")): str(item.get("title") or "")
+                for item in (state.get("retrieved") or [])
+                if item.get("clause_id")
+            }
+            out["draft"] = guardrails.sanitize_customer_text(
+                out["draft"], clause_titles=titles
+            )
         # 任务结束(图终态)才抽取偏好写记忆;act 自环/待确认挂起轮一律不写
         if not (confirm and not confirm.get("decided")):
             guard = _text_guard(text_of(state), dict(state.get("context") or {}))
@@ -1244,7 +1266,7 @@ def make_nodes(
             return _render({
                 "kind": "order_verdict_eligible",
                 "order_id": verdict.get("order_id"),
-                "status": verdict.get("status"),
+                "status": guardrails.order_status_label(verdict.get("status")),
                 "amount_cents": verdict.get("amount_cents"),
                 "reason_text": verdict.get("reason_text"),
                 "verdict_reason": verdict.get("verdict_reason"),
@@ -1254,7 +1276,7 @@ def make_nodes(
             return _render({
                 "kind": "order_verdict_refused",
                 "order_id": verdict.get("order_id"),
-                "status": verdict.get("status"),
+                "status": guardrails.order_status_label(verdict.get("status")),
                 "verdict_reason": verdict.get("verdict_reason"),
                 "clause": clause,
             }, state)
@@ -1271,7 +1293,8 @@ def make_nodes(
         if kind == "order_checked":
             order = dict(verdict.get("order") or {})
             return (
-                f"已核验订单 {order.get('order_id')},当前状态:{order.get('status')}。"
+                f"已核验订单 {order.get('order_id')},当前状态:"
+                f"{guardrails.order_status_label(order.get('status'))}。"
                 "如需办理退换货,请说明具体诉求。"
             )
         # FIX-7:偏好/记忆场景也把注入的记忆交给回复层,确保引用来源可追溯。

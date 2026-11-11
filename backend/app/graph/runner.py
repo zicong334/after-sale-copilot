@@ -42,6 +42,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
+from app.errors import StateConflictError
 from app.graph.build import RECURSION_LIMIT, build_graph, open_checkpointer
 from app.graph.state import initial_state
 from app.llm import (
@@ -54,7 +55,12 @@ from app.llm import (
 from app.models import ChatMessage, ChatSession, Ticket
 from app.perception import Percept, normalize
 from app.services import tickets as ticket_service
-from app.trace import EVENT_ROUTE_BLOCKED, new_trace_id, record_event
+from app.trace import (
+    EVENT_ROUTE_BLOCKED,
+    EVENT_SESSION_STATUS,
+    new_trace_id,
+    record_event,
+)
 
 #: 四类意图(仅用于兜底校验;分类结果由 classify 节点给出)。
 _INTENTS = (INTENT_POLICY_QA, INTENT_ORDER_JUDGE, INTENT_HANDOFF, INTENT_OTHER)
@@ -336,24 +342,34 @@ def handle_turn(
 def _latest_open_ticket(session: Session, session_row: ChatSession) -> Ticket | None:
     """定位该会话对应的最近一个未关闭工单。
 
-    Ticket 无 session_id 列(W1-A 冻结),只能按 merchant_id + customer_id 关联;
-    "最近"= last_msg_at 降序(NULL 排最后),同值再按 created_at 降序。
+    W13-ISS-20 起优先按 ``ticket.session_id`` 精确匹配(W5-FIX R1 起 handoff 建单
+    会写当前 thread_id),避免同一买家多会话时误把别的会话的工单释放/追加;
+    匹配不到再回退到历史口径(merchant_id + customer_id,且 session_id 为空的
+    0005 前老工单)。"最近"= last_msg_at 降序(NULL 排最后),同值再按 created_at
+    降序。
     """
-    return session.scalars(
-        select(Ticket)
-        .where(
-            Ticket.merchant_id == session_row.merchant_id,
-            Ticket.customer_id == session_row.customer_id,
-            Ticket.status != "closed",
-        )
-        .order_by(
-            # 非 NULL 优先(兼容不支持 "NULLS LAST" 的方言)
-            Ticket.last_msg_at.is_(None),
-            Ticket.last_msg_at.desc(),
-            Ticket.created_at.desc(),
-        )
-        .limit(1)
-    ).first()
+
+    def _query(*criteria: Any) -> Ticket | None:
+        return session.scalars(
+            select(Ticket)
+            .where(*criteria, Ticket.status != "closed")
+            .order_by(
+                # 非 NULL 优先(兼容不支持 "NULLS LAST" 的方言)
+                Ticket.last_msg_at.is_(None),
+                Ticket.last_msg_at.desc(),
+                Ticket.created_at.desc(),
+            )
+            .limit(1)
+        ).first()
+
+    ticket = _query(Ticket.session_id == session_row.id)
+    if ticket is not None:
+        return ticket
+    return _query(
+        Ticket.merchant_id == session_row.merchant_id,
+        Ticket.customer_id == session_row.customer_id,
+        Ticket.session_id.is_(None),
+    )
 
 
 def build_blocked_turn(
@@ -397,6 +413,79 @@ def build_blocked_turn(
         tool_calls=[],
         session_status=str(session_row.status or "active"),
         ai_replied=False,
+        ack=ack,
+        ack_ticket_id=ack_ticket_id,
+    )
+
+
+#: 买家主动转回 AI 时的固定话术(W13-ISS-20)。
+RESUME_AI_REPLY = "好的,已结束人工服务,由我继续为您服务。您的问题可以直接告诉我。"
+
+
+def build_resume_turn(
+    *,
+    session: Session,
+    session_row: ChatSession,
+    trace_id: str,
+    text: str,
+) -> TurnResult:
+    """会话 handed_off 时买家主动要求"转回 AI"的逆向路由(W13-ISS-20)。
+
+    验收要求:买家输入"退出人工/转回 AI/结束人工"等关键词时,必须
+    「工单释放/取消 + 会话回 active + AI 接管」,而不是继续静默留言。
+
+    实现口径:
+    * 工单不改状态机枚举(``ticket.status`` 的 CHECK 只有 queued/claimed/
+      waiting_customer/closed,加 cancelled 需重建表,风险大于收益),用既有
+      ``close()`` 完成"释放"语义;释放前先追加一条 internal 的 system 消息,
+      保留"为什么关单"的审计痕迹。
+    * 会话状态回写 ``active`` 并记一条 ``session__status_change`` 事件,
+      事件载荷只放状态与原因,不放买家原文(隐私红线)。
+    * 不跑图、不调工具:本轮回一句固定话术,下一轮起恢复正常路由。
+    """
+    ticket = _latest_open_ticket(session, session_row)
+    ack = RESUME_AI_REPLY
+    ack_ticket_id: str | None = None
+    if ticket is not None:
+        ack_ticket_id = ticket.id
+        try:
+            ticket_service.add_message(
+                session,
+                ticket.id,
+                "system",
+                "买家要求转回 AI 客服,工单已释放,由 AI 继续服务。",
+                is_internal=True,
+            )
+            ticket_service.close(session, ticket.id)
+            ack = f"好的,已结束人工服务,工单 #{ticket.id} 已关闭,由我继续为您服务。"
+        except StateConflictError:
+            # 并发场景:坐席刚好关单/状态已变,释放失败不影响"回 active"。
+            session.rollback()
+            ack = RESUME_AI_REPLY
+    session_row.status = "active"
+    record_event(
+        session,
+        trace_id=trace_id,
+        event=EVENT_SESSION_STATUS,
+        payload={
+            "from": "handed_off",
+            "to": "active",
+            "reason": "buyer_resume_ai",
+            "ticket_id": ack_ticket_id,
+        },
+    )
+    session.flush()
+    return TurnResult(
+        intent="handoff_resume",
+        confidence=1.0,
+        intent_reason="买家主动要求转回 AI 客服",
+        classification_path="route_resume",
+        reply=RESUME_AI_REPLY,
+        citations=[],
+        pending_confirm=None,
+        tool_calls=[],
+        session_status="active",
+        ai_replied=True,
         ack=ack,
         ack_ticket_id=ack_ticket_id,
     )

@@ -415,7 +415,8 @@ def test_a2_refunded_order_refund_is_hard_rejected(db):
     )
     assert verdict.ok is True
     assert verdict.data["eligible"] is False
-    assert "refunded" in verdict.data["reason"]
+    assert "refunded" not in verdict.data["reason"]
+    assert "已退款" in verdict.data["reason"]
 
     blocked = invoke(
         "refund__create",
@@ -441,7 +442,8 @@ def test_a2_graph_reply_does_not_claim_refund_again(db, ckpt):
 
     assert result.intent == "order_judge"
     assert result.pending_confirm is None, "不可退订单不得生成确认卡"
-    assert "不支持" in result.reply, result.reply
+    # W13-ISS-05:对客文案改中文引导,拒绝语义由「不支持/无法办理」表达。
+    assert ("不支持" in result.reply) or ("无法" in result.reply), result.reply
     assert "已为您退款" not in result.reply
     assert "已为您再次退款" not in result.reply
     assert [c["name"] for c in result.tool_calls].count("refund__create") == 0
