@@ -87,22 +87,28 @@ INJECTION_RULES: tuple[tuple[str, str, re.Pattern[str], bool], ...] = (
         True,
     ),
     (
+        # ISS-61:只有"分隔符/反引号后紧跟高危系统命令词"才算命令注入;
+        # 普通反引号(如 `seed-order-020`)与普通 `&&` 不再一律硬拦截。
         "command",
         "命令拼接",
         re.compile(
-            r"(?is)(&&|\|\||;\s*(?:rm|curl|wget|powershell|pwsh|cmd|bash|sh)\b|"
-            r"\$\(|`[^`]{1,120}`|rm\s+-rf\b)"
+            r"(?is)(?:;|&&|\|\||\$\(|`)\s*"
+            r"(?:rm|curl|wget|powershell|pwsh|cmd|bash|sh|zsh|del|copy|move|"
+            r"chmod|chown|mkdir|rmdir|netstat|taskkill|whoami|ipconfig|ifconfig|"
+            r"ping|nc|ssh|scp|shutdown|reboot|format|diskpart|eval|exec)\b"
+            r"|rm\s+-rf\b"
         ),
         True,
     ),
     (
+        # ISS-61:金额参数只在"同时出现工具名/工具调用痕迹"时才算伪造调用。
         "tool_injection",
         "伪造工具调用",
         re.compile(
             r"(?is)(调用\s*[A-Za-z_]\w*__\w+\s*工具|"
             r"tool_call|function_call|"
             r"<\|?tool\|?>|"
-            r"amount_cents\s*=\s*\d+)"
+            r"[A-Za-z_]\w*__\w+[^\n]{0,40}?amount_cents\s*=\s*\d+)"
         ),
         True,
     ),
@@ -739,13 +745,19 @@ PII_PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
 
 #: 地址启发式:省/市/区县 + 街道门牌等后缀。只要求"像收货地址"即可,
 #: 单说"杭州市西湖区"(无街道门牌)不算,避免把政策问答里的地名也涂掉。
+#:
+#: ISS-50:街道/路名可以连续出现(如"五常街道文一西路"),但**门牌后缀只收
+#: 数字 + 号/室/栋/座/单元/层/楼**,不再无标点地继续向后吞中文动词短语
+#: (旧版尾部 `[\u4e00-\u9fa5A-Za-z0-9 \-]{0,20}` 会把"帮我改一下"一起涂掉)。
 PII_ADDRESS_RE = re.compile(
     r"(?:[\u4e00-\u9fa5]{2,8}(?:省|自治区|特别行政区))?"
     r"[\u4e00-\u9fa5]{2,10}(?:市|自治州|地区)"
     r"[\u4e00-\u9fa5]{2,10}(?:区|县|市|旗)"
-    r"[\u4e00-\u9fa5A-Za-z0-9 \-]{2,30}?"
-    r"(?:路|街|道|巷|弄|村|小区|花园|苑|大厦|号楼|号院)"
-    r"[\u4e00-\u9fa5A-Za-z0-9 \-]{0,20}"
+    r"(?:[\u4e00-\u9fa5A-Za-z0-9 \-]{0,30}?"
+    r"(?:路|街|道|巷|弄|村|小区|花园|苑|大厦|号楼|号院))+"
+    r"(?:\d+(?:\s*[-－]\s*\d+)?"
+    r"(?:\s*(?:号|室|栋|座|单元|层|楼|门))*"
+    r"(?:\s*\d+\s*(?:单元|室|楼|层))*)?"
 )
 
 #: (占位前缀, 正则) —— 顺序即替换顺序;占位符形如 [PHONE_1]。

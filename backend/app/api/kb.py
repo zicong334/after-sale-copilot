@@ -63,9 +63,15 @@ KBStatus = Literal["draft", "active", "retired"]
 # 鉴权依赖
 # ---------------------------------------------------------------------------
 def require_agent(request: Request) -> security.Identity:
-    """校验 agent 身份;401/403 错误体与 W8 中间件一致。"""
+    """校验 agent 身份;401/403 错误体与 W8 中间件一致。
+
+    W13 ISS-60:/api/kb/* 已纳入中间件的白名单式强制鉴权(见
+    ``security.ROLE_PREFIXES``),正常链路直接读 ``request.state.identity``。
+    但 ``AUTH_MODE=internal``(回归脚本 / 本机联调)下中间件写入的是 internal
+    身份,此时退回自行解析 Bearer,保持既有 internal 形态"按 token 判角色"的行为。
+    """
     identity = getattr(request.state, "identity", None)
-    if identity is None:
+    if identity is None or identity.is_internal:
         token = security.bearer_token(request.headers.get("authorization"))
         if token is None:
             raise AppError(

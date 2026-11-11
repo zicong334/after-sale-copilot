@@ -25,6 +25,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -82,6 +83,9 @@ TENANT_BURST = 50
 REPLAY_WINDOW_SECONDS = 300
 REPLAY_NONCE_MIN_LEN = 8
 REPLAY_NONCE_MAX_LEN = 128
+#: 过期 nonce 行的清理抽样频率(W13 ISS-65):每 N 次写请求清一次,不再每次全表 DELETE。
+NONCE_CLEANUP_EVERY = 20
+_nonce_cleanup_counter = itertools.count()
 #: 日 token 配额(chat 轮次;tokens_in + tokens_out 聚合)。
 DAILY_TOKEN_QUOTA = 200_000
 
@@ -469,7 +473,9 @@ def require_replay_guard(
     """写接口防重放依赖(confirm/reject/claim/close/reply 五个写接口挂载)。
 
     - 缺头 → 400 ``REPLAY_HEADER_REQUIRED``
-    - 时间戳非整数 / 超出 ±5 分钟窗口 → 401 ``REPLAY_TIMESTAMP_INVALID``
+    - 时间戳非整数 / 超出 ±5 分钟窗口 → 400 ``REPLAY_TIMESTAMP_INVALID``
+      (W13 ISS-65:旧实现返 401,前端 ``apiFetch`` 见 401 就把用户踢回登录页;
+      时钟偏差属于客户端问题,应返 4xx 而非"未认证")
     - 同 (subject, nonce) 二次出现 → 409 ``REPLAY_DETECTED``(DB UNIQUE 兜并发)
     - nonce 长度非法 → 400
     """
@@ -486,21 +492,24 @@ def require_replay_guard(
     try:
         timestamp = int(str(x_timestamp).strip())
     except (TypeError, ValueError):
-        raise _replay_error(401, "REPLAY_TIMESTAMP_INVALID", "X-Timestamp 必须是 Unix 秒整数") from None
+        raise _replay_error(400, "REPLAY_TIMESTAMP_INVALID", "X-Timestamp 必须是 Unix 秒整数") from None
     now = utc_now()
     now_ts = int(now.timestamp())
     if abs(now_ts - timestamp) > REPLAY_WINDOW_SECONDS:
         raise _replay_error(
-            401, "REPLAY_TIMESTAMP_INVALID", "X-Timestamp 超出允许的时间窗口(±5 分钟)"
+            400, "REPLAY_TIMESTAMP_INVALID", "X-Timestamp 超出允许的时间窗口(±5 分钟)"
         )
 
     identity = getattr(request.state, "identity", None)
     subject = identity.sub if identity is not None else "anonymous"
 
-    # TTL 清理:窗口之外的老 nonce 行每次写入时顺手清掉(本机 SQLite,成本可忽略)。
-    cutoff = now - timedelta(seconds=REPLAY_WINDOW_SECONDS * 2)
-    db.execute(delete(RequestNonce).where(RequestNonce.created_at < cutoff))
-    db.flush()
+    # TTL 清理:低频抽样(W13 ISS-65)。旧实现每个写请求都全表 DELETE,
+    # 写请求密集时把整张 request_nonce 表扫一遍;现改为每 NONCE_CLEANUP_EVERY
+    # 次写请求抽样清一次,窗口外的老行最多多留 NONCE_CLEANUP_EVERY 次写请求。
+    if next(_nonce_cleanup_counter) % NONCE_CLEANUP_EVERY == 0:
+        cutoff = now - timedelta(seconds=REPLAY_WINDOW_SECONDS * 2)
+        db.execute(delete(RequestNonce).where(RequestNonce.created_at < cutoff))
+        db.flush()
 
     db.add(RequestNonce(subject=subject, nonce=x_nonce, ts=timestamp))
     try:
@@ -634,15 +643,49 @@ PUBLIC_PATHS = (
 PUBLIC_PREFIXES = ("/ws/",)
 #: 只需要"任意合法身份"的路径(如 /auth/me:登录态校验,不区分角色)。
 ANY_ROLE_PATHS = ("/auth/me",)
-#: 角色路由前缀:``/api/c/*`` 只认 buyer,``/api/b/*`` 只认 agent。
-ROLE_PREFIXES: tuple[tuple[str, str], ...] = (("/api/c/", "buyer"), ("/api/b/", "agent"))
+#: 角色路由前缀:``/api/c/*`` 只认 buyer,``/api/b/*`` 与 ``/api/kb/*`` 只认 agent。
+ROLE_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("/api/c/", "buyer"),
+    ("/api/b/", "agent"),
+    ("/api/kb/", "agent"),
+)
 
 #: ``required_role`` 的特殊返回值:要求合法 token 但不校验角色。
 ROLE_ANY = "any"
 
+#: 前端静态资源后缀(W13 ISS-60):页面/脚本/样式不经 API 鉴权,
+#: 否则浏览器加载 index 页时会被 401 拦下。``/api/*`` 不受此白名单影响。
+PUBLIC_ASSET_SUFFIXES = (
+    ".html",
+    ".js",
+    ".css",
+    ".svg",
+    ".ico",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".woff",
+    ".woff2",
+    ".map",
+    ".txt",
+    ".webmanifest",
+)
+
 
 def required_role(path: str) -> str | None:
-    """该路径需要的角色;None = 放行(静态页/健康检查/登录)。"""
+    """该路径需要的角色;None = 放行(静态页/健康检查/登录)。
+
+    W13 ISS-60(白名单式强制鉴权):旧实现只拦 ``/api/c/`` 与 ``/api/b/``,
+    ``/orders``、``/tickets``、``/refunds``、``/v1/maintenance/*``、``/api/kb/*``
+    在 enforce 模式下完全裸奔(既无鉴权也不受限流)。现在改为:
+
+    - ``PUBLIC_PATHS`` / 前端静态资源 → 放行;
+    - ``/api/c/*`` → buyer,``/api/b/*`` 与 ``/api/kb/*`` → agent;
+    - ``/auth/me`` → 任意合法身份;
+    - **其余一切业务与维护路由** → 任意合法身份(强制 Bearer + 令牌桶限流)。
+    """
     if path in PUBLIC_PATHS:
         return None
     for prefix in PUBLIC_PREFIXES:
@@ -653,7 +696,9 @@ def required_role(path: str) -> str | None:
     for prefix, role in ROLE_PREFIXES:
         if path.startswith(prefix):
             return role
-    return None
+    if not path.startswith("/api/") and path.endswith(PUBLIC_ASSET_SUFFIXES):
+        return None
+    return ROLE_ANY
 
 
 def bearer_token(header_value: str | None) -> str | None:

@@ -17,17 +17,20 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
 
 from app import jobs
 from app import security
 from app.api import agent as agent_api
+from app.api import get_db
 from app.api import kb as kb_api
 from app.api import auth as auth_api
 from app.api import chat as chat_api
@@ -36,10 +39,10 @@ from app.api import handoff as handoff_api
 from app.api import orders as orders_api
 from app.api import refunds as refunds_api
 from app.api import tickets as tickets_api
-from app.db import engine, utc_now
+from app.db import SessionLocal, engine, utc_now
 from app.errors import register_error_handlers
 from app.memory.decay import router as memory_maintenance_router
-from app.models import Base
+from app.models import Base, ChatSession
 
 
 @asynccontextmanager
@@ -229,6 +232,47 @@ async def _ws_authenticate(websocket: WebSocket) -> str | None:
     return str(first.get("token") or "") or None
 
 
+@contextmanager
+def _ws_db_session() -> Iterator["Session"]:
+    """取当前生效的 DB 会话。
+
+    WS 端点不走 FastAPI 依赖注入,这里显式复用 ``app.dependency_overrides``
+    里对 ``get_db`` 的覆盖(测试把库重定向到临时 SQLite),未覆盖时用默认
+    ``SessionLocal``。
+    """
+    override = app.dependency_overrides.get(get_db)
+    if override is None:
+        with SessionLocal() as session:
+            yield session
+        return
+    produced = override()
+    if hasattr(produced, "__next__"):
+        generator = produced
+        try:
+            yield next(generator)
+        finally:
+            generator.close()
+    else:
+        yield produced
+
+
+def _buyer_owns_session(session_id: str, identity: security.Identity) -> bool:
+    """W13 ISS-48:买家只能连**自己**的会话。
+
+    旧实现只要带合法 buyer token 就能连 ``/ws/buyer/{任意 session_id}``,
+    从而窃听他人会话的坐席回复。现在先查 ``ChatSession``,要求会话存在且
+    ``customer_id`` 与 token 主体一致,否则 WS 端点以 4403 关闭。
+    """
+    if identity.is_internal:
+        return True
+    try:
+        with _ws_db_session() as session:
+            row = session.get(ChatSession, session_id)
+            return row is not None and row.customer_id == identity.customer_id
+    except Exception:  # pragma: no cover - DB 异常时按"不授权"处理
+        return False
+
+
 async def _serve_websocket(websocket: WebSocket, *, role: str, target: str | None) -> None:
     """WS 端点公共流程:首帧/查询参数鉴权 → 角色与频道校验 → 订阅 → 双向泵。
 
@@ -254,6 +298,10 @@ async def _serve_websocket(websocket: WebSocket, *, role: str, target: str | Non
         session_id = target or websocket.query_params.get("session_id")
         if not session_id:
             await websocket.close(code=4400)
+            return
+        if not _buyer_owns_session(session_id, identity):
+            # 会话不存在或不属于该买家 → 拒绝订阅(防跨租户窃听)。
+            await websocket.close(code=4403)
             return
         channels = [security.channel_buyer(session_id)]
     else:
