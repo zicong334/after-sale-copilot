@@ -48,47 +48,21 @@
     if (location.pathname.indexOf("login.html") < 0) location.replace("/login.html");
   }
 
-  /* 16 字节随机 hex(crypto.getRandomValues;旧浏览器退回 Math.random 兜底) */
-  function randomHex(byteLen) {
-    var buf = new Uint8Array(byteLen);
-    if (window.crypto && window.crypto.getRandomValues) {
-      window.crypto.getRandomValues(buf);
-    } else {
-      for (var i = 0; i < byteLen; i += 1) buf[i] = Math.floor(Math.random() * 256);
-    }
-    var out = "";
-    for (var j = 0; j < buf.length; j += 1) out += ("0" + buf[j].toString(16)).slice(-2);
-    return out;
-  }
+  /* W15 U5:底层网络调用收拢到 /api.js(全站唯一持有请求实现的文件)。
+   * 本页只做两件事:懒加载共享封装 + 注入本页凭证槽与 401 兜底。
+   * 共享封装统一提供:超时兜底 / 统一错误信封 { ok, status, data, error, resp }
+   * / 写接口防重放头(X-Timestamp + X-Nonce)。 */
+  var _apiFetch = null;
 
-  var WRITE_METHODS = { POST: true, PUT: true, PATCH: true, DELETE: true };
-
-  /**
-   * 统一请求入口(原生 fetch 封装,无 CDN/无构建):
-   * - 带 `Authorization: Bearer <token>`
-   * - 写请求(POST/PUT/PATCH/DELETE)加防重放头 `X-Timestamp`(Unix 秒)+ `X-Nonce`(16 字节 hex)
-   * - 401 → 清登录态并跳 login.html
-   */
-  async function apiFetch(path, opts) {
-    opts = opts || {};
-    var method = String(opts.method || "GET").toUpperCase();
-    var headers = {};
-    if (opts.headers) {
-      Object.keys(opts.headers).forEach(function (key) { headers[key] = opts.headers[key]; });
+  function apiFetch(path, opts) {
+    if (!_apiFetch) {
+      var SC = (typeof window !== "undefined") ? window.SCApi : null;
+      if (!SC || typeof SC.createApiFetch !== "function") {
+        return Promise.reject(new Error("请求封装未加载(/api.js)"));
+      }
+      _apiFetch = SC.createApiFetch({ tokenKey: TOKEN_KEY, onUnauthorized: gotoLogin });
     }
-    var token = readToken();
-    if (token) headers["Authorization"] = "Bearer " + token;
-    if (WRITE_METHODS[method]) {
-      headers["X-Timestamp"] = String(Math.floor(Date.now() / 1000));
-      headers["X-Nonce"] = randomHex(16);
-    }
-    var init = {};
-    Object.keys(opts).forEach(function (key) { init[key] = opts[key]; });
-    init.method = method;
-    init.headers = headers;
-    var resp = await fetch(path, init);
-    if (resp.status === 401) gotoLogin();
-    return resp;
+    return _apiFetch(path, opts);
   }
 
   /* 会话 id 持久化:WS 与续聊都依赖它(同一买家账号下复用) */
@@ -122,9 +96,9 @@
   (async function verifySession() {
     if (!TOKEN || TEST_MODE) return;
     try {
-      var resp = await apiFetch("/auth/me");
-      if (!resp.ok) { if (resp.status === 401) gotoLogin(); return; }
-      var data = await resp.json();
+      var out = await apiFetch("/auth/me");
+      if (!out.ok) { if (out.status === 401) gotoLogin(); return; }
+      var data = out.data;
       var user = data && data.user;
       if (!user) return;
       if (user.id !== ME.id || user.role !== ME.role) {
@@ -167,6 +141,8 @@
     pollTimer: null,
     pollFails: 0,
     seenHuman: Object.create(null),
+    ticketMsgCount: null, // W15 U6:已见工单消息条数(变化才拉消息正文)
+    ticketLastMsgAt: "", // W15 U6:增量拉取游标(最后一条消息时间)
     lastText: "",
     lastUserBubble: null, // 最近一条买家气泡,用于挂「已同步至坐席」微标
     confirmCards: Object.create(null), // confirm_token → { okBtn, noBtn, countdown },供 WS 同步
@@ -541,14 +517,9 @@
           thread_id: card.thread_id || state.sessionId
         })
       })
-        .then(function (resp) {
-          return resp.json().then(function (json) {
-            return { status: resp.status, json: json };
-          });
-        })
         .then(function (out) {
           countdown.textContent = "";
-          if (out.status >= 400 || out.json.ok === false) {
+          if (!out.ok || !out.data) {
             countdown.textContent = "暂时没能办成，请稍后再试或联系人工坐席";
             /* ISS-54:失败不能把卡留在「已停止」的死锁里,恢复按钮与倒计时。 */
             entry.stopped = false;
@@ -558,7 +529,7 @@
             return;
           }
           stopTick();
-          renderDecision(out.json);
+          renderDecision(out.data);
         })
         .catch(function (err) {
           countdown.textContent = "网络不稳定，请稍后再试";
@@ -594,8 +565,11 @@
       var id = (receipt && (receipt.refund_request_id || receipt.ticket_id)) || "—";
       box.appendChild(el("span", "row", "业务单号 " + shortCode(id)));
       if (receipt && receipt.amount_cents !== undefined && receipt.amount_cents !== null) {
-        box.appendChild(el("span", "row",
-          "退款金额 ¥" + (receipt.amount_cents / 100).toFixed(2)));
+        /* W15 U2:退款金额改红橙药丸(主色令牌),标签与次要信息降灰。 */
+        var amountRow = el("span", "row price-row");
+        amountRow.appendChild(el("span", "price-label", "退款金额 "));
+        amountRow.appendChild(pricePill(receipt.amount_cents));
+        box.appendChild(amountRow);
       }
       if (receipt) {
         box.appendChild(el("span", "row",
@@ -614,6 +588,56 @@
     if (result.reply) box.appendChild(el("span", "row", sanitizeCopy(result.reply)));
     els.stream.appendChild(box);
     if (nearBottom()) scrollBottom();
+    /* W15 U1:售后进度 stepper(没有退款单关联时不渲染,避免空进度条)。 */
+    if (receipt && receipt.refund_request_id) {
+      loadRefundStepper(receipt.refund_request_id);
+    }
+  }
+
+  /* W15 U1/U2:进度条与金额药丸的实现统一放在 /ui.js(买家页与坐席页共用),
+   * 两个视图必须完全一致,不允许各写一份。
+   * /ui.js 没加载时降级成本地最小实现,不影响主链路。 */
+  function scui() {
+    return (typeof window !== "undefined" && window.SCUi) ? window.SCUi : null;
+  }
+
+  /* 金额单位换算:后端金额一律用分,展示用元。 */
+  function yuanOf(cents) {
+    return Number(cents || 0) / 100;
+  }
+
+  /* W15 U2:金额药丸(¥ + 大号数字,主色底白字,圆角同令牌)。 */
+  function pricePill(cents) {
+    var ui = scui();
+    if (ui) return ui.pricePill(yuanOf(cents));
+    var pill = el("span", "price-pill");
+    pill.appendChild(el("span", "price-cur", "¥"));
+    pill.appendChild(el("span", "price-num", yuanOf(cents).toFixed(2)));
+    return pill;
+  }
+
+  /* W15 U1:售后进度四节点(申请 → 审核 → 退款 / 驳回)。
+   * 当前节点高亮、已完成实心、未来空心;节点时间戳用本地 HH:MM。
+   * 具体实现见 /ui.js(与坐席页共用),这里只做转发。 */
+  function renderRefundStepper(status, createdAt, decidedAt) {
+    var ui = scui();
+    if (!ui) return null;
+    return ui.renderRefundStepper(status, createdAt, decidedAt);
+  }
+
+  /* W15 U1:拉退款单进度(数据源:现有 GET /refunds/{id},不改后端)。 */
+  async function loadRefundStepper(refundId) {
+    try {
+      var out = await apiFetch("/refunds/" + encodeURIComponent(refundId));
+      if (!out.ok || !out.data) return;
+      var stepper = renderRefundStepper(
+        out.data.status, out.data.created_at, out.data.decided_at);
+      if (!stepper) return;
+      els.stream.appendChild(stepper);
+      if (nearBottom()) scrollBottom();
+    } catch (err) {
+      /* 进度拉不到不打扰买家,回执本身照常展示 */
+    }
   }
 
   /* W14 ISS-02/03:token 用量/费用/耗时属于调试信息,不再展示给买家;
@@ -668,11 +692,13 @@
     if (!state.sessionId || state.closed) return;
     try {
       // W5-FIX R1:会话作用域端点——只返回本 session 的工单,不再按客户取最近一张。
-      var resp = await apiFetch(
-        "/api/c/handoff/summary?session_id=" + encodeURIComponent(state.sessionId),
+      // W15 U6:view=brief → 极简字段(状态 + 消息计数),不再每 3s 回传整段转录。
+      var out = await apiFetch(
+        "/api/c/handoff/summary?session_id=" + encodeURIComponent(state.sessionId) +
+        "&view=brief",
         { headers: { Accept: "application/json" } }
       );
-      if (!resp.ok) {
+      if (!out.ok) {
         state.pollFails += 1;
         if (state.pollFails === 6) {
           addSysLine("工单状态同步暂时不可用,正在重试…");
@@ -680,24 +706,19 @@
         return;
       }
       state.pollFails = 0;
-      var data = await resp.json();
+      var data = out.data || {};
       state.ticketId = (data.ticket && data.ticket.ticket_id) || null;
       state.ticketStatus = data.ticket_status || null;
       if (data.session_status === "handed_off" || data.session_status === "closed") {
         markHandedOff(false);
       }
-      var list = Array.isArray(data.ticket_messages) ? data.ticket_messages : [];
-      list.forEach(function (msg) {
-        if (!msg || msg.author_type !== "agent") return;
-        // 内部备注只给坐席看,买家页不渲染(后端 summary 也带 is_internal 标记)
-        if (msg.is_internal === true) return;
-        var key = msg.id ||
-          (String(msg.created_at_utc || "") + "|" + String(msg.content || ""));
-        if (state.seenHuman[key]) return;
-        state.seenHuman[key] = true;
-        hideEmpty(); // W14 ISS-51:渲染人工消息前先收起欢迎屏
-        addBubble("human", msg.content || "", { time: fmtTime(msg.created_at_utc) });
-      });
+      /* 只有工单消息条数变化时才拉一次消息正文(view=messages + after 游标)。 */
+      var count = Number(data.message_count || 0);
+      if (count !== state.ticketMsgCount) {
+        await pollNewMessages(state.ticketLastMsgAt || "");
+        state.ticketMsgCount = count;
+        state.ticketLastMsgAt = data.last_msg_at_utc || state.ticketLastMsgAt || "";
+      }
       // 只有「本会话的工单」关闭才禁用输入;同客户历史 closed 工单不再参与判断。
       if (data.ticket_closed === true) {
         onTicketClosed();
@@ -707,6 +728,33 @@
     } catch (err) {
       state.pollFails += 1;
     }
+  }
+
+  /* W15 U6:增量拉取坐席新消息(只回 after 之后的可见消息,不含内部备注)。 */
+  async function pollNewMessages(after) {
+    var out = await apiFetch(
+      "/api/c/handoff/summary?session_id=" + encodeURIComponent(state.sessionId) +
+      "&view=messages&after=" + encodeURIComponent(after || ""),
+      { headers: { Accept: "application/json" } }
+    );
+    if (!out.ok || !out.data) return;
+    renderTicketMessages(
+      Array.isArray(out.data.ticket_messages) ? out.data.ticket_messages : []);
+  }
+
+  /* 渲染坐席消息:按消息 id 去重,内部备注不下发给买家。 */
+  function renderTicketMessages(list) {
+    list.forEach(function (msg) {
+      if (!msg || msg.author_type !== "agent") return;
+      // 内部备注只给坐席看,买家页不渲染(后端 summary 也带 is_internal 标记)
+      if (msg.is_internal === true) return;
+      var key = msg.id ||
+        (String(msg.created_at_utc || "") + "|" + String(msg.content || ""));
+      if (state.seenHuman[key]) return;
+      state.seenHuman[key] = true;
+      hideEmpty(); // W14 ISS-51:渲染人工消息前先收起欢迎屏
+      addBubble("human", msg.content || "", { time: fmtTime(msg.created_at_utc) });
+    });
   }
 
   function onTicketClosed() {
@@ -1122,19 +1170,25 @@
     if (state.sessionId) body.session_id = state.sessionId;
 
     try {
-      var resp = await apiFetch("/api/c/chat/stream", {
+      var out = await apiFetch("/api/c/chat/stream", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "text/event-stream"
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        raw: true,        // W15 U5:SSE 走原始响应模式(不解析 JSON)
+        timeoutMs: 0     // W15 U5:流式长连接不设超时
       });
-      if (!resp.ok) {
-        var detail = await resp.text();
-        throw new Error("HTTP " + resp.status + " " + detail.slice(0, 240));
+      if (!out.ok) {
+        var resp = out.resp;
+        var detail = out.error ? out.error.message : "请求失败";
+        if (resp) {
+          try { detail += " " + (await resp.text()).slice(0, 240); } catch (err) { /* 忽略 */ }
+        }
+        throw new Error("HTTP " + out.status + " " + detail);
       }
-      var reader = resp.body.getReader();
+      var reader = out.resp.body.getReader();
       var decoder = new TextDecoder("utf-8");
       var buffer = "";
       for (;;) {
@@ -1197,7 +1251,9 @@
   async function loadMyOrders() {
     if (TEST_MODE || !CUSTOMER_ID || !els.orderStrip || !els.orderChips) return;
     try {
-      var data = await apiFetch("/orders");
+      var out = await apiFetch("/orders");
+      if (!out.ok) return;
+      var data = out.data;
       var list = Array.isArray(data) ? data : (data && data.items) || [];
       var mine = list.filter(function (o) {
         return o && o.customer_id === CUSTOMER_ID;
@@ -1210,8 +1266,10 @@
       mine.forEach(function (o) {
         var btn = el("button", "order-chip");
         btn.type = "button";
-        btn.textContent = "订单 " + shortCode(o.id) + " · ¥" +
-          (Number(o.total_cents || 0) / 100).toFixed(2) + " · " + orderStatusText(o.status);
+        /* W15 U2:订单卡金额改红橙药丸,单号与状态降灰。 */
+        btn.appendChild(el("span", "order-code", "订单 " + shortCode(o.id)));
+        btn.appendChild(pricePill(o.total_cents));
+        btn.appendChild(el("span", "order-status", orderStatusText(o.status)));
         btn.addEventListener("click", function () {
           els.input.value = "我想咨询订单 " + shortCode(o.id) + " 的售后问题";
           autoResize();
@@ -1229,8 +1287,10 @@
   async function restorePendingConfirm() {
     if (TEST_MODE || !state.sessionId) return;
     try {
-      var data = await apiFetch(
+      var out = await apiFetch(
         "/api/c/confirm/pending?thread_id=" + encodeURIComponent(state.sessionId));
+      if (!out.ok || !out.data) return;
+      var data = out.data;
       if (!data || !data.ok || !data.card || !data.confirm_token) return;
       var card = Object.assign({}, data.card, {
         confirm_token: data.confirm_token,
@@ -1297,6 +1357,9 @@
       addBubble: addBubble,
       renderCitations: renderCitations,
       state: state,
+      // W15:进度条与金额药丸的渲染入口(DOM 快照探针直接调用)
+      renderRefundStepper: renderRefundStepper,
+      pricePill: pricePill,
       // 以下两项是给测试用的工厂:与 sendTurn 共用同一份状态/句柄结构,避免测试与线上漂移
       createTurnMeta: createTurnMeta,
       createTurnUi: createTurnUi

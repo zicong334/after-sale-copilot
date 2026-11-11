@@ -410,3 +410,492 @@ def test_dom_snapshot_export():
     )
     assert snapshot["chat"]["has_svg_brand"] and snapshot["agent"]["has_svg_brand"]
     assert "安心退" in snapshot["chat"]["text_head"] + snapshot["login"]["text_head"]
+
+
+# ===========================================================================
+# W15 前端精修 + 工程规范包
+#   U1 售后进度 stepper / U2 金额红橙药丸 / U3 队列彩色角标 / U4 快捷词图标
+#   U5 通信收拢终章 / U6 轮询瘦身 / U7 辅助模块降级壳
+# ===========================================================================
+
+import shutil  # noqa: E402  (W15 追加,放在本节顶部便于自检)
+import subprocess  # noqa: E402
+import uuid  # noqa: E402
+
+API_JS = _read("api.js")
+UI_JS = _read("ui.js")
+HANDOFF_PY = (ROOT / "backend" / "app" / "api" / "handoff.py").read_text(encoding="utf-8")
+CHAT_PY = (ROOT / "backend" / "app" / "api" / "chat.py").read_text(encoding="utf-8")
+AGENT_PY = (ROOT / "backend" / "app" / "api" / "agent.py").read_text(encoding="utf-8")
+SLA_PY = (ROOT / "backend" / "app" / "sla.py").read_text(encoding="utf-8")
+TRACE_PY = (ROOT / "backend" / "app" / "trace.py").read_text(encoding="utf-8")
+
+# 裸 fetch:排除 window.fetch / fetchImpl / fetch( 之类的属性与方法名
+RAW_FETCH_RE = re.compile(r"(?<![A-Za-z0-9_.$])fetch\s*\(")
+
+
+def test_w15_shared_ui_single_implementation():
+    """U1/U2:stepper 与金额药丸只有一份实现(/ui.js),买家页与坐席页共用。"""
+    assert "global.SCUi" in UI_JS
+    for label in ("提交申请", "平台审核", "退款到账", "申请驳回"):
+        assert label in UI_JS, f"ui.js 缺少节点文案 {label}"
+        assert label not in APP_JS, f"app.js 重复实现了节点文案 {label}"
+        assert label not in AGENT_JS, f"agent.js 重复实现了节点文案 {label}"
+    assert "window.SCUi" in APP_JS and "window.SCUi" in AGENT_JS
+    assert "pricePillCents" in UI_JS
+
+
+def test_w15_stepper_four_nodes_and_states():
+    """U1:四个节点 + 当前高亮/已完成实心/未来空心三态。"""
+    for cls in ("step-done", "step-current", "step-future"):
+        assert ".stepper-node." + cls in CSS, f"style.css 缺少 .stepper-node.{cls}"
+    assert '"step-" + mark' in UI_JS, "ui.js 未按状态拼接节点类名"
+    for mark in ('"done"', '"current"', '"future"'):
+        assert mark in UI_JS, f"ui.js 缺少节点态 {mark}"
+    assert UI_JS.count('"stepper-node"') >= 1
+    assert "data-refund-status" in UI_JS
+    assert "step-dot" in UI_JS and "step-line" in UI_JS
+    assert "step-title" in UI_JS and "step-time" in UI_JS
+
+
+def test_w15_stepper_timestamp_local_hhmm():
+    """U1:节点时间戳取 UTC 转本地 HH:MM(实现只在 ui.js 一处)。"""
+    assert "getHours" in UI_JS and "getMinutes" in UI_JS
+    assert '":"' in UI_JS
+    assert "function fmtClock" not in APP_JS, "app.js 不应重复实现步骤时间格式化"
+    assert "function fmtClock" not in AGENT_JS, "agent.js 不应重复实现步骤时间格式化"
+    assert "fmtClock" in UI_JS
+
+
+def test_w15_stepper_skipped_without_refund():
+    """U1:没有退款关联时不渲染进度条(工单 B2 场景)。"""
+    assert "if (!status) return null;" in UI_JS
+    assert "receipt.refund_request_id" in APP_JS
+    assert "if (!rid) return;" in AGENT_JS
+    assert "if (!rf || !rf.status) return;" in AGENT_JS
+
+
+def test_w15_price_pill_structure():
+    """U2:金额药丸 = ¥ + 大号数字,主色底白字,圆角沿用令牌。"""
+    assert "price-pill" in UI_JS and "price-cur" in UI_JS and "price-num" in UI_JS
+    assert ".price-pill" in CSS and ".price-cur" in CSS and ".price-num" in CSS
+    assert "background: var(--primary);" in CSS
+    assert "border-radius: var(--radius);" in CSS
+    assert "price-row" in APP_JS and "price-label" in APP_JS
+    assert "pricePill(o.total_cents)" in APP_JS, "订单卡金额未使用药丸"
+    assert "pricePill(cached)" in AGENT_JS, "工单详情金额未使用药丸"
+
+
+def test_w15_token_values_unchanged():
+    """U2:既有 12 个令牌值逐字未改;W15 段落只用令牌,不再造裸色值。"""
+    origin = {
+        "--bg": "#FAF6F0",
+        "--card": "#FFFFFF",
+        "--primary": "#C05621",
+        "--accent": "#9C4221",
+        "--success": "#2F855A",
+        "--warn": "#B7791F",
+        "--danger": "#C53030",
+        "--ink": "#2D2A26",
+        "--muted": "#6B6560",
+    }
+    for name, value in origin.items():
+        assert re.search(re.escape(name) + r"\s*:\s*" + re.escape(value) + r"\s*;", CSS), \
+            f"基准令牌 {name} 被改动"
+    tail = CSS.split("W15 前端精修")[1]
+    assert not re.search(r"#[0-9A-Fa-f]{3,8}\b", tail), "W15 段落出现了裸 hex 色值"
+    assert "rgba(" not in tail, "W15 段落出现了裸 rgba 色值"
+    for name in ("--primary-soft", "--warn-soft", "--muted-soft", "--info", "--info-soft",
+                 "--warn-ink", "--muted-line", "--muted-rule", "--primary-line"):
+        assert name in CSS, f"缺少令牌变体 {name}"
+
+
+def test_w15_queue_corner_badge():
+    """U3:队列卡右上角四状态彩色角标,颜色全部走令牌。"""
+    for cls in ("corner-queued", "corner-claimed", "corner-waiting_customer", "corner-closed"):
+        assert cls in AGENT_JS, f"agent.js 缺少角标类 {cls}"
+        assert "." + cls in CSS, f"style.css 缺少 .{cls}"
+    assert "ticket-corner" in AGENT_JS and ".ticket-corner" in CSS
+    assert ".corner-queued { background: var(--warn-soft); color: var(--warn-ink); }" in CSS
+    assert ".corner-claimed { background: var(--primary); color: var(--card); }" in CSS
+    assert ".corner-waiting_customer { background: var(--info-soft); color: var(--info); }" in CSS
+    assert ".corner-closed { background: var(--muted-soft); color: var(--muted); }" in CSS
+
+
+def test_w15_queue_card_remains_button():
+    """U3:角标只是叠加在卡片上,整卡仍是 button(键盘可达性不退化)。"""
+    assert 'el("button", "ticket-item"' in AGENT_JS
+    assert 'item.type = "button";' in AGENT_JS
+    queue_block = AGENT_JS.split("function renderQueue()")[1][:2600]
+    assert "cornerBadge(ticket)" in queue_block
+    assert "row.appendChild(badge(ticket))" not in queue_block, "队列行仍放纯文字徽章"
+    assert "badge(ticket)" in AGENT_JS, "详情头部徽章不应被移除"
+
+
+def test_w15_quick_chip_icons():
+    """U4:三个快捷词各带一枚 16px 线性 SVG 图标,W14 的胶囊契约不变。"""
+    chips = re.findall(r'class="example-chip"[^>]*data-text="([^"]+)"', CHAT_HTML)
+    assert len(chips) == 3
+    assert CHAT_HTML.count('<svg class="chip-icon"') == 3
+    for chip in re.findall(r'<button[^>]*class="example-chip"[\s\S]*?</button>', CHAT_HTML):
+        assert '<svg class="chip-icon"' in chip
+        assert 'stroke="currentColor"' in chip
+    assert ".chip-icon" in CSS
+    assert "width: 16px;" in CSS and "height: 16px;" in CSS
+
+
+def test_w15_no_raw_fetch_in_pages():
+    """U5:底层网络调用收拢到 /api.js,其余页面零裸 fetch。"""
+    for name, src in (
+        ("app.js", APP_JS),
+        ("agent.js", AGENT_JS),
+        ("login.html", LOGIN_HTML),
+        ("chat.html", CHAT_HTML),
+        ("agent.html", AGENT_HTML),
+        ("ui.js", UI_JS),
+    ):
+        assert not RAW_FETCH_RE.search(src), f"{name} 仍有裸 fetch 调用"
+        assert "fetchImpl" not in src, f"{name} 绕过了统一封装"
+    assert "global.fetch" in API_JS, "api.js 必须持有唯一的底层网络调用"
+
+
+def test_w15_api_fetch_timeout_and_envelope():
+    """U5:统一封装带超时兜底、统一错误信封、写接口防重放头。"""
+    assert "createApiFetch" in API_JS
+    assert "AbortController" in API_JS and "timeoutMs" in API_JS
+    assert "X-Timestamp" in API_JS and "X-Nonce" in API_JS
+    assert "resp.status === 401" in API_JS and "onUnauthorized" in API_JS
+    for key in ("ok:", "status:", "data:", "error:", "resp:"):
+        assert key in API_JS, f"信封缺少字段 {key}"
+    assert "createApiFetch" in APP_JS
+    assert "createApiFetch" in AGENT_JS
+    assert "createApiFetch" in LOGIN_HTML
+    assert '<script src="/api.js"></script>' in LOGIN_HTML
+    assert '<script src="/api.js"></script>' in CHAT_HTML
+    assert '<script src="/api.js"></script>' in AGENT_HTML
+    assert '<script src="/ui.js"></script>' in CHAT_HTML
+    assert '<script src="/ui.js"></script>' in AGENT_HTML
+
+
+def test_w15_summary_brief_view_has_no_transcript():
+    """U6:轮询用的 brief 视图只回状态与计数,不含消息正文。"""
+    assert '_SUMMARY_VIEWS = ("full", "brief", "messages")' in HANDOFF_PY
+    assert 'if view == "brief":' in HANDOFF_PY
+    brief_block = HANDOFF_PY.split('if view == "brief":')[1].split('if view == "messages":')[0]
+    assert "ticket_messages" not in brief_block, "brief 视图仍在回工单消息正文"
+    assert '"messages"' not in brief_block, "brief 视图仍在回会话消息正文"
+    assert "message_count" in brief_block and "last_msg_at_utc" in brief_block
+    assert "view=brief" in APP_JS and "view=messages" in APP_JS
+    assert "&after=" in APP_JS
+
+
+def test_w15_aux_degraded_shells():
+    """U7:三处辅助调用包 try-degrade,异常记 aux_degraded 事件后走原主链路。"""
+    assert 'EVENT_AUX_DEGRADED = "aux_degraded"' in TRACE_PY
+    assert "def record_aux_degraded(" in TRACE_PY
+    for src, source in (
+        (CHAT_PY, "semantic_cache.lookup"),
+        (AGENT_PY, "agent.suggest_citations"),
+        (SLA_PY, "sla.scan_breaches"),
+    ):
+        assert "record_aux_degraded" in src, "缺少降级事件记录"
+        assert source in src, f"缺少降级来源标记 {source}"
+    assert "semantic_cache.store" in CHAT_PY
+
+
+# ---------------------------------------------------------------------------
+# W15 DOM 快照(Node + 假 DOM 探针,产出 .tmp/w15/*.json)
+# ---------------------------------------------------------------------------
+
+_W15_PROBE = r"""
+"use strict";
+var fs = require("fs");
+var path = require("path");
+var FRONTEND = process.argv[2];
+
+function makeNode(tag) {
+  var node = {
+    tagName: String(tag).toUpperCase(),
+    childNodes: [],
+    attributes: {},
+    _class: "",
+    _text: "",
+    parentNode: null,
+    style: {},
+    files: []
+  };
+  Object.defineProperty(node, "className", {
+    get: function () { return node._class; },
+    set: function (v) { node._class = (v === null || v === undefined) ? "" : String(v); }
+  });
+  Object.defineProperty(node, "textContent", {
+    get: function () {
+      if (!node.childNodes.length) return node._text;
+      return node.childNodes.map(function (c) { return c.textContent; }).join("");
+    },
+    set: function (v) {
+      node._text = (v === null || v === undefined) ? "" : String(v);
+      node.childNodes = [];
+    }
+  });
+  node.classList = {
+    add: function () {
+      var set = node._class.split(/\s+/).filter(Boolean);
+      Array.prototype.slice.call(arguments).forEach(function (c) {
+        if (set.indexOf(c) < 0) set.push(c);
+      });
+      node._class = set.join(" ");
+    },
+    remove: function () {
+      var set = node._class.split(/\s+/).filter(Boolean);
+      Array.prototype.slice.call(arguments).forEach(function (c) {
+        var i = set.indexOf(c);
+        if (i >= 0) set.splice(i, 1);
+      });
+      node._class = set.join(" ");
+    },
+    contains: function (c) { return node._class.split(/\s+/).indexOf(c) >= 0; },
+    toggle: function () {}
+  };
+  node.appendChild = function (c) { c.parentNode = node; node.childNodes.push(c); return c; };
+  node.removeChild = function (c) {
+    node.childNodes = node.childNodes.filter(function (x) { return x !== c; });
+    c.parentNode = null;
+    return c;
+  };
+  node.setAttribute = function (k, v) { node.attributes[k] = String(v); };
+  node.getAttribute = function (k) {
+    return Object.prototype.hasOwnProperty.call(node.attributes, k) ? node.attributes[k] : null;
+  };
+  node.removeAttribute = function (k) { delete node.attributes[k]; };
+  node.addEventListener = function () {};
+  node.removeEventListener = function () {};
+  node.dispatchEvent = function () { return true; };
+  node.querySelector = function () { return null; };
+  node.querySelectorAll = function () { return []; };
+  node.closest = function () { return null; };
+  node.matches = function () { return false; };
+  node.focus = function () {};
+  node.blur = function () {};
+  node.click = function () {};
+  node.scrollIntoView = function () {};
+  node.getBoundingClientRect = function () {
+    return { top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0 };
+  };
+  return node;
+}
+
+var byId = {};
+global.document = {
+  getElementById: function (id) { if (!byId[id]) byId[id] = makeNode("div"); return byId[id]; },
+  createElement: function (tag) { return makeNode(tag); },
+  createTextNode: function (text) { var n = makeNode("#text"); n._text = String(text); return n; },
+  createDocumentFragment: function () { return makeNode("#fragment"); },
+  addEventListener: function () {},
+  removeEventListener: function () {},
+  querySelector: function () { return null; },
+  querySelectorAll: function () { return []; },
+  body: makeNode("body"),
+  documentElement: makeNode("html"),
+  head: makeNode("head")
+};
+
+var store = {
+  _d: {},
+  getItem: function (k) {
+    return Object.prototype.hasOwnProperty.call(store._d, k) ? store._d[k] : null;
+  },
+  setItem: function (k, v) { store._d[k] = String(v); },
+  removeItem: function (k) { delete store._d[k]; },
+  clear: function () { store._d = {}; }
+};
+store.setItem("sc_agent_token", "probe-token");
+store.setItem("sc_agent_user", JSON.stringify({
+  role: "agent", id: "agent_probe", merchant_id: "m_probe",
+  service_id: "s_probe", display_name: "探针坐席"
+}));
+store.setItem("sc_buyer_token", "probe-token");
+store.setItem("sc_buyer_user", JSON.stringify({
+  role: "buyer", id: "buyer_probe", customer_id: "c_probe"
+}));
+
+global.window = global;
+global.localStorage = store;
+global.location = {
+  pathname: "/agent.html", protocol: "http:", host: "127.0.0.1", search: "",
+  href: "http://127.0.0.1/agent.html",
+  replace: function () {}, reload: function () {}, assign: function () {}
+};
+try {
+  Object.defineProperty(global, "navigator", {
+    value: { userAgent: "node-probe" }, configurable: true, writable: true
+  });
+} catch (err) { /* node 已内置只读 navigator,忽略 */ }
+global.addEventListener = function () {};
+global.removeEventListener = function () {};
+global.innerHeight = 900;
+global.innerWidth = 1440;
+global.scrollTo = function () {};
+global.matchMedia = function () {
+  return { matches: false, addEventListener: function () {}, removeEventListener: function () {} };
+};
+global.setInterval = function () { return 0; };
+global.clearInterval = function () {};
+global.setTimeout = function () { return 0; };
+global.clearTimeout = function () {};
+global.requestAnimationFrame = function () { return 0; };
+global.fetch = function () {
+  var payload = JSON.stringify({ ok: true, items: [], user: null });
+  return Promise.resolve({
+    ok: true, status: 200,
+    text: function () { return Promise.resolve(payload); },
+    json: function () { return Promise.resolve(JSON.parse(payload)); },
+    headers: { get: function () { return null; } }
+  });
+};
+global.WebSocket = function () {
+  this.readyState = 0;
+  this.close = function () {};
+  this.send = function () {};
+  this.addEventListener = function () {};
+};
+global.__DSH_TEST_HOOKS__ = {};
+
+function load(file) {
+  var src = fs.readFileSync(path.join(FRONTEND, file), "utf8");
+  (0, eval)(src);
+}
+
+function ser(node, depth) {
+  if (!node || depth > 8) return null;
+  var out = {
+    tag: node.tagName,
+    class: node.className || "",
+    text: (node.textContent || "").trim(),
+    attrs: node.attributes || {}
+  };
+  var kids = [];
+  (node.childNodes || []).forEach(function (c) {
+    var s = ser(c, depth + 1);
+    if (s) kids.push(s);
+  });
+  out.children = kids;
+  return out;
+}
+
+load("api.js");
+load("ui.js");
+load("app.js");
+load("agent.js");
+
+var hooks = global.__DSH_TEST_HOOKS__;
+var out = { ok: false, snapshots: {} };
+
+try {
+  out.snapshots.buyer_stepper = ser(hooks.app.renderRefundStepper(
+    "审核", "2026-11-10T02:03:00Z", null), 0);
+  out.snapshots.workbench_stepper = ser(hooks.agent.renderRefundStepper(
+    "退款", "2026-11-10T02:03:00Z", "2026-11-11T09:41:00Z"), 0);
+  out.snapshots.corners = {};
+  ["queued", "claimed", "waiting_customer", "closed"].forEach(function (st) {
+    out.snapshots.corners[st] = ser(hooks.agent.cornerBadge({ status: st }), 0);
+  });
+  out.snapshots.order_pill = ser(hooks.app.pricePill(13390), 0);
+  out.snapshots.agent_price_pill = ser(hooks.agent.pricePill(8212), 0);
+  out.ok = true;
+} catch (err) {
+  out.error = String(err && err.stack ? err.stack : err);
+}
+
+process.stdout.write("__DSH_JSON__" + JSON.stringify(out));
+process.exit(0);
+"""
+
+
+def _run_w15_probe() -> dict:
+    """跑 Node 假 DOM 探针,返回观察结果(标准输出落文件,避开 Windows 匿名管道限制)。"""
+    node = shutil.which("node")
+    if node is None:
+        return {}
+    work_dir = ROOT / ".tmp" / f"w15_probe_{uuid.uuid4().hex}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    script = work_dir / "probe.js"
+    stdout_path = work_dir / "probe.stdout.txt"
+    stderr_path = work_dir / "probe.stderr.txt"
+    script.write_text(_W15_PROBE, encoding="utf-8")
+    try:
+        with stdout_path.open("wb") as out_file, stderr_path.open("wb") as err_file:
+            proc = subprocess.run(
+                [node, str(script), str(FRONTEND)],
+                stdin=subprocess.DEVNULL,
+                stdout=out_file,
+                stderr=err_file,
+                timeout=120,
+                cwd=str(ROOT),
+            )
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        assert proc.returncode == 0, f"探针退出码 {proc.returncode}: {stderr[-500:]}"
+        assert "__DSH_JSON__" in stdout, f"探针无输出: {stderr[-500:]}"
+        return json.loads(stdout.split("__DSH_JSON__", 1)[1])
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_w15_dom_snapshots_export():
+    """W15 DOM 快照:买家/坐席两套 stepper、队列角标、金额药丸(≥4 份,落 .tmp/w15/)。"""
+    node = shutil.which("node")
+    if node is None:
+        import pytest
+
+        pytest.skip("未找到 node 可执行文件,跳过 DOM 快照(node 不可用时 skip 而非 fail)")
+
+    observed = _run_w15_probe()
+    assert observed.get("ok"), f"探针执行失败: {observed.get('error')}"
+    snaps = observed["snapshots"]
+
+    buyer = snaps["buyer_stepper"]
+    bench = snaps["workbench_stepper"]
+    buyer_nodes = buyer["children"]
+    bench_nodes = bench["children"]
+    assert len(buyer_nodes) == 4 and len(bench_nodes) == 4
+    assert buyer_nodes[0]["class"].endswith("step-done")
+    assert buyer_nodes[1]["class"].endswith("step-current")
+    assert buyer_nodes[2]["class"].endswith("step-future")
+    assert bench_nodes[2]["class"].endswith("step-current")
+    assert bench_nodes[3]["class"].endswith("step-future")
+    clock = re.compile(r"^\d{2}:\d{2}$")
+    times = [
+        node_text
+        for item in bench_nodes
+        for node_text in [
+            kid["text"] for kid in item["children"][1]["children"] if kid["class"] == "step-time"
+        ]
+    ]
+    assert times and all(clock.match(t) for t in times), f"时间戳不是本地 HH:MM: {times}"
+
+    corners = snaps["corners"]
+    assert corners["queued"]["class"] == "ticket-corner corner-queued"
+    assert corners["queued"]["text"] == "待领取"
+    assert corners["claimed"]["class"] == "ticket-corner corner-claimed"
+    assert corners["waiting_customer"]["class"] == "ticket-corner corner-waiting_customer"
+    assert corners["closed"]["class"] == "ticket-corner corner-closed"
+
+    assert snaps["order_pill"]["text"] == "¥133.90"
+    assert snaps["agent_price_pill"]["text"] == "¥82.12"
+
+    out_dir = ROOT / ".tmp" / "w15"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = {
+        "buyer_refund_stepper.json": buyer,
+        "workbench_refund_stepper.json": bench,
+        "queue_corner_badges.json": corners,
+        "order_card_price_pill.json": snaps["order_pill"],
+    }
+    for name, payload in files.items():
+        (out_dir / name).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    assert len(files) >= 4
+    for name in files:
+        assert (out_dir / name).exists()

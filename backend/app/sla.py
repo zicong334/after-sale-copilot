@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.db import utc_now
 from app.models import Ticket
-from app.trace import record_event
+from app.trace import record_aux_degraded, record_event
 
 logger = logging.getLogger("app.sla")
 
@@ -102,31 +102,53 @@ def scan_breaches(
     )
     breached: list[Ticket] = []
     for ticket in candidates:
-        result = session.execute(
-            update(Ticket)
-            .where(
-                Ticket.id == ticket.id,
-                Ticket.status == "queued",
-                Ticket.sla_breached.is_(False),
+        # W15 U7:单条工单的扫描是辅助路径,失败只降级(记 aux_degraded 事件),
+        # 不阻断其余工单的扫描,更不让后台线程整体失败。
+        try:
+            result = session.execute(
+                update(Ticket)
+                .where(
+                    Ticket.id == ticket.id,
+                    Ticket.status == "queued",
+                    Ticket.sla_breached.is_(False),
+                )
+                .values(sla_breached=True)
             )
-            .values(sla_breached=True)
-        )
-        if result.rowcount != 1:  # pragma: no cover - 并发下已被领取
+            if result.rowcount != 1:  # pragma: no cover - 并发下已被领取
+                continue
+            session.flush()
+            waited_seconds = int((current - _aware(ticket.created_at)).total_seconds())
+            record_event(
+                session,
+                trace_id=ticket.session_id or ticket.id,
+                event=EVENT_SLA_ALERT,
+                payload={
+                    "ticket_id": ticket.id,
+                    "merchant_id": ticket.merchant_id,
+                    "waited_seconds": max(waited_seconds, 0),
+                    "threshold_minutes": minutes,
+                },
+            )
+            breached.append(ticket)
+        except Exception as exc:  # noqa: BLE001 - 辅助路径兜底
+            logger.exception("SLA 扫描单条工单失败,降级继续: ticket=%s", ticket.id)
+            try:
+                session.rollback()
+            except Exception:  # pragma: no cover - 回滚失败也不能上抛
+                logger.exception("SLA 扫描回滚失败: ticket=%s", ticket.id)
+            breached = []
+            record_aux_degraded(
+                session,
+                trace_id=ticket.session_id or ticket.id,
+                source="sla.scan_breaches",
+                error=f"{type(exc).__name__}: {exc}",
+                payload={"ticket_id": ticket.id, "merchant_id": ticket.merchant_id},
+            )
+            try:
+                session.commit()
+            except Exception:  # pragma: no cover - 降级事件落库失败也不能上抛
+                logger.exception("SLA 降级事件落库失败: ticket=%s", ticket.id)
             continue
-        session.flush()
-        waited_seconds = int((current - _aware(ticket.created_at)).total_seconds())
-        record_event(
-            session,
-            trace_id=ticket.session_id or ticket.id,
-            event=EVENT_SLA_ALERT,
-            payload={
-                "ticket_id": ticket.id,
-                "merchant_id": ticket.merchant_id,
-                "waited_seconds": max(waited_seconds, 0),
-                "threshold_minutes": minutes,
-            },
-        )
-        breached.append(ticket)
     if breached:
         session.commit()
     return breached

@@ -18,6 +18,16 @@
   --ink: #2D2A26;
   --muted: #6B6560;
   --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* W15 令牌变体(只增不改:上面 12 个基准令牌值逐字未动) */
+  --primary-soft: rgba(192, 86, 33, .11);   /* 沿用 .badge-waiting_customer 既有底色 */
+  --warn-soft: #FEF3C7;                   /* 沿用 .badge-queued 既有底色 */
+  --muted-soft: rgba(107, 101, 96, .13);  /* 沿用 .badge-closed 既有底色 */
+  --info: #5B6B7C;                        /* 新增:信息蓝灰(角标/步骤线) */
+  --info-soft: rgba(91, 107, 124, .12);   /* 新增:信息蓝灰浅底 */
+  --warn-ink: #8A5A10;                    /* 新增:警示橙字色(沿用 .badge-queued 既有值) */
+  --muted-line: rgba(107, 101, 96, .45);  /* 新增:未到达节点的圆点描边色 */
+  --muted-rule: rgba(107, 101, 96, .25);  /* 新增:步骤节点之间的连接线色 */
+  --primary-line: rgba(192, 86, 33, .16); /* 新增:进度卡描边色 */
 }
 
 * { box-sizing: border-box; }
@@ -1871,3 +1881,134 @@ textarea:focus-visible,
 .ticket-time, .ticket-sub, .kb-version, .kb-item-text { color: #5F5852; }
 .ticket-time { font-size: 12px; }
 .tmsg-head span { font-size: 12px; }
+
+/* ==========================================================================
+   W15 前端精修(淘宝视觉惯例 U1-U4)
+   令牌约束:只使用 :root 既有令牌与本轮新增的 5 个变体令牌,不新造裸色值。
+   ========================================================================== */
+
+/* ---- U2:金额红橙药丸徽标(主色底 + 白字 + 大号数字) ---- */
+.price-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1px;
+  padding: 3px 11px;
+  border-radius: var(--radius);
+  background: var(--primary);
+  color: var(--card);
+  font-weight: 700;
+  line-height: 1.25;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.price-pill .price-cur { font-size: 12px; font-weight: 600; }
+.price-pill .price-num { font-size: 17px; letter-spacing: .2px; }
+.price-label { color: var(--muted); font-size: 13px; }
+.price-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ---- U2:订单条(短单号 + 药丸 + 状态降灰) ---- */
+.order-code {
+  color: var(--accent);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.order-status { color: var(--muted); font-size: 12px; }
+
+/* ---- U1:售后进度 stepper(纵向四节点) ---- */
+.stepper {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--card);
+  border: 1px solid var(--primary-line);
+  text-align: left;
+}
+.stepper-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.stepper-node {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding-bottom: 12px;
+}
+.stepper-node:last-child { padding-bottom: 0; }
+.stepper-node .step-dot {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  margin-top: 4px;
+  border-radius: 50%;
+  border: 2px solid var(--muted);
+  background: var(--card);
+}
+.stepper-node .step-line { display: flex; flex-direction: column; gap: 1px; }
+.stepper-node .step-title { font-size: 13px; color: var(--muted); }
+.stepper-node .step-time { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stepper-node:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 17px;
+  bottom: 2px;
+  width: 1px;
+  background: var(--muted-rule);
+}
+.stepper-node.step-done .step-dot { border-color: var(--primary); background: var(--primary); }
+.stepper-node.step-done .step-title { color: var(--ink); }
+.stepper-node.step-done:not(:last-child)::before { background: var(--primary-soft); }
+.stepper-node.step-current .step-dot {
+  border-color: var(--primary);
+  background: var(--card);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.stepper-node.step-current .step-title { color: var(--accent); font-weight: 700; }
+.stepper-node.step-current .step-time { color: var(--accent); }
+.stepper-node.step-future .step-dot { border-color: var(--muted-line); }
+
+/* ---- U3:队列卡片右上角状态角标 ---- */
+.ticket-item { position: relative; }
+.ticket-corner {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.corner-queued { background: var(--warn-soft); color: var(--warn-ink); }
+.corner-claimed { background: var(--primary); color: var(--card); }
+.corner-waiting_customer { background: var(--info-soft); color: var(--info); }
+.corner-closed { background: var(--muted-soft); color: var(--muted); }
+.ticket-item .ticket-time { margin-right: 62px; }
+
+/* ---- U4:快捷词胶囊线性图标 ---- */
+.example-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chip-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+.example-chip:hover .chip-icon { color: var(--primary); }
+
+/* ---- U1/U2:坐席工单详情里的处理进度与金额药丸 ---- */
+.detail-progress { margin: 14px 0 4px; }
+.detail-progress:empty { display: none; }
+.meta-item .price-amount { display: inline-flex; align-items: center; }
+.meta-item .price-amount .price-pill { font-size: 13px; }
+.meta-item .price-amount .price-num { font-size: 15px; }

@@ -44,47 +44,19 @@
     if (location.pathname.indexOf("login.html") < 0) location.replace("/login.html");
   }
 
-  /* 16 字节随机 hex(crypto.getRandomValues;旧浏览器退回 Math.random 兜底) */
-  function randomHex(byteLen) {
-    var buf = new Uint8Array(byteLen);
-    if (window.crypto && window.crypto.getRandomValues) {
-      window.crypto.getRandomValues(buf);
-    } else {
-      for (var i = 0; i < byteLen; i += 1) buf[i] = Math.floor(Math.random() * 256);
-    }
-    var out = "";
-    for (var j = 0; j < buf.length; j += 1) out += ("0" + buf[j].toString(16)).slice(-2);
-    return out;
-  }
+  /* W15 U5:底层网络调用收拢到 /api.js(全站唯一持有请求实现的文件)。
+   * 本页只做两件事:懒加载共享封装 + 注入本页凭证槽与 401 兜底。 */
+  var _apiFetch = null;
 
-  var WRITE_METHODS = { POST: true, PUT: true, PATCH: true, DELETE: true };
-
-  /**
-   * 统一请求入口(原生 fetch 封装,无 CDN/无构建):
-   * - 带 `Authorization: Bearer <token>`
-   * - 写请求(POST/PUT/PATCH/DELETE)加防重放头 `X-Timestamp`(Unix 秒)+ `X-Nonce`(16 字节 hex)
-   * - 401 → 清登录态并跳 login.html
-   */
-  async function apiFetch(path, opts) {
-    opts = opts || {};
-    var method = String(opts.method || "GET").toUpperCase();
-    var headers = {};
-    if (opts.headers) {
-      Object.keys(opts.headers).forEach(function (key) { headers[key] = opts.headers[key]; });
+  function apiFetch(path, opts) {
+    if (!_apiFetch) {
+      var SC = (typeof window !== "undefined") ? window.SCApi : null;
+      if (!SC || typeof SC.createApiFetch !== "function") {
+        return Promise.reject(new Error("请求封装未加载(/api.js)"));
+      }
+      _apiFetch = SC.createApiFetch({ tokenKey: TOKEN_KEY, onUnauthorized: gotoLogin });
     }
-    var token = readToken();
-    if (token) headers["Authorization"] = "Bearer " + token;
-    if (WRITE_METHODS[method]) {
-      headers["X-Timestamp"] = String(Math.floor(Date.now() / 1000));
-      headers["X-Nonce"] = randomHex(16);
-    }
-    var init = {};
-    Object.keys(opts).forEach(function (key) { init[key] = opts[key]; });
-    init.method = method;
-    init.headers = headers;
-    var resp = await fetch(path, init);
-    if (resp.status === 401) gotoLogin();
-    return resp;
+    return _apiFetch(path, opts);
   }
 
   /* 身份一律来自 token(不再读 URL ?merchant_id=,也没有静态坐席列表/手填入口) */
@@ -104,9 +76,9 @@
   (async function verifySession() {
     if (!TOKEN) return;
     try {
-      var resp = await apiFetch("/auth/me");
-      if (!resp.ok) { if (resp.status === 401) gotoLogin(); return; }
-      var data = await resp.json();
+      var out = await apiFetch("/auth/me");
+      if (!out.ok) { if (out.status === 401) gotoLogin(); return; }
+      var data = out.data;
       var user = data && data.user;
       if (!user) return;
       if (user.id !== ME.id || user.role !== ME.role) {
@@ -173,6 +145,10 @@
     refreshTimer: null,      // WS 事件触发的队列刷新去抖
     prevLastMsg: Object.create(null), // ticket_id → 上次看到的最后消息时间
     unread: Object.create(null),      // ticket_id → true(买家有新消息)
+    orderAmounts: Object.create(null), // order_id → 订单金额(分,W15 U2 详情金额药丸)
+    amountNode: null,                 // 当前详情页里的金额节点(W15 U2)
+    amountOrderId: "",                // 当前金额节点对应的订单号(W15 U2)
+    progressNode: null,               // 当前详情页里的「处理进度」容器(W15 U1)
     ws: null,
     wsReady: false,
     wsRetry: 0,
@@ -188,6 +164,29 @@
     if (cls) node.className = cls;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+
+  /* W15 U1/U2:进度条与金额药丸的实现统一放在 /ui.js(与买家页共用),
+   * 两个视图必须完全一致,不允许各写一份。 */
+  function scui() {
+    return (typeof window !== "undefined" && window.SCUi) ? window.SCUi : null;
+  }
+
+  /* W15 U2:金额药丸(¥ + 大号数字,主色底白字)。入参是「分」。 */
+  function pricePill(cents) {
+    var ui = scui();
+    if (ui) return ui.pricePillCents(cents);
+    var pill = el("span", "price-pill");
+    pill.appendChild(el("span", "price-cur", "¥"));
+    pill.appendChild(el("span", "price-num", (Number(cents || 0) / 100).toFixed(2)));
+    return pill;
+  }
+
+  /* W15 U1:售后进度条(与买家页共用实现;没有退款关联时返回 null,不渲染)。 */
+  function renderRefundStepper(status, createdAt, decidedAt) {
+    var ui = scui();
+    if (!ui) return null;
+    return ui.renderRefundStepper(status, createdAt, decidedAt);
   }
 
   function pad(n) { return n < 10 ? "0" + n : String(n); }
@@ -260,6 +259,22 @@
     return el("span", cls, statusLabel(ticket));
   }
 
+  /* W15 U3:队列卡片右上角的彩色状态角标(替代纯文字徽章)。
+   * 待领取=警示橙 / 跟进中=主色 / 待客户回复=信息蓝灰 / 已关闭=灰;
+   * 整张卡片仍是 button,键盘可达性不变。 */
+  var CORNER_CLASS = {
+    queued: "corner-queued",
+    claimed: "corner-claimed",
+    waiting_customer: "corner-waiting_customer",
+    closed: "corner-closed"
+  };
+
+  function cornerBadge(ticket) {
+    var status = (ticket && ticket.status) || "closed";
+    var cls = "ticket-corner " + (CORNER_CLASS[status] || "corner-closed");
+    return el("span", cls, statusLabel(ticket));
+  }
+
   // W11-3:队列/详情共用的 SLA 超时红色徽标(仅服务端标记为真时展示)
   function slaBadge(ticket) {
     if (!ticket || !ticket.sla_breached) return null;
@@ -283,24 +298,19 @@
   /* --------------------------------- HTTP --------------------------------- */
 
   async function api(path, options) {
-    var resp;
+    var out;
     try {
-      resp = await apiFetch(path, options || {});
+      out = await apiFetch(path, options || {});
     } catch (err) {
       throw new Error("网络错误:" + errorMessage(err));
     }
-    var json = null;
-    try { json = await resp.json(); } catch (err) { json = null; }
-    if (!resp.ok || (json && json.ok === false)) {
-      var message = json && json.error && json.error.message
-        ? json.error.message
-        : "HTTP " + resp.status;
-      var e = new Error(message);
-      e.status = resp.status;
-      e.code = json && json.error ? json.error.code : null;
+    if (!out.ok) {
+      var e = new Error((out.error && out.error.message) || "HTTP " + out.status);
+      e.status = out.status;
+      e.code = out.error ? out.error.code : null;
       throw e;
     }
-    return json || {};
+    return out.data || {};
   }
 
   function postJSON(path, body) {
@@ -404,9 +414,11 @@
       item.type = "button";
       item.setAttribute("data-ticket", ticket.ticket_id);
 
+      /* W15 U3:状态改用卡片右上角彩色角标,行内不再放纯文字徽章。 */
+      item.appendChild(cornerBadge(ticket));
+
       var row = el("div", "ticket-row");
       row.appendChild(el("span", "ticket-id", shortCode(ticket.ticket_id)));
-      row.appendChild(badge(ticket));
       var sla = slaBadge(ticket);
       if (sla) row.appendChild(sla);
       if (state.unread[ticket.ticket_id]) {
@@ -489,6 +501,65 @@
     return box;
   }
 
+  /* W15 U2:工单详情里的订单金额药丸。
+   * 工单接口本身不含金额,打开详情时按订单号取一次(GET /orders/{id},现成接口)。
+   * 取不到就显示「—」,不打断详情。 */
+  function metaAmountItem(ticket) {
+    var box = el("div", "meta-item");
+    box.appendChild(el("span", "k", "订单金额"));
+    var val = el("span", "v price-amount");
+    var oid = ticket && ticket.order_id ? ticket.order_id : "";
+    var cached = oid ? state.orderAmounts[oid] : null;
+    if (cached !== null && cached !== undefined) {
+      val.appendChild(pricePill(cached));
+    } else {
+      val.textContent = "—";
+    }
+    state.amountNode = val;
+    state.amountOrderId = oid;
+    box.appendChild(val);
+    return box;
+  }
+
+  async function loadOrderAmount(ticket) {
+    var oid = ticket && ticket.order_id ? ticket.order_id : "";
+    if (!oid) return;
+    if (state.orderAmounts[oid] !== undefined) return;
+    try {
+      var data = await api("/orders/" + encodeURIComponent(oid));
+      var cents = Number((data && data.total_cents) || 0);
+      state.orderAmounts[oid] = cents;
+      if (state.amountNode && state.amountOrderId === oid) {
+        state.amountNode.textContent = "";
+        state.amountNode.appendChild(pricePill(cents));
+      }
+    } catch (err) {
+      /* 金额取不到就保持「—」,不打断详情 */
+    }
+  }
+
+  /* W15 U1:工单「处理进度」。
+   * 数据源用现成接口:GET /tickets/{id}(取该工单关联的退款单号)
+   * + GET /refunds/{id}(取退款状态与时间戳);没有退款关联就不渲染进度条。 */
+  async function loadTicketProgress(ticket) {
+    var tid = ticket && ticket.ticket_id ? ticket.ticket_id : "";
+    if (!tid) return;
+    try {
+      var tinfo = await api("/tickets/" + encodeURIComponent(tid));
+      var rid = tinfo && tinfo.refund_request_id ? tinfo.refund_request_id : "";
+      if (!rid) return;
+      var rf = await api("/refunds/" + encodeURIComponent(rid));
+      if (!rf || !rf.status) return;
+      var stepper = renderRefundStepper(rf.status, rf.created_at, rf.decided_at);
+      if (!stepper || !state.progressNode) return;
+      state.progressNode.textContent = "";
+      state.progressNode.appendChild(el("div", "stepper-title", "处理进度"));
+      state.progressNode.appendChild(stepper);
+    } catch (err) {
+      /* 进度拉不到不打扰坐席 */
+    }
+  }
+
   function renderTranscript(messages) {
     var wrap = el("div", "transcript");
     if (!messages || !messages.length) {
@@ -565,10 +636,17 @@
     grid.appendChild(metaItem("领取人", ticket.claimed_by ? shortCode(ticket.claimed_by) : "未领取"));
     grid.appendChild(metaItem("创建时间", fmtDateTime(ticket.created_at_utc)));
     grid.appendChild(metaItem("最后消息", fmtDateTime(ticket.last_msg_at_utc)));
+    /* W15 U2:订单金额药丸(工单接口不含金额,打开详情时按订单号取一次)。 */
+    grid.appendChild(metaAmountItem(ticket));
     if (ticket.message_count !== undefined && ticket.message_count !== null) {
       grid.appendChild(metaItem("消息数", String(ticket.message_count)));
     }
     els.detailBody.appendChild(grid);
+
+    /* W15 U1:工单「处理进度」(有退款关联才渲染内容,没有就保持空白)。 */
+    var progress = el("div", "detail-progress");
+    state.progressNode = progress;
+    els.detailBody.appendChild(progress);
 
     if (chatTranscript && chatTranscript.length) {
       els.detailBody.appendChild(el("div", "section-title", "转人工前 AI 问答(只读)"));
@@ -714,6 +792,8 @@
       meta.appendChild(metaItem("领取人", ticket.claimed_by ? shortCode(ticket.claimed_by) : "未领取"));
       meta.appendChild(metaItem("创建时间", fmtDateTime(ticket.created_at_utc)));
       meta.appendChild(metaItem("最后消息", fmtDateTime(ticket.last_msg_at_utc)));
+      /* W15 U2:静默刷新同样补上订单金额药丸。 */
+      meta.appendChild(metaAmountItem(ticket));
       if (ticket.message_count !== undefined && ticket.message_count !== null) {
         meta.appendChild(metaItem("消息数", String(ticket.message_count)));
       }
@@ -775,6 +855,9 @@
       } else {
         renderDetail(data.ticket || {}, msgs, chatTranscript);
       }
+      /* W15 U1/U2:详情渲染完再补金额与进度(都是附加信息,失败不影响详情)。 */
+      loadOrderAmount(data.ticket || {});
+      loadTicketProgress(data.ticket || {});
     } catch (err) {
       if (state.selectedId !== ticketId || silent) return;
       els.detailBody.textContent = "";
@@ -1575,6 +1658,19 @@
       if (action === "edit") kbEditItem(item);
       else kbChangeStatus(item, action);
     });
+  }
+
+  /* W10:测试钩子(Node + 假 DOM 探针用)。
+   * 正常浏览器没有 window.__DSH_TEST_HOOKS__,这段不会执行。 */
+  if (typeof window !== "undefined" && window.__DSH_TEST_HOOKS__) {
+    window.__DSH_TEST_HOOKS__.agent = {
+      renderQueue: renderQueue,
+      renderDetail: renderDetail,
+      cornerBadge: cornerBadge,
+      renderRefundStepper: renderRefundStepper,
+      pricePill: pricePill,
+      state: state
+    };
   }
 
   /* --------------------------------- 启动 --------------------------------- */

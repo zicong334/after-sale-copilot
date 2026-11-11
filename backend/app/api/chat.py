@@ -54,7 +54,7 @@ from app.llm import LLMError, build_llm
 from app.llm.base import stream_sink
 from app.perception import PerceptionError, normalize
 from app.pii import MaskingLLM, PIIMasker
-from app.trace import new_trace_id, record_event
+from app.trace import new_trace_id, record_aux_degraded, record_event
 
 router = APIRouter(prefix="/api/c", tags=["chat"])
 
@@ -252,7 +252,18 @@ def _run_turn(
         # W10/ISS-46+55:语义缓存读路径。写意图/订单号/PII 由 is_cacheable
         # 挡在缓存外(lookup 内部判定),跨租户按 merchant_id 隔离;
         # 命中则跳过图执行与 LLM 调用,但仍照常落 user/assistant 两条消息。
-        cached = semantic_cache.lookup(percept.text, merchant_id=ident.merchant_id)
+        # W15 U7:语义缓存是辅助加速路径,读取失败只降级(记 aux_degraded 事件),
+        # 主链路照常执行,绝不 500。
+        try:
+            cached = semantic_cache.lookup(percept.text, merchant_id=ident.merchant_id)
+        except Exception as exc:  # noqa: BLE001 - 辅助路径兜底
+            record_aux_degraded(
+                db,
+                trace_id=trace_id,
+                source="semantic_cache.lookup",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            cached = None
         if cached is not None:
             cache_hit = True
             result = runner.TurnResult(
@@ -321,17 +332,26 @@ def _run_turn(
         and result.pending_confirm is None
         and result.session_status == "active"
     ):
-        semantic_cache.store(
-            percept.text,
-            {
-                "reply": result.reply,
-                "citations": result.citations,
-                "intent": result.intent,
-                "confidence": result.confidence,
-                "intent_reason": result.intent_reason,
-            },
-            merchant_id=ident.merchant_id,
-        )
+        # W15 U7:回写同样是辅助路径,失败只降级(缓存写不进去不影响本轮回复)。
+        try:
+            semantic_cache.store(
+                percept.text,
+                {
+                    "reply": result.reply,
+                    "citations": result.citations,
+                    "intent": result.intent,
+                    "confidence": result.confidence,
+                    "intent_reason": result.intent_reason,
+                },
+                merchant_id=ident.merchant_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - 辅助路径兜底
+            record_aux_degraded(
+                db,
+                trace_id=trace_id,
+                source="semantic_cache.store",
+                error=f"{type(exc).__name__}: {exc}",
+            )
     if not degraded:
         user_msg.intent = result.intent
     # W5 真静默:blocked 轮 AI 零吐字(reply=""),不落空 assistant 消息;

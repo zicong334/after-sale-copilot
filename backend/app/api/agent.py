@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -53,6 +54,9 @@ from app.retrieval.base import RetrievedChunk
 from app.retrieval.bm25_backend import DEFAULT_THRESHOLD, BM25Backend
 from app.retrieval.chunker import PolicyChunk
 from app.services import tickets as ticket_svc
+from app.trace import record_aux_degraded
+
+logger = logging.getLogger("app.api.agent")
 
 router = APIRouter(prefix="/api/b", tags=["agent-workbench"])
 
@@ -681,9 +685,26 @@ def suggest_reply(
         ).all()
     )
     user_texts = _suggest_user_texts(messages)
-    citations = _suggest_citations(
-        db, ticket.merchant_id, _suggest_query(ticket, user_texts)
-    )
+    # W15 U7:条款检索是辅助增强路径,失败只降级(记 aux_degraded 事件),
+    # 建议回复照常生成(退化为无条款引用的兜底话术),绝不 500。
+    try:
+        citations = _suggest_citations(
+            db, ticket.merchant_id, _suggest_query(ticket, user_texts)
+        )
+    except Exception as exc:  # noqa: BLE001 - 辅助路径兜底
+        record_aux_degraded(
+            db,
+            trace_id=ticket.session_id or ticket.id,
+            source="agent.suggest_citations",
+            error=f"{type(exc).__name__}: {exc}",
+            payload={"ticket_id": ticket.id},
+        )
+        citations = []
+        try:
+            # 该接口本身不写业务数据,此处提交只为让降级痕迹可审计。
+            db.commit()
+        except Exception:  # pragma: no cover - 落库失败也不阻断主链路
+            logger.exception("aux_degraded 事件落库失败: ticket=%s", ticket.id)
     prompt = _suggest_prompt(ticket, messages, citations)
     draft = _compose_suggestion(ticket, user_texts, citations, prompt=prompt)
 

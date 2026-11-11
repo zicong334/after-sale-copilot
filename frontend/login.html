@@ -65,6 +65,8 @@
     </section>
   </main>
 
+  <!-- W15 U5:统一请求封装(全站唯一持有底层网络调用的文件),必须先于登录脚本加载 -->
+  <script src="/api.js"></script>
   <script>
   /* W8 登录脚本(原生 JS,零依赖、零构建)
    * - 成功:按 user.role 写 sc_agent_token/user 或 sc_buyer_token/user,再跳转
@@ -91,6 +93,17 @@
     function setError(message) {
       els.error.textContent = message || "";
     }
+
+    /* W15 U5:登录页也走统一请求封装(/api.js)——超时兜底 + 统一错误信封 + 写接口防重放头。
+     * /api.js 没加载时降级为一次性失败信封,页面照常给出错误提示。 */
+    var apiFetch = (window.SCApi && window.SCApi.createApiFetch)
+      ? window.SCApi.createApiFetch({ tokenKey: "" })
+      : function () {
+        return Promise.resolve({
+          ok: false, status: 0, data: null,
+          error: { code: "no_transport", message: "请求封装未加载(/api.js)" }
+        });
+      };
 
     function slotOf(user) {
       return user && user.role === "agent" ? "agent" : "buyer";
@@ -181,22 +194,18 @@
       els.button.disabled = true;
       els.button.textContent = "登录中…";
 
-      fetch("/auth/login", {
+      apiFetch("/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ username: username, password: password })
       })
-        .then(function (resp) {
-          return resp.json()
-            .catch(function () { return null; })
-            .then(function (json) { return { status: resp.status, json: json }; });
-        })
         .then(function (out) {
-          var data = out.json || {};
-          if (out.status >= 400 || data.ok === false || !data.token) {
+          var data = (out && out.data) || {};
+          if (!out.ok || data.ok === false || !data.token) {
             setError(
+              (out.error && out.error.message) ||
               (data.error && data.error.message) ||
-              ("登录失败(HTTP " + out.status + ")")
+              ("登录失败(HTTP " + (out ? out.status : 0) + ")")
             );
             return;
           }

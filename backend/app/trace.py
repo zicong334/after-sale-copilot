@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
@@ -21,6 +22,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.tools.events import ToolEvent, write_event
+
+logger = logging.getLogger("app.trace")
 
 # ---------------------------------------------------------------------------
 # 事件名(命名空间约定:模块__动作)
@@ -30,6 +33,9 @@ EVENT_CLASSIFY = "router__classify"          # 意图判定(含快捷路径 / Fa
 EVENT_SESSION_STATUS = "session__status_change"  # 会话状态变更(active->handed_off 等)
 EVENT_ROUTE_BLOCKED = "route__blocked"       # 入口拦截:会话非 active,AI 停止回复
 EVENT_QUERY_REWRITE = "retrieval__query_rewrite"  # 无命中时的确定性查询改写(MOCK)
+#: W15 U7:辅助模块(语义缓存读取 / 建议条款检索 / SLA 扫描)失败时的降级事件。
+#: 语义是"辅助路径挂了但主链路照常走完",不是会话失败。
+EVENT_AUX_DEGRADED = "aux_degraded"
 
 
 def new_trace_id() -> str:
@@ -77,6 +83,37 @@ def record_event(
     # autoflush=False,不 flush 会导致同 trace 内 step 撞号(演示脚本即真实库 SessionLocal)。
     session.flush()
     return tool_event
+
+
+def record_aux_degraded(
+    session: Session,
+    *,
+    trace_id: str,
+    source: str,
+    error: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """W15 U7:辅助模块降级事件(语义缓存/建议检索/SLA 扫描等)。
+
+    约定:辅助路径失败**不得**中断主链路,只落一条 ``aux_degraded`` 事件,
+    事件写入本身也吞异常(降级记录失败不能反过来把主链路打断)。
+    """
+    body: dict[str, Any] = {"source": source}
+    if error:
+        body["error"] = error[:400]
+    if payload:
+        body.update(payload)
+    try:
+        record_event(
+            session,
+            trace_id=trace_id,
+            event=EVENT_AUX_DEGRADED,
+            payload=body,
+            ok=False,
+            error_code="aux_degraded",
+        )
+    except Exception:  # pragma: no cover - 降级事件写失败也不能阻断主链路
+        logger.exception("aux_degraded 事件写入失败: source=%s", source)
 
 
 def trace_events(session: Session, trace_id: str) -> list[ToolEvent]:

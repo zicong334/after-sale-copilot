@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import case, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app import security
@@ -32,6 +32,20 @@ from app.services import tickets as ticket_svc
 router = APIRouter(prefix="/api/c/handoff", tags=["handoff"])
 
 _STATUSES = ("queued", "claimed", "waiting_customer", "closed")
+
+# W15 U6:会话摘要视图粒度(full=全量兼容旧形状 / brief=轮询极简 / messages=增量消息)。
+_SUMMARY_VIEWS = ("full", "brief", "messages")
+
+
+def _check_view(view: str) -> str:
+    if view not in _SUMMARY_VIEWS:
+        raise AppError(
+            "VALIDATION_ERROR",
+            f"未知视图: {view}",
+            400,
+            param="view",
+        )
+    return view
 
 
 class ClaimIn(BaseModel):
@@ -257,6 +271,8 @@ def close(
 @router.get("/sessions/{session_id}/summary")
 def session_summary(
     session_id: str,
+    view: str = Query(default="full"),
+    after: str | None = Query(default=None),
     db: Session = Depends(get_db),
     identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
@@ -266,6 +282,9 @@ def session_summary(
     历史工单没有 session_id 时返回 ticket=None,绝不回退到
     「按客户取最近一张」的启发式(那会把同客户历史 closed 工单误当成当前会话)。
     enforce 下买家只能看自己的会话(internal 跳过)。
+
+    W15 U6:``view=brief`` 返回极简字段(轮询用,不含消息正文);
+    ``view=messages`` 只回 ``after`` 之后的新工单消息。
     """
     ident = security.effective_identity(identity, "buyer")
     row = db.get(ChatSession, session_id)
@@ -273,7 +292,10 @@ def session_summary(
         raise NotFoundError(f"会话不存在: {session_id}")
     _scope_session(row, identity, ident)
     ticket = _session_ticket(db, session_id)
-    return _summary_body(db, row, ticket, link="session_id(精确归属)")
+    return _summary_body(
+        db, row, ticket, link="session_id(精确归属)",
+        view=_check_view(view), after=after,
+    )
 
 
 def _session_ticket(db: Session, session_id: str) -> Ticket | None:
@@ -309,24 +331,134 @@ def _public_ticket_messages(db: Session, ticket: Ticket | None) -> list[dict[str
     ]
 
 
+def _ticket_meta(ticket: Ticket | None) -> dict[str, Any] | None:
+    """极简工单视图(W15 U6):轮询只需要这几项,不回传摘要正文等大字段。"""
+    if ticket is None:
+        return None
+    return {
+        "ticket_id": ticket.id,
+        "order_id": ticket.order_id,
+        "status": ticket.status,
+        "created_at_utc": _iso(ticket.created_at),
+        "last_msg_at_utc": _iso(ticket.last_msg_at),
+    }
+
+
+def _ticket_message_stats(db: Session, ticket: Ticket | None) -> tuple[str | None, int]:
+    """工单最后消息时间 + 可见消息条数(W15 U6 极简轮询用)。"""
+    if ticket is None:
+        return None, 0
+    count = int(
+        db.scalar(
+            select(func.count(TicketMessage.id)).where(
+                TicketMessage.ticket_id == ticket.id,
+                TicketMessage.is_internal.is_(False),
+            )
+        )
+        or 0
+    )
+    return _iso(ticket.last_msg_at), count
+
+
+def _parse_after(value: str | None) -> datetime | None:
+    """解析 ``after`` 游标(ISO 时间串)→ naive UTC(与库里 created_at 对齐)。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def _summary_body(
     db: Session, row: ChatSession, ticket: Ticket | None, *, link: str,
+    view: str = "full", after: str | None = None,
 ) -> dict[str, Any]:
     """会话摘要响应体(两个入口共用,保证形状一致)。"""
+    return _build_summary(
+        db,
+        session_id=row.id,
+        session_status=row.status,
+        merchant_id=row.merchant_id,
+        customer_id=row.customer_id,
+        ticket=ticket,
+        link=link,
+        view=view,
+        after=after,
+    )
+
+
+def _build_summary(
+    db: Session,
+    *,
+    session_id: str | None,
+    session_status: str | None,
+    merchant_id: str | None,
+    customer_id: str | None,
+    ticket: Ticket | None,
+    link: str,
+    view: str = "full",
+    after: str | None = None,
+) -> dict[str, Any]:
+    """会话摘要响应体(按视图粒度裁剪)。
+
+    W15 U6:``view`` 控制返回粒度——
+    - ``full``(默认):保持既有形状(messages + ticket_messages 全量),兼容既有调用方;
+    - ``brief``:轮询用的极简视图,只回状态与计数,**不含任何消息正文**;
+    - ``messages``:增量消息视图,只回 ``after`` 之后的新工单消息。
+    """
+    if view == "brief":
+        last_msg_at, message_count = _ticket_message_stats(db, ticket)
+        return {
+            "ok": True,
+            "view": "brief",
+            "session_id": session_id,
+            "session_status": session_status,
+            "ticket": _ticket_meta(ticket),
+            "ticket_link": link,
+            "ticket_status": ticket.status if ticket is not None else None,
+            "ticket_closed": bool(ticket is not None and ticket.status == "closed"),
+            "last_msg_at_utc": last_msg_at,
+            "message_count": message_count,
+        }
+    if view == "messages":
+        last_msg_at, message_count = _ticket_message_stats(db, ticket)
+        cursor = _parse_after(after)
+        messages = _public_ticket_messages(db, ticket)
+        if cursor is not None:
+            messages = [
+                item
+                for item in messages
+                if (_parse_after(item.get("created_at_utc")) or cursor) >= cursor
+            ]
+        return {
+            "ok": True,
+            "view": "messages",
+            "session_id": session_id,
+            "session_status": session_status,
+            "ticket_status": ticket.status if ticket is not None else None,
+            "ticket_closed": bool(ticket is not None and ticket.status == "closed"),
+            "last_msg_at_utc": last_msg_at,
+            "message_count": message_count,
+            "ticket_messages": messages,
+        }
     messages = list(
         db.scalars(
             select(ChatMessage)
-            .where(ChatMessage.session_id == row.id)
+            .where(ChatMessage.session_id == session_id)
             .order_by(ChatMessage.created_at.asc())
             .limit(20)
         ).all()
     )
     return {
         "ok": True,
-        "session_id": row.id,
-        "session_status": row.status,
-        "merchant_id": row.merchant_id,
-        "customer_id": row.customer_id,
+        "session_id": session_id,
+        "session_status": session_status,
+        "merchant_id": merchant_id,
+        "customer_id": customer_id,
         "ticket": _ticket_dict(ticket) if ticket is not None else None,
         "ticket_link": link,
         "ticket_status": ticket.status if ticket is not None else None,
@@ -350,6 +482,8 @@ def summary(
     session_id: str | None = Query(default=None),
     merchant_id: str | None = Query(default=None),
     customer_id: str | None = Query(default=None),
+    view: str = Query(default="full"),
+    after: str | None = Query(default=None),
     db: Session = Depends(get_db),
     identity: security.Identity = Depends(security.current_identity),
 ) -> dict[str, Any]:
@@ -365,6 +499,7 @@ def summary(
     if not identity.is_internal:
         merchant_id = ident.merchant_id
         customer_id = ident.customer_id
+    wanted_view = _check_view(view)
     if session_id:
         row = db.get(ChatSession, session_id)
         if row is None:
@@ -372,6 +507,7 @@ def summary(
         _scope_session(row, identity, ident)
         return _summary_body(
             db, row, _session_ticket(db, session_id), link="session_id(精确归属)",
+            view=wanted_view, after=after,
         )
     if not merchant_id or not customer_id:
         raise AppError(
@@ -386,6 +522,18 @@ def summary(
         .order_by(Ticket.created_at.desc(), Ticket.id.desc())
         .limit(1)
     ).first()
+    if wanted_view != "full":
+        return _build_summary(
+            db,
+            session_id=None,
+            session_status=None,
+            merchant_id=merchant_id,
+            customer_id=customer_id,
+            ticket=legacy_ticket,
+            link="merchant_id+customer_id(最近一张;旧行为兼容)",
+            view=wanted_view,
+            after=after,
+        )
     return {
         "ok": True,
         "session_id": None,
