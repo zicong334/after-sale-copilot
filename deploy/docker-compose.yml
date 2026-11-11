@@ -1,0 +1,115 @@
+# W12-3 交付物:本地/单机编排(backend + nginx 静态入口;可选 profiles 带 PG/Redis/监控)。
+#
+# ⚠️ 未在本机运行时验证(本机无 Docker);本文件只经过 deploy/lint_artifacts.py 的
+#    结构级 YAML 校验(services/ports/volumes/profile 键齐全、镜像与健康检查存在)。
+#
+# 用法:
+#   docker compose -f deploy/docker-compose.yml up -d --build                 # 最小栈:SLA 用 SQLite
+#   docker compose -f deploy/docker-compose.yml --profile full up -d --build  # 再带 PG/Redis 容器
+#   docker compose -f deploy/docker-compose.yml --profile observability up -d # 再带 Prometheus/Grafana
+#
+# 说明:
+# - backend 默认 DATABASE_URL 指向命名卷里的 SQLite;要切 PostgreSQL 请同时:
+#   1) 开 --profile full;2) 设 DATABASE_URL=postgresql+psycopg://...。
+#   PG 方言适配属于 W12-4,本仓库当前只保证 SQLite 口径。
+# - backend 不映射宿主端口,外部只经 nginx;nginx 对 /metrics 做了内网限定。
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: after-sale-copilot-backend:local
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/dev.db}
+      METRICS_ENABLED: "1"
+      # 容器内 client IP 不是回环:prometheus/nginx 抓取需要 1;
+      # 对外暴露面由 nginx 的 /metrics allow/deny 与 compose 网络隔离兜住。
+      # 若把 backend 直接映射到宿主公网,请改回 0。
+      METRICS_ALLOW_REMOTE: ${METRICS_ALLOW_REMOTE:-1}
+      TMPDIR: /app/.tmp
+    expose:
+      - "8000"
+    volumes:
+      - copilot-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 25s
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    volumes:
+      - ../frontend:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+  # ---- 可选:业务侧数据库/缓存容器(profile=full) ----
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["full"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-copilot}
+      POSTGRES_USER: ${POSTGRES_USER:-copilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-in-env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-copilot} -d ${POSTGRES_DB:-copilot}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["full"]
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---- 可选:可观测栈(profile=observability) ----
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-in-env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+volumes:
+  copilot-data:
+  pgdata:
+  redis-data:
+  prometheus-data:
+  grafana-data:

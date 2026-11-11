@@ -16,6 +16,9 @@ class Base(DeclarativeBase):
 # 注:本文件不在 W8 白名单里,但新模型必须在此 import 才会进 Base.metadata /
 # alembic autogenerate;属"新模型注册"必要最小改动,已在回执说明。
 from app.models.auth import AuthUser, RequestNonce, TokenUsage  # noqa: E402,F401
+# W12-2 坏例回流表。本文件不在 W12 白名单,但新模型必须在此 import 才进
+# Base.metadata / create_all;与 W8 同一"必要最小改动",已在回执说明。
+from app.models.badcase import BadCase  # noqa: E402,F401
 from app.models.catalog import Product, ProductMetric, ProductVariant, Review  # noqa: E402,F401
 from app.models.chat import ChatMessage, ChatSession  # noqa: E402,F401
 from app.models.eval import EvalCase  # noqa: E402,F401
@@ -47,4 +50,5 @@ __all__ = [
     "AuthUser",
     "RequestNonce",
     "TokenUsage",
+    "BadCase",
 ]

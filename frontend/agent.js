@@ -156,6 +156,7 @@
     suggestSummary: document.getElementById("suggest-summary"),
     suggestReply: document.getElementById("suggest-reply"),
     fillReplyBtn: document.getElementById("fill-reply-btn"),
+    markBadcaseBtn: document.getElementById("mark-badcase-btn"),
     toastWrap: document.getElementById("toastWrap")
   };
 
@@ -864,6 +865,41 @@
     toast("已填入回复框,请确认或编辑后发送", "success");
   }
 
+  /* W12-2 数据飞轮:把工单现场打包成坏例。
+   * 只落 badcase 表(转录/工具链/建议 diff/judge 占位),不改用例集;
+   * eval 草稿由 scripts/promote_badcase.py 另行生成到 data/eval/drafts/。 */
+  async function markBadcase(ticket, btn) {
+    if (!ticket || !ticket.ticket_id) {
+      toast("请先选择工单", "error");
+      return;
+    }
+    var note = window.prompt("标记坏例的备注(可留空,例如「答非所问」「金额说错」):", "");
+    if (note === null) return;  // 用户取消
+    btn.disabled = true;
+    var original = btn.textContent;
+    btn.textContent = "打包中…";
+    try {
+      var data = await postJSON("/api/b/badcases", {
+        ticket_id: ticket.ticket_id,
+        service_id: currentAgent(),
+        note: note,
+        suggestion: els.suggestReply ? els.suggestReply.value : ""
+      });
+      var payload = data.data || {};
+      toast(
+        "已标记坏例 " + shortCode(payload.badcase_id || "") +
+        "（转录 " + (payload.transcript_entries || 0) + " 条 · 工具链 " +
+        (payload.tool_chain_entries || 0) + " 步）",
+        "success"
+      );
+    } catch (err) {
+      toast("标记坏例失败:" + errorMessage(err), "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+
   /* --------------------------------- 动作 --------------------------------- */
 
   async function claimTicket(ticket, btn) {
@@ -1169,6 +1205,13 @@
   });
 
   els.fillReplyBtn.addEventListener("click", fillReplyFromSuggestion);
+
+  /* W12-2:标记坏例(数据飞轮入口) */
+  if (els.markBadcaseBtn) {
+    els.markBadcaseBtn.addEventListener("click", function () {
+      markBadcase(state.selectedTicket, els.markBadcaseBtn);
+    });
+  }
 
   /* W8:退出登录(清登录态后回登录页) */
   if (els.logoutBtn) {

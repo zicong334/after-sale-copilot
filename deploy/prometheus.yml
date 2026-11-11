@@ -1,0 +1,16 @@
+# W12-3 交付物:Prometheus 抓取配置(配合 docker-compose --profile observability)。
+# backend 容器不映射宿主端口,Prometheus 在 compose 网络内直连 backend:8000。
+# /metrics 的"仅本机"是应用层对客户端 IP 的判断:compose 内网地址不属于回环,
+# 因此 backend 在本编排里设 METRICS_ALLOW_REMOTE=1,由 nginx 的 allow/deny
+# 与 compose 网络隔离承担"不对外"的职责;直连宿主时请保持该变量为 0。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: copilot-backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["backend:8000"]
+        labels:
+          service: after-sale-copilot

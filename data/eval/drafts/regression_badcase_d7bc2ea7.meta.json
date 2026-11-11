@@ -1,0 +1,15 @@
+{
+  "badcase_id": "d7bc2ea7-4209-4c8a-8cc8-6b9330705910",
+  "ticket_id": "tk-1",
+  "merchant_id": "m-1",
+  "trace_id": "trace-w12b-0002",
+  "case_id": "regression_badcase_d7bc2ea7",
+  "generated_at_utc": "2026-11-11T17:05:19.918227+00:00",
+  "generator": "backend/scripts/promote_badcase.py",
+  "draft_sha256": "58d4af873c58bb4da47245d7d1fe7124d9666781f23605297967032dd99cf028",
+  "judge_score": 0.5,
+  "judge_detail": {
+    "source": "demo_manual_review"
+  },
+  "governance": "草稿只落 data/eval/drafts/,不并入 cases_v1.json;入集需主会话按版本升级流程处理配额与必造用例。"
+}

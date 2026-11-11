@@ -1,0 +1,109 @@
+# W12-3 交付物:CI 四门禁(语法 / 测试 / 评测 smoke / 交付物静态自检)。
+#
+# 密封口径:本仓库全部离线可跑,FakeLLM + FakeJudge(MOCK)。
+# 不注入 LLM_API_KEY / LLM_BASE_URL / MINIMAX_API_KEY —— build_llm 无 key 时自动回退 FakeLLM。
+#
+# 注:本地仓库未配置 remote,本 workflow 推送后才真正生效;本地仅做 YAML 解析校验。
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  PYTHONPATH: backend
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  lint:
+    name: lint(compileall + 交付物静态自检)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - name: 安装依赖(锁文件)
+        run: python -m pip install -r requirements.lock.txt
+      - name: 全量语法编译
+        run: python -m compileall -q backend/app backend/scripts deploy
+      - name: 交付物静态自检
+        run: python deploy/lint_artifacts.py
+
+  pytest:
+    name: pytest(密封 FakeLLM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - name: 安装依赖(锁文件)
+        run: python -m pip install -r requirements.lock.txt
+      - name: 确认未注入真实模型凭据
+        run: |
+          test -z "${LLM_API_KEY:-}" || { echo "检测到 LLM_API_KEY,密封测试不允许"; exit 1; }
+          test -z "${MINIMAX_API_KEY:-}" || { echo "检测到 MINIMAX_API_KEY,密封测试不允许"; exit 1; }
+      - name: 全量测试
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python -m pytest backend/tests -q -p no:cacheprovider \
+            --basetemp="$RUNNER_TEMP/pytest"
+
+  eval:
+    name: eval(--smoke,mock 基线)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - name: 安装依赖(锁文件)
+        run: python -m pip install -r requirements.lock.txt
+      - name: 确认未注入真实模型凭据
+        run: |
+          test -z "${LLM_API_KEY:-}" || { echo "检测到 LLM_API_KEY,密封评测不允许"; exit 1; }
+      - name: 跑 smoke 评测(报告写临时目录,不脏 data/eval/reports)
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python backend/scripts/run_eval.py --smoke \
+            --run-id "ci-${{ github.run_id }}" \
+            --out-dir "$RUNNER_TEMP/eval-reports"
+      - name: 上传评测报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-smoke-report
+          path: ${{ runner.temp }}/eval-reports
+          if-no-files-found: warn
+
+  deploy:
+    name: deploy(交付物规则)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - name: 安装依赖(锁文件)
+        run: python -m pip install -r requirements.lock.txt
+      - name: Dockerfile / compose / nginx / prometheus / ci 规则
+        run: python deploy/lint_artifacts.py
+      - name: 说明
+        run: echo "本 job 只做静态结构校验;真实 docker build 需在具备 Docker 的 runner 上另行开启"

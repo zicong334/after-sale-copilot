@@ -151,7 +151,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:694 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:722 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -290,6 +290,37 @@ MOCK 边界:W10-1 的「备」是 `MinimaxRealClient`(代码真实、默认 MOCK
 MOCK 边界:验货回调的 `FULFILLMENT_SECRET` 未配置时使用 `dev-w11-fulfillment-secret-change-me`(代码内 MOCK 标注),
 生产必须显式注入;验货结论由仓库系统给出,本仓只做验签 + 状态机,不接真实 WMS;SLA 扫描线程只在 `serve` 生命周期内运行,
 多 worker 部署时同一工单的标记有守卫式更新兜底(不会重复告警)。
+
+### 7.6 可观测、坏例回流与交付物包清单(W12)
+
+> 原则:指标只读已有 trace/工具/job 表,后台 5s 刷缓存,请求路径不算全表;坏例只落库 + 起草,
+> **绝不写 `data/eval/cases_v1.json`**;容器化产物只做到"结构可校验",本机没有 Docker 就不宣称跑通。
+
+| 项 | 实现位置 | 语义与边界 | 测试 |
+|---|---|---|---|
+| W12-1 `/metrics` | `app/observability.py`、`app/main.py`(`GET /metrics`,免鉴权) | Prometheus 文本格式;窗口 15min / 最多 5000 条事件;缓存 5s(`METRICS_BACKGROUND_REFRESH=0` 可关守护线程)。节点延迟 = 同 trace 相邻 `tool_events` 时间差,归因到后一事件(近似口径,已在 docstring 声明);token 分账:agent 读 `token_usage` 表、judge 读最近评测报告 `meta.tokens_by_role`、tier 只按 `router_failover` 事件计数;护栏 = `graph__prompt_probe_block.payload.flags` + `handoff__create_ticket.args.reason`;工具错误率 = `ok=False`,排除 payload 带 `event` 键的编排事件;熔断器取最新 `breaker_state`;队列深度按 `job_queue.status`;缓存命中率取 `semantic_cache.stats()`。仅回环可见,`METRICS_ALLOW_REMOTE=1` 才放行远端 | `tests/test_metrics.py` |
+| W12-2 标记坏例 | `app/api/badcases.py`(`POST /api/b/badcases`,201)、`app/models/badcase.py`、迁移 `0010_badcase`、`frontend/agent.html` + `agent.js`(「标记坏例」按钮) | 按工单打包:trace_ids、转录(chat + ticket,过滤内部备注到独立字段)、工具链(跳过编排事件)、judge 分(可显式注入;缺失写 `judge_source=unavailable`,**不伪造分数**)、AI 建议与坐席最终回复的 unified diff;`badcase` 表无外键,工单删除后审计行仍留存;状态 `new/promoted/ignored` | `tests/test_badcase.py` |
+| W12-2 坏例草稿 | `scripts/promote_badcase.py`(`--id` / `--list` / `--check`) | 生成 17 字段、`layer=regression` 的单条 case 草稿 + 同名 `.meta.json` 到 `data/eval/drafts/`;**不入集**,`notes` 写明"入集需主会话治理";导出后坏例转 `promoted` 并回填 `eval_case_id/promoted_at` | `tests/test_badcase.py::test_promote_draft_then_case_level_validate` |
+| W12-3 交付物 | `deploy/Dockerfile`、`entrypoint.sh`、`docker-compose.yml`、`nginx.conf`、`prometheus.yml`、`deploy/lint_artifacts.py`、`.dockerignore`、`.github/workflows/ci.yml` | 多阶段镜像 / UID 10001 非 root / HEALTHCHECK 探 `/health`;compose 最小栈 backend+nginx,可选 `full`(PG/Redis)与 `observability`(Prometheus/Grafana)profiles;nginx `/metrics` 只放行回环与私网;CI 四门禁(compileall + 交付物 lint、pytest 密封、`run_eval --smoke`、交付物 lint) | `tests/test_deploy_artifacts.py`、`python deploy/lint_artifacts.py` |
+
+**验收口径差异(主动上报)**:任务书写"`validate_eval_cases` 对草稿 exit 0",但该脚本对"非 10 条"的
+输入一律委托 `app.eval.validate_cases`,后者硬性要求**总数 48 且各 layer 配额精确**
+(golden 19 / adversarial 14 / edge 10 / regression 5,且 5 个必造回归 anchor 已占满 regression 配额)。
+任何"48 + 第 6 条 regression"都必然撞配额,替换任一既有 case 又会缺 anchor,而 `validate_eval_cases.py`
+不在 W12 白名单内。因此本棒的实际口径是:
+`promote_badcase.py --check` 调**同一个官方校验器**、只隔离 5 类"集级错误"
+(`用例总数应为` / `配额不符:` / `缺少必造对抗用例` / `缺少必造边界用例` / `缺少必造回归用例`),
+用例级规则(17 字段、类型、枚举、工具名、错误码、金额口径等)必须 0 错误才 `exit 0`;
+测试同时断言"官方 `validate_eval_cases.py` 对单条草稿 `exit 1` 且 20 条错误全部是上述集级前缀",
+证明单条草稿在结构上合格、只是不能单独成集。
+
+**本机未验证清单(如实)**:`docker build` / `docker compose up`、nginx 实跑与 `/metrics` 403 实测、
+PostgreSQL 与 Redis 容器、Prometheus 实际抓取与 Grafana 出图、迁移链在 PG 上执行。
+本机只做了 YAML 解析、结构断言、Dockerfile/nginx 规则自检(`deploy/lint_artifacts.py`)与 pytest。
+
+MOCK 边界:指标是"对既有事件表的离线聚合",不发任何外呼;坏例 judge 分不实时裁判,缺失即标 `unavailable`;
+容器化交付物是**静态可校验形态**,不冒充"已在本机跑通"。
+
 
 
 

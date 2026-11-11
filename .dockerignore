@@ -1,0 +1,49 @@
+# W12-3 交付物:docker build 上下文裁剪。
+# 只保留镜像真正需要的东西:依赖锁、backend 源码、frontend 静态页、deploy 入口脚本。
+# (本仓库根目录同时是开发工作区,不裁会让 .venv/.tmp/本地库 一起进上下文。)
+
+# 版本控制与编辑器
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# 本地环境与产物
+.venv
+.tmp
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+.coverage
+.coverage.*
+
+# 本地数据库与报告(镜像内由迁移/seed 生成)
+backend/dev.db
+backend/dev.db-*
+data/eval/reports
+data/eval/drafts
+*.sqlite
+*.sqlite3
+*.db
+
+# 文档与任务书不进镜像
+docs
+*.md
+!deploy/README.md
+
+# 开发期脚本(镜像只用 entrypoint.sh)
+backend/tests
+deploy/docker-compose.yml
+deploy/nginx.conf
+deploy/prometheus.yml
+deploy/lint_artifacts.py
+
+# 其它
+.DS_Store
+Thumbs.db
+node_modules

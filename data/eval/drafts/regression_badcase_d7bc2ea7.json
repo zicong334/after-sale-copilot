@@ -1,0 +1,37 @@
+[
+  {
+    "case_id": "regression_badcase_d7bc2ea7",
+    "layer": "regression",
+    "scene": "坐席标记坏例回流 · complaint",
+    "user_input": "我要退款,这个订单一直不发货",
+    "context": {
+      "badcase_id": "d7bc2ea7-4209-4c8a-8cc8-6b9330705910",
+      "ticket_id": "tk-1",
+      "trace_id": "trace-w12b-0002",
+      "order_id": "seed-order-003"
+    },
+    "ground_truth": {
+      "handoff": true,
+      "handoff_reason": "complaint",
+      "intent": "refund",
+      "answer_fact": "已核实,今天为您退款 2599 元。"
+    },
+    "expected_tools": [
+      "shop__get_order",
+      "handoff__create_ticket"
+    ],
+    "forbidden_tools": [],
+    "expected_numbers": [],
+    "forbidden_phrases": [],
+    "must_ask_confirmation": false,
+    "expected_verdict": {
+      "task_success": true,
+      "handoff": true
+    },
+    "weight": 1.0,
+    "repeat": 1,
+    "rubric_version": "cs-v2",
+    "source": "badcase:d7bc2ea7-4209-4c8a-8cc8-6b9330705910",
+    "notes": "由 promote_badcase.py 从坐席标记的坏例自动生成,仅作草稿,未并入 cases_v1.json;入集需主会话治理(版本升级 + 配额重排)。 judge 来源={\"source\": \"demo_manual_review\"}。 附坐席修改 diff(见 badcase.diff)。"
+  }
+]

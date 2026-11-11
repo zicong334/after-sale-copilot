@@ -267,13 +267,14 @@ def test_refund_active_unique_race_state_conflict(session):
     assert session.scalar(select(func.count()).select_from(RefundRequest)) == 1
 
 
-def test_alembic_upgrade_head_fresh_db_nine_migrations():
-    """F3:全新空库 alembic upgrade head,0001→…→0009 依次成功且 ticket 有 summary/session_id 列。
+def test_alembic_upgrade_head_fresh_db_all_migrations():
+    """F3:全新空库 alembic upgrade head,0001→…→0010 依次成功且 ticket 有 summary/session_id 列。
 
     W8 新增 0006_auth(鉴权三表);W9 新增 0007_kb_vectors(kb_vector 表 +
     knowledge_item.status);W10 新增 0008_jobs(job_queue/turn_audit);
     W11 新增 0009_fulfillment(refund_item / refund_request.tracking_no /
-    ticket.sla_breached),head 断言随之更新。
+    ticket.sla_breached);W12 新增 0010_badcase(badcase 表,坏例回流),
+    head 断言随之更新。
     用 alembic 命令 API 在进程内跑 ``upgrade head``(等价 CLI 命令);临时库显式建在
     ROOT/.tmp 下并在 teardown 清理(不用 tmp_path:pytest 以 0o700 创建 basetemp,
     在 DSH 沙盒 ACL 下创建后不可再访问)。
@@ -320,9 +321,10 @@ def test_alembic_upgrade_head_fresh_db_nine_migrations():
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='refund_item'"
                 )
             ]
+            badcase_columns = [r[1] for r in con.execute("PRAGMA table_info(badcase)")]
         finally:
             con.close()
-        assert versions == ["0009_fulfillment"]
+        assert versions == ["0010_badcase"]
         assert job_tables == ["job_queue", "turn_audit"]
         assert "summary" in columns
         assert "session_id" in columns
@@ -332,5 +334,9 @@ def test_alembic_upgrade_head_fresh_db_nine_migrations():
         assert kb_tables == ["kb_vector"]
         assert refund_tables == ["refund_item"]
         assert "tracking_no" in refund_columns
+        # W12 新增 0010_badcase:坏例回流表及其关键列
+        assert {"id", "ticket_id", "merchant_id", "status", "transcript", "tool_chain"} <= set(
+            badcase_columns
+        )
     finally:
         shutil.rmtree(work, ignore_errors=True)

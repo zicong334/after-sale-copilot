@@ -56,3 +56,4 @@
 - 2026-11-11 22:2x W11c-FIX 验收 | 评测引擎 handoff 触发修复闭环:693+1(环境裁决)+check_w1 10/10+48条对照独立复算逐字节一致;CS-ADV-004 恢复真实"确认→建单→handed_off";handed_off 放宽退化为惰性兜底(裁决闭环) | README 数字保留裁决;两项遗留(基线报告陈旧/notes 措辞)入收官治理清单 | 探活后派 W12
 - 2026-11-11 22:1x W12 派发 | hrun-mwc7ao3e-e9cf10 / session-4ceaef27(minimax-cn/MiniMax-M3.1-Flash/high,探活USABLE后派;send超时→2分钟查重找回run_id,规程第七次全通,单实例确认) | 内容:/metrics+坏例回流(drafts隔离区)+Docker/CI/PG 语法级交付物;附 bash spawn 环境坑预告免误修 | 看护:盘中终态监视器+心跳
 - 2026-11-12 00:2x W12 Minimax 429 中途死(第四次,16b 复现)+W12b 续作派发 | hrun-mwc7ao3e-e9cf10 死于 W12-1 起步:盘上唯一遗留 observability.py 541行(主会话核验语法/导入/结尾完整,判可信草稿);探活 EXHAUSTED→按 D-13 直接 flash 续作 hrun-mwcbunzp-2c95ee / session-f5692af0(deepseek-flash/high;超时找回规程第八次全通,单实例查重;brief 含读段30分钟纪律+W12-2→1→3 分块落盘策略) | 基线694(1环境红)| 看护:分块落盘信号+心跳(00:47)
+- 2026-11-12 02:2x W12b 验收 | 可观测+坏例回流+deploy/CI 交付物闭环:亲测 721+1(环境裁决)/722收集,check_w1 10/10,deploy lint rc=0,红线净;口径差异与3处必要改动全部裁决通过 | 队列:W15(探活定模型)→收官 | 心跳02:47

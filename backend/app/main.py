@@ -21,16 +21,18 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from app import jobs
+from app import observability
 from app import security
 from app import sla
 from app.api import agent as agent_api
+from app.api import badcases as badcases_api
 from app.api import get_db
 from app.api import kb as kb_api
 from app.api import auth as auth_api
@@ -59,6 +61,10 @@ async def lifespan(_app: FastAPI):
     Base.metadata.create_all(bind=engine)
     jobs.start_worker(engine)
     sla_scheduler = sla.start_scheduler(engine)
+    # W12-1:/metrics 的后台 5s 刷新线程(daemon,进程退出即止)。请求路径只读
+    # 进程内缓存文本,不在这里做全表聚合;开关关闭或后台刷新显式禁用时不启动。
+    if observability.metrics_enabled() and observability.background_refresh_enabled():
+        observability.start_background_refresh()
     try:
         yield
     finally:
@@ -202,8 +208,41 @@ app.include_router(chat_api.router)
 app.include_router(confirm_api.router)
 app.include_router(handoff_api.router)
 app.include_router(agent_api.router)
+app.include_router(badcases_api.router)
 app.include_router(kb_api.router)
 app.include_router(memory_maintenance_router)
+
+
+# ---------------------------------------------------------------------------
+# W12-1:/metrics(Prometheus 文本格式,免鉴权但默认仅本机可读)
+# ---------------------------------------------------------------------------
+#
+# 采集口径见 ``app.observability`` 模块 docstring:全部来自已落库的
+# ``tool_events`` / ``token_usage`` / ``job_queue`` 与进程内缓存统计,后台每 5s
+# 刷新一次文本缓存;请求路径只读缓存,缓存尚未建立时用本次请求的 session 现算一次。
+# 暴露策略:``METRICS_ENABLED=0`` 关闭整个端点;默认只允许本机(含 TestClient),
+# ``METRICS_ALLOW_REMOTE=1`` 才允许外部抓取(生产应交给 nginx 内网限定)。
+
+#: Prometheus 文本格式的 Content-Type(0.0.4 版本,Prometheus 抓取协议要求)。
+_PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics(request: Request, db: Session = Depends(get_db)) -> Response:
+    """Prometheus 指标抓取端点(文本格式,零第三方依赖)。"""
+    if not observability.metrics_enabled():
+        return Response(content="metrics disabled\n", status_code=404, media_type="text/plain")
+    client_host = request.client.host if request.client else None
+    if not observability.allow_remote_clients() and not observability.client_is_local(client_host):
+        return Response(
+            content="metrics only available from localhost\n",
+            status_code=403,
+            media_type="text/plain",
+        )
+    text = observability.CACHE.get()
+    if text is None or observability.CACHE.is_stale(observability.REFRESH_INTERVAL_SECONDS):
+        text = observability.refresh(db)
+    return Response(content=text, media_type=_PROMETHEUS_CONTENT_TYPE)
 
 
 # ---------------------------------------------------------------------------
