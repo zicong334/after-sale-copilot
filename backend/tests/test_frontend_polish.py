@@ -418,6 +418,7 @@ def test_dom_snapshot_export():
 #   U5 通信收拢终章 / U6 轮询瘦身 / U7 辅助模块降级壳
 # ===========================================================================
 
+import os  # noqa: E402
 import shutil  # noqa: E402  (W15 追加,放在本节顶部便于自检)
 import subprocess  # noqa: E402
 import uuid  # noqa: E402
@@ -459,12 +460,51 @@ def test_w15_stepper_four_nodes_and_states():
 
 
 def test_w15_stepper_timestamp_local_hhmm():
-    """U1:节点时间戳取 UTC 转本地 HH:MM(实现只在 ui.js 一处)。"""
+    """U1:节点时间戳取 UTC 转本地 HH:MM(实现只在 ui.js 一处)。
+
+    W15-FIX:后端 RefundOut 的 created_at/decided_at 是 naive UTC,FastAPI 序列化成
+    无 Z 后缀 ISO 串;fmtClock 必须补 Z 按 UTC 解析,再转本地显示。
+    证法(与时区无关):同一 UTC 瞬间的「无 Z 串」与「带 Z 串」渲染结果必须相同;
+    东八区宿主上再锁定精确值(主会话截图 bug:22:28 UTC 被显示成 22:28,应为 06:28)。
+    Windows 下 node 可能忽略 TZ 环境变量,故精确断言以探针实测时区偏移 (-480=UTC+8) 门控。
+    """
     assert "getHours" in UI_JS and "getMinutes" in UI_JS
     assert '":"' in UI_JS
     assert "function fmtClock" not in APP_JS, "app.js 不应重复实现步骤时间格式化"
     assert "function fmtClock" not in AGENT_JS, "agent.js 不应重复实现步骤时间格式化"
     assert "fmtClock" in UI_JS
+
+    if shutil.which("node") is None:
+        import pytest
+
+        pytest.skip("未找到 node 可执行文件,跳过 naive UTC 行为断言(node 缺失 skip 而非 fail)")
+
+    observed = _run_w15_probe()
+    assert observed.get("ok"), f"探针执行失败: {observed.get('error')}"
+    clocks = observed["clocks"]
+
+    # 1) 无时标串与显式 UTC 串渲染一致 = 按 UTC 解析(不依赖宿主时区)
+    assert clocks["naive_utc"] == clocks["zulu"], "无 Z 后缀的 naive UTC 串被按本地时间解析"
+    assert clocks["naive_ms"] == clocks["zulu_ms"], "naive UTC 22:28 未按 UTC 解析"
+    assert clocks["naive_frac"] == clocks["zulu"], "带微秒的 naive UTC 串未按 UTC 解析"
+
+    # 2) 带时标串维持原行为(不重复补 Z)
+    assert clocks["offset_plus8"] == clocks["zulu"]
+
+    # 3) 非法/空值仍返回空串
+    assert clocks["invalid"] == "" and clocks["empty"] == ""
+
+    # 4) 东八区宿主:锁定精确本地时刻 + stepper 首节点文案
+    if observed.get("tz_offset_min") == -480:
+        assert clocks["naive_utc"] == "08:00", "2026-01-01T00:00:00(naive UTC)应为本地 08:00"
+        assert clocks["naive_ms"] == "06:28", "2026-11-11T22:28:00(naive UTC)应为本地 06:28"
+        first_node = observed["snapshots"]["naive_stepper"]["children"][0]
+        times = [
+            kid["text"]
+            for kid in first_node["children"][1]["children"]
+            if kid["class"] == "step-time"
+        ]
+        assert times == ["06:28"], f"stepper 首节点时间应为本地 06:28,实际 {times}"
 
 
 def test_w15_stepper_skipped_without_refund():
@@ -802,6 +842,19 @@ try {
   });
   out.snapshots.order_pill = ser(hooks.app.pricePill(13390), 0);
   out.snapshots.agent_price_pill = ser(hooks.agent.pricePill(8212), 0);
+  out.clocks = {
+    naive_utc: global.SCUi.fmtClock("2026-01-01T00:00:00"),
+    zulu: global.SCUi.fmtClock("2026-01-01T00:00:00Z"),
+    naive_ms: global.SCUi.fmtClock("2026-11-11T22:28:00"),
+    zulu_ms: global.SCUi.fmtClock("2026-11-11T22:28:00Z"),
+    naive_frac: global.SCUi.fmtClock("2026-01-01T00:00:00.123456"),
+    offset_plus8: global.SCUi.fmtClock("2026-01-01T08:00:00+08:00"),
+    invalid: global.SCUi.fmtClock("not-a-time"),
+    empty: global.SCUi.fmtClock("")
+  };
+  out.tz_offset_min = new Date("2026-01-01T00:00:00Z").getTimezoneOffset();
+  out.snapshots.naive_stepper = ser(global.SCUi.renderRefundStepper(
+    "审核", "2026-11-11T22:28:00", null), 0);
   out.ok = true;
 } catch (err) {
   out.error = String(err && err.stack ? err.stack : err);
@@ -823,6 +876,9 @@ def _run_w15_probe() -> dict:
     stdout_path = work_dir / "probe.stdout.txt"
     stderr_path = work_dir / "probe.stderr.txt"
     script.write_text(_W15_PROBE, encoding="utf-8")
+    # 东八区固定,便于锁定 08:00/06:28;Windows 下 node 可能忽略 TZ,断言按实测偏移门控
+    env = dict(os.environ)
+    env["TZ"] = "Asia/Shanghai"
     try:
         with stdout_path.open("wb") as out_file, stderr_path.open("wb") as err_file:
             proc = subprocess.run(
@@ -832,6 +888,7 @@ def _run_w15_probe() -> dict:
                 stderr=err_file,
                 timeout=120,
                 cwd=str(ROOT),
+                env=env,
             )
         stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
         stderr = stderr_path.read_text(encoding="utf-8", errors="replace")

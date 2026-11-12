@@ -61,3 +61,4 @@
 - 2026-11-12 04:1x W15 Minimax 五度429死+W15b 续作 | W15 hrun-mwcg07yr 67分钟后死于"修正断言与探针"段(2056 Token Plan 上限,03:25);盘上14文件半成品+4 DOM快照,探活 EXHAUSTED 按 D-13 直接 flash 续作 hrun-mwck5uy4-59b237 / session-843156ed(超时找回规程第十次全通,三路查重单实例确认;工序=审计→基线复测→补U5-U7→全量自测) | 教训:夜间长棒 Minimax 连续两棒被 67-120 分钟打死,W15b 起本会话周期内 Minimax 只做探活参考、大棒默认 flash | 看护:审计段信号+心跳04:47/06:47
 - 2026-11-12 06:4x W15b 验收 | 前端精修+工程规范闭环:743+1亲测/check_w1 10/10/真截图7张;U1-U4/U5-U7 全项落位;**真截图抓到 P1:stepper 时间戳 UTC 未换算(22:28 vs 06:26)**,根因定位 ui.js:43+RefundOut naive UTC,立 W15-FIX(flash 派发) | 修复后复拍即收官 | 心跳06:47
 - 2026-11-12 06:4x W15-FIX 派发 | hrun-mwcp5q3f-5b396f / session-7bce15db(deepseek-flash/high,探活EXHAUSTED按D-13直接flash;超时找回规程第十一次全通,单实例确认) | 内容:fmtClock 无Z后缀naive UTC补Z解析+test_frontend_polish naive断言 | 修复后我复拍14号图验证时间戳,随即收官
+- 2026-11-12 08:2x W15-FIX 验收 | 时区P1修复闭环:743+1亲测/check_w1 10/10/真截图复验节点06:28与头部一致;W15全链(U1-U7+P1修)收官 | 用户新指令:天气查询→W16任务书已立(Open-Meteo免key/mock零外呼/辅助信息定位),FIX提交后即派 | 队列:W16→收官

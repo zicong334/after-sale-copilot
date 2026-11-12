@@ -39,10 +39,17 @@
     return 0;
   }
 
+  /* 无时标 ISO 串:YYYY-MM-DDTHH:MM(:SS)(.fff…),不含 Z 或 ±HH:MM。
+   * 后端 RefundOut.created_at/decided_at 是无时标的 naive UTC(FastAPI 序列化后
+   * 没有 Z 后缀),JS 对这类串按**本地时间**解析,stepper 会把 UTC 原值直接显示
+   * (实测 22:28 UTC 显示成 22:28,本地应为 06:28);因此先补 Z 按 UTC 解析。 */
+  var NAIVE_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?$/;
+
   /* UTC 时间戳 → 本地 HH:MM(空值/非法值返回空串)。 */
   function fmtClock(iso) {
     if (!iso) return "";
-    var d = new Date(iso);
+    var text = String(iso);
+    var d = new Date(NAIVE_UTC_RE.test(text) ? text + "Z" : iso);
     if (isNaN(d.getTime())) return "";
     return pad(d.getHours()) + ":" + pad(d.getMinutes());
   }
