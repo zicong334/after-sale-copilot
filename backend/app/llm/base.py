@@ -26,6 +26,10 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Callable, Iterator
 
+# W16:天气/越界词表与来源口径统一由 app.guardrails 提供(纯常量 + 纯函数、无 IO、
+# 不 import 任何业务模块),本模块只引用不复制,避免两处词表漂移;无循环依赖。
+from app import guardrails
+
 # 消息类型:OpenAI 风格
 Message = dict[str, str]
 
@@ -118,7 +122,7 @@ SCHEMA_INTENT: dict[str, Any] = {
     "properties": {
         "intent": {
             "type": "string",
-            "enum": ["policy_qa", "order_judge", "handoff", "other"],
+            "enum": ["policy_qa", "order_judge", "handoff", "weather", "other"],
         },
         "confidence": {"type": "number"},
         "reason": {"type": "string"},
@@ -146,6 +150,8 @@ INTENT_POLICY_QA = "policy_qa"
 INTENT_ORDER_JUDGE = "order_judge"
 #: 意图:转人工(建工单 + 会话 handed_off + AI 停止回复)
 INTENT_HANDOFF = "handoff"
+#: 意图:范围内辅助信息-天气(W16:暴雨延误语境下的天气查询,非通用天气助手)
+INTENT_WEATHER = "weather"
 #: 意图:其它(能力说明)
 INTENT_OTHER = "other"
 
@@ -232,14 +238,26 @@ class FakeLLM(LLMClient):
             return {"intent": INTENT_HANDOFF, "confidence": 0.95, "reason": "风险信号(投诉/金额争议)"}
         if unresolved >= 3:
             return {"intent": INTENT_HANDOFF, "confidence": 0.95, "reason": "连续 3 轮未解决"}
+        # W16:越界主题(投资/股票/菜谱等)→ 转人工。判定优先于天气白名单:
+        # 天气白名单不得成为越界逃生口,也不削弱既有越界拦截。
+        if guardrails.is_out_of_scope(lowered):
+            return {"intent": INTENT_HANDOFF, "confidence": 0.95, "reason": "超出售后服务范围"}
         if has_order and _hit(lowered, ORDER_TOPIC_HINTS):
             return {"intent": INTENT_ORDER_JUDGE, "confidence": 0.9, "reason": "命中订单话题且会话有订单"}
+        # W16:会话已锁订单 + 延误/未达语境 → 履约链优先(先答售后处置),
+        # 天气只作附注,不把会话从履约链上带走。
+        if has_order and guardrails.has_delay_context(lowered):
+            return {"intent": INTENT_ORDER_JUDGE, "confidence": 0.9, "reason": "命中延误语境且会话有订单(履约链优先)"}
         if _hit(lowered, MEMORY_SCENE_HINTS):
             return {"intent": INTENT_OTHER, "confidence": 0.9, "reason": "记忆/偏好场景(由记忆注入处理)"}
         if _hit(lowered, POLICY_TOPIC_HINTS):
             return {"intent": INTENT_POLICY_QA, "confidence": 0.9, "reason": "命中政策话题"}
         if _hit(lowered, ORDER_TOPIC_HINTS):
             return {"intent": INTENT_ORDER_JUDGE, "confidence": 0.85, "reason": "命中订单话题(缺订单号,先追问)"}
+        # W16:范围内辅助信息-天气(强档问句,或天气词叠加物流语境)。
+        # 排在最后,不改变既有规则的相对顺序。
+        if guardrails.is_in_scope_weather_query(lowered):
+            return {"intent": INTENT_WEATHER, "confidence": 0.85, "reason": "命中范围内辅助信息(天气)"}
         return {"intent": INTENT_OTHER, "confidence": 0.5, "reason": "未命中规则"}
 
     # -- 回复组装 ---------------------------------------------------------
@@ -309,6 +327,14 @@ class FakeLLM(LLMClient):
                 f"已为您转接人工客服{order_part}。转接原因:{facts.get('reason')}。"
                 "工单已进入人工队列,坐席会尽快跟进;在人工接手前,我先不再自动回复。"
             )
+
+        # W16:天气回复只由工具返回的事实拼装(实况数字来自 Open-Meteo),
+        # 末尾固定带来源口径;取不到数据时不臆造天气。
+        if kind == "weather":
+            note = guardrails.format_weather_note(facts.get("weather"))
+            if note:
+                return note
+            return "暂时没有取到当地的天气实况,不影响售后处置本身,需要时可以稍后再试。"
 
         # other 分支:任务开始注入了历史偏好时,回复要引用记忆内容(如尺码偏好),
         # 没有记忆(count=0 / text 为空)则保持原能力菜单模板,避免空口承诺。

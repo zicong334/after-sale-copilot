@@ -48,6 +48,7 @@ from app.llm import (
     INTENT_ORDER_JUDGE,
     INTENT_OTHER,
     INTENT_POLICY_QA,
+    INTENT_WEATHER,
     SCHEMA_INTENT,
     SCHEMA_REPLY,
     FakeLLM,
@@ -103,6 +104,8 @@ UNTRUSTED_DATA_NOTICE = (
 #: 写工具名(确认门按它选择 execute 函数)
 TOOL_REFUND = "refund__create"
 TOOL_HANDOFF = "handoff__create_ticket"
+#: W16:天气查询工具(只读;范围内辅助信息,暴雨延误语境下作附注)
+TOOL_WEATHER = "weather__query"
 
 #: 高置信快捷路径:命中即 conf=1.0,跳过 LLM(只放"无需理解就能确定"的表达)。
 HIGH_CONFIDENCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -785,6 +788,15 @@ def make_nodes(
                 "reason": "注入指令拦截",
             }
             path = "guard:injection_block"
+        elif guardrails.is_out_of_scope(text):
+            # W16:越界主题(投资/股票/菜谱等)→ 转人工。判定早于订单快捷路径与 LLM:
+            # 越界拦截不被天气白名单削弱,也不因订单号在手而放行。
+            decision = {
+                "intent": INTENT_HANDOFF,
+                "confidence": 0.95,
+                "reason": "超出售后服务范围",
+            }
+            path = "guard:out_of_scope"
         elif shortcut is not None:
             decision = {
                 "intent": shortcut,
@@ -811,7 +823,8 @@ def make_nodes(
             except json.JSONDecodeError:  # pragma: no cover - 规则表不会走到
                 decision = {"intent": INTENT_OTHER, "confidence": 0.0, "reason": "解析失败"}
             if decision.get("intent") not in {
-                INTENT_POLICY_QA, INTENT_ORDER_JUDGE, INTENT_HANDOFF, INTENT_OTHER,
+                INTENT_POLICY_QA, INTENT_ORDER_JUDGE, INTENT_HANDOFF, INTENT_WEATHER,
+                INTENT_OTHER,
             }:
                 decision["intent"] = INTENT_OTHER
             path = "llm"
@@ -823,6 +836,30 @@ def make_nodes(
                     "reason": "政策争议:核对政策原文",
                 }
                 path = "guard:policy_dispute"
+            # W16:模型判 other 且命中"范围内辅助信息-天气"白名单 → 走天气工具。
+            # 放在 policy_forgery 之后:伪造政策/风险信号不走天气,避免白名单被滥用。
+            elif (
+                decision.get("intent") == INTENT_OTHER
+                and guardrails.is_in_scope_weather_query(text)
+            ):
+                decision = {
+                    "intent": INTENT_WEATHER,
+                    "confidence": 0.85,
+                    "reason": "范围内辅助信息(天气)",
+                }
+                path = "rule:weather"
+            elif (
+                decision.get("intent") == INTENT_WEATHER
+                and not guardrails.is_in_scope_weather_query(text)
+            ):
+                # W16:模型把闲聊判成天气,但没命中范围内辅助信息白名单 → 退回 other,
+                # 不做通用天气助手(售后 Copilot 只在售后语境里给天气)。
+                decision = {
+                    "intent": INTENT_OTHER,
+                    "confidence": 0.5,
+                    "reason": "天气查询不在售后范围内",
+                }
+                path = "llm:weather_out_of_scope"
 
         # 连续 3 轮同意图未解决 → 升级转人工(消费历史消息,不靠关键词"三遍")
         if not blocked and decision.get("intent") != INTENT_HANDOFF and _prior_same_intent(decision["intent"]) + 1 >= 3:
@@ -845,6 +882,16 @@ def make_nodes(
                 "model": llm.model_name,
             },
         )
+        # W16:天气附注槽位——命中天气白名单时记下城市(抽不到为 None,compose 追问);
+        # 越界主题不记天气(白名单不得成为越界逃生口)。
+        pending_weather = None
+        if (
+            not blocked
+            and not guardrails.is_out_of_scope(text)
+            and guardrails.is_in_scope_weather_query(text)
+        ):
+            pending_weather = {"city": guardrails.extract_city(text)}
+
         return {
             "intent": {
                 "name": decision["intent"],
@@ -852,6 +899,7 @@ def make_nodes(
                 "reason": str(decision.get("reason") or ""),
                 "path": path,
                 "order_id": order_id,
+                "pending_weather": pending_weather,
             }
         }
 
@@ -1003,7 +1051,13 @@ def make_nodes(
         text = text_of(state)
         context = dict(state.get("context") or {})
         intent_name = (state.get("intent") or {}).get("name")
-        if guardrails.needs_order_verification(
+        pending_weather = dict((state.get("intent") or {}).get("pending_weather") or {})
+        # W16:纯天气问句(不含延误语境)问的是天气不是订单,不占用履约链;
+        # 一旦出现延误/未达语境,仍按订单链处理(履约链优先,天气只作附注)。
+        weather_only = (
+            intent_name == INTENT_WEATHER and not guardrails.has_delay_context(text)
+        )
+        if not weather_only and guardrails.needs_order_verification(
             text=text,
             context=context,
             intent_name=intent_name,
@@ -1020,6 +1074,18 @@ def make_nodes(
             plan = [{"name": "shop__get_order", "args": {"order_id": forced_order_id}}]
         if not plan:
             plan = _next_plan(state)
+        # ---- W16:天气取数前置——先取数,订单链/确认流走到 compose 时都能带上附注 ----
+        if pending_weather.get("city") and not state.get("weather"):
+            plan = [
+                {"name": TOOL_WEATHER, "args": {"city": str(pending_weather["city"])}}
+            ] + [item for item in plan if str(item.get("name")) != TOOL_WEATHER]
+        elif intent_name == INTENT_WEATHER and not pending_weather.get("city"):
+            # 城市抽不到:追问城市,不臆造天气,也不白跑一次工具
+            return {
+                "steps": steps,
+                "plan": [],
+                "verdict": {"kind": "weather_missing_city"},
+            }
         if not plan:
             # 本轮无事可做:policy 已由 retrieve 完成 / 判定已收敛 / 无订单号
             return {"steps": steps, "plan": []}
@@ -1149,6 +1215,23 @@ def make_nodes(
             pending = dict((result.data or {}).get("pending_confirm") or {})
             return {"plan": [], "confirm": _build_confirm(TOOL_REFUND, pending)}
 
+        if name == TOOL_WEATHER:
+            # W16:天气取数只落 state["weather"]——observations 的 _call_record 不含 data,
+            # verdict 也会被订单/政策分支整体重建,所以用独立状态槽位承载。
+            if not result.ok:
+                error = getattr(result, "error", None)
+                code = str(getattr(error, "code", "") or "UNKNOWN")
+                return {
+                    "plan": rest,
+                    "weather": {"ok": False, "code": code},
+                    "verdict": {**verdict, "kind": "weather_unavailable"},
+                }
+            return {
+                "plan": rest,
+                "weather": {"ok": True, "data": dict(result.data or {})},
+                "verdict": {**verdict, "kind": "weather"},
+            }
+
         return {}
 
     # ---- ⑤ compose:组装文案 + 终态抽取记忆(不调工具 / 不写事件) ---------
@@ -1208,6 +1291,19 @@ def make_nodes(
                 out = {"draft": draft, "confirm": {**confirm, "replied": True}}
             else:
                 out = {"draft": draft}
+        # W16:天气附注——订单/政策类回复后附一段天气参考(只作附注,不改变售后处置);
+        # 天气类回复本身已带来源口径,ensure_weather_note 幂等,不会重复追加。
+        weather_state = dict(state.get("weather") or {})
+        if weather_state and isinstance(out.get("draft"), str):
+            if weather_state.get("ok"):
+                out["draft"] = guardrails.ensure_weather_note(
+                    out["draft"], dict(weather_state.get("data") or {})
+                )
+            else:
+                base = str(out["draft"])
+                if verdict.get("kind") != "weather_unavailable":
+                    base = f"{base}\n\n{guardrails.WEATHER_UNAVAILABLE}"
+                out["draft"] = guardrails.ensure_weather_note(base, None)
         # W13-ISS-21:买家可见文本统一脱敏——内部条款代号 RP-xx/LP-xx 一律换成条款标题。
         # 放在所有确定性守卫之后,保证追加的条款原文同样不泄漏内部代号。
         if isinstance(out.get("draft"), str):
@@ -1297,6 +1393,19 @@ def make_nodes(
                 f"{guardrails.order_status_label(order.get('status'))}。"
                 "如需办理退换货,请说明具体诉求。"
             )
+        # W16:天气类判定——数据只来自工具返回的事实,失败/缺城市都不臆造天气。
+        if kind == "weather":
+            return _render(
+                {
+                    "kind": "weather",
+                    "weather": dict((state.get("weather") or {}).get("data") or {}),
+                },
+                state,
+            )
+        if kind == "weather_missing_city":
+            return guardrails.ensure_weather_note(guardrails.WEATHER_CITY_PROMPT, None)
+        if kind == "weather_unavailable":
+            return guardrails.WEATHER_UNAVAILABLE
         # FIX-7:偏好/记忆场景也把注入的记忆交给回复层,确保引用来源可追溯。
         return _render({"kind": "other", "memory": state.get("memory") or {}}, state)
 

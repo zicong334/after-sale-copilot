@@ -1,8 +1,8 @@
-"""工具层:九字段注册表 + 5 个工具 + ToolResult/Event 三件套。
+"""工具层:九字段注册表 + 6 个工具 + ToolResult/Event 三件套。
 
 导入本包即完成:① ``app.tools.events`` 里的 ToolEvent/ConfirmRequest 注册进
-Base.metadata(否则 conftest 的 create_all 不建这两张表);② 5 个工具注册进
-``app.tools.registry``。
+Base.metadata(否则 conftest 的 create_all 不建这两张表);② 6 个工具注册进
+``app.tools.registry``(W16 新增 ``weather__query`` 天气辅助工具)。
 
 命名空间 ``{server}__{tool}`` 分发见正例 ai_service.py:234-244;此处只暴露
 ``registry`` 的 invoke/ainvoke 统一入口与九字段 dump。
@@ -10,7 +10,7 @@ Base.metadata(否则 conftest 的 create_all 不建这两张表);② 5 个工具
 from __future__ import annotations
 
 from app.tools import events  # noqa: F401 —— 触发 ToolEvent/ConfirmRequest 注册进 Base.metadata
-from app.tools import handoff, policy, refund, shop  # noqa: F401 —— 触发工具注册
+from app.tools import handoff, policy, refund, shop, weather  # noqa: F401 —— 触发工具注册
 from app.tools.events import (
     CONFIRM_TTL_MINUTES,
     ConfirmRequest,

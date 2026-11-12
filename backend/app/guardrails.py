@@ -14,7 +14,10 @@
 - FIX-8 查单快捷路径/统一拒绝话术:``is_order_query_shortcut``
   / ``order_lookup_denied`` / ``ensure_order_not_found_clause``;
 - FIX-9 偏好引用保真:``memory_reference_phrase`` / ``needs_memory_reference``
-  / ``ensure_memory_reference``。
+  / ``ensure_memory_reference``;
+- W16 范围内辅助信息(天气)与越界主题:``is_in_scope_weather_query``
+  / ``has_delay_context`` / ``is_out_of_scope`` / ``extract_city``
+  / ``format_weather_note`` / ``ensure_weather_note``。
 
 注意:本模块不 import app 内其他业务模块(避免循环依赖),可被 perception /
 memory / graph / tools 任意层安全导入。
@@ -927,3 +930,226 @@ def is_resume_ai_request(text: str) -> bool:
     if not compact:
         return False
     return any(pattern in compact for pattern in RESUME_AI_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# W16:售后范围内的辅助信息(天气)+ 越界主题拦截
+#
+# 定位:天气只在"售后履约语境"下作为附注出现(暴雨/延误),
+# 售后 Copilot 不做通用天气助手;越界主题(投资/菜谱等)一律转人工。
+# 新增天气白名单不得削弱既有越界拦截:两者互斥且越界判定优先。
+# ---------------------------------------------------------------------------
+
+#: 强档天气问句:明确在问天气,直接算"范围内辅助信息"。
+WEATHER_QUESTION_HINTS: tuple[str, ...] = (
+    "查天气",
+    "查一下天气",
+    "查查天气",
+    "查询天气",
+    "天气查询",
+    "天气预报",
+    "天气怎么样",
+    "天气如何",
+    "天气情况",
+    "天气咋样",
+    "会下雨",
+    "下雨了吗",
+    "会下雪",
+    "下雪了吗",
+    "气温多少",
+    "今天多少度",
+)
+
+#: 弱档天气词:必须叠加物流/履约语境才算数,否则就变成通用天气助手。
+WEATHER_KEYWORD_HINTS: tuple[str, ...] = (
+    "天气",
+    "下雨",
+    "暴雨",
+    "大雨",
+    "下雪",
+    "气温",
+    "台风",
+    "雷阵雨",
+    "阵雨",
+)
+
+#: 物流/履约语境词:辅助信息只服务于售后履约链。
+LOGISTICS_CONTEXT_HINTS: tuple[str, ...] = (
+    "物流",
+    "快递",
+    "配送",
+    "派送",
+    "发货",
+    "运输",
+    "到货",
+    "签收",
+    "订单",
+    "收货",
+    "上门",
+    "揽收",
+)
+
+#: 延误语境词:会话已锁订单时"履约链优先、天气只作附注"的判定依据。
+DELAY_CONTEXT_HINTS: tuple[str, ...] = (
+    "延误",
+    "延迟",
+    "晚到",
+    "没到",
+    "还没到",
+    "没收到",
+    "未收到",
+    "还没收到",
+    "卡住",
+    "停运",
+    "发不出",
+    "发不了",
+)
+
+#: 越界主题:不在售后服务范围内,一律转人工(不受天气白名单影响)。
+OUT_OF_SCOPE_HINTS: tuple[str, ...] = (
+    "投资",
+    "股票",
+    "基金",
+    "理财",
+    "证券",
+    "期货",
+    "炒股",
+    "比特币",
+    "加密货币",
+    "菜谱",
+    "食谱",
+    "做饭",
+    "烹饪",
+    "彩票",
+    "游戏攻略",
+    "买房",
+)
+
+#: 常见城市名(用于从买家消息里抽城市;按长度倒序匹配,先长后短)。
+CITY_NAMES: tuple[str, ...] = (
+    "北京", "上海", "天津", "重庆", "广州", "深圳", "杭州", "南京", "苏州",
+    "成都", "武汉", "西安", "长沙", "郑州", "青岛", "大连", "沈阳", "哈尔滨",
+    "长春", "济南", "合肥", "福州", "厦门", "南昌", "昆明", "贵阳", "南宁",
+    "海口", "三亚", "兰州", "西宁", "银川", "乌鲁木齐", "拉萨", "呼和浩特",
+    "太原", "石家庄", "宁波", "温州", "无锡", "常州", "南通", "扬州", "徐州",
+    "唐山", "洛阳", "襄阳", "桂林", "珠海", "东莞", "佛山", "中山", "汕头",
+    "惠州", "嘉兴", "绍兴", "金华", "台州", "湖州", "盐城", "泰州", "宿迁",
+    "连云港", "镇江", "威海", "日照", "潍坊", "烟台", "淄博", "济宁", "临沂",
+    "宜昌", "荆州", "黄石", "十堰", "株洲", "湘潭", "衡阳", "岳阳", "常德",
+    "遵义", "大理", "丽江", "绵阳", "德阳", "自贡", "泸州", "宜宾", "乐山",
+    "北海", "六盘水", "毕节", "安顺", "包头", "赤峰", "通辽", "鞍山", "抚顺",
+    "丹东", "锦州", "营口", "盘锦", "四平", "辽源", "通化", "白山", "松原",
+    "牡丹江", "齐齐哈尔", "大庆", "鸡西", "西双版纳", "呼伦贝尔", "鄂尔多斯",
+)
+
+#: 城市名正则(按长度倒序,允许带一个「市」后缀)。
+_CITY_RE = re.compile(
+    "(?:" + "|".join(sorted(set(CITY_NAMES), key=len, reverse=True)) + ")市?"
+)
+
+#: 天气来源固定附注(任务书指定口径,逐字出现在天气相关回复末尾)。
+WEATHER_SOURCE_NOTE = "数据来自 Open-Meteo,仅供参考;物流时效以承运方为准"
+
+#: 天气附注小标题(用于识别"已带附注",避免重复追加)。
+WEATHER_NOTE_MARK = "【天气参考】"
+
+#: 城市缺失时的追问话术。
+WEATHER_CITY_PROMPT = "请告诉我您所在的城市(例如「武汉」),我再为您查询天气。"
+
+#: 上游不可用时的兜底话术(不掩盖售后处置本身)。
+WEATHER_UNAVAILABLE = (
+    "天气信息暂时查询失败(上游数据源未响应),不影响售后处置,需要时可稍后再试。"
+)
+
+
+def _normalized(text: str) -> str:
+    """归一化文本:去空白 + 小写(用于关键词包含匹配)。"""
+    return "".join(str(text or "").split()).lower()
+
+
+def _contains_hint(text: str, hints: tuple[str, ...]) -> bool:
+    body = _normalized(text)
+    if not body:
+        return False
+    return any(hint.lower() in body for hint in hints)
+
+
+def is_in_scope_weather_query(text: str) -> bool:
+    """是否命中"售后范围内的辅助信息-天气"白名单。
+
+    两档:
+    - 强档:明确的天气问句(查天气/天气怎么样/会下雨吗…);
+    - 弱档:天气词 + 物流/履约语境(暴雨导致快递没到…)。
+
+    弱档必须叠加物流语境,否则"今天天气不错"这类闲聊不进天气工具,
+    售后 Copilot 仍然只做售后,不做通用天气助手。
+    """
+    if _contains_hint(text, WEATHER_QUESTION_HINTS):
+        return True
+    return _contains_hint(text, WEATHER_KEYWORD_HINTS) and _contains_hint(
+        text, LOGISTICS_CONTEXT_HINTS
+    )
+
+
+def has_delay_context(text: str) -> bool:
+    """是否处于"延误/未达"语境(履约链优先、天气只作附注的判定依据)。"""
+    return _contains_hint(text, DELAY_CONTEXT_HINTS)
+
+
+def is_out_of_scope(text: str) -> bool:
+    """是否属于售后服务范围之外的主题(投资/菜谱等)→ 转人工。"""
+    return _contains_hint(text, OUT_OF_SCOPE_HINTS)
+
+
+def extract_city(text: str) -> str | None:
+    """从买家消息里抽城市名(取最长匹配,去掉末尾「市」);抽不到返回 None。"""
+    matched = _CITY_RE.search(str(text or ""))
+    if not matched:
+        return None
+    city = matched.group(0)
+    if city.endswith("市"):
+        city = city[:-1]
+    return city or None
+
+
+def format_weather_note(weather: Mapping[str, Any] | None) -> str:
+    """把天气数据拼成一段买家可读的附注(末尾固定带来源与免责口径)。"""
+    data = dict(weather or {})
+    if not data:
+        return ""
+    city = str(data.get("city") or "")
+    phenomenon = str(data.get("weather") or "")
+    temperature = data.get("temperature")
+    apparent = data.get("apparent_temperature")
+    temp_max = data.get("temp_max")
+    temp_min = data.get("temp_min")
+    probability = data.get("precipitation_probability")
+
+    head = f"{city}{phenomenon}".strip()
+    parts = [f"{WEATHER_NOTE_MARK}{head or '当地'}"]
+    if temperature is not None:
+        item = f"当前 {temperature}℃"
+        if apparent is not None:
+            item += f"(体感 {apparent}℃)"
+        parts.append(item)
+    if temp_min is not None and temp_max is not None:
+        parts.append(f"今日 {temp_min}~{temp_max}℃")
+    if probability is not None:
+        parts.append(f"降水概率 {probability}%")
+    return "，".join(parts) + "。" + WEATHER_SOURCE_NOTE
+
+
+def ensure_weather_note(reply: str, weather: Mapping[str, Any] | None = None) -> str:
+    """确定性追加天气附注(幂等:已带来源口径则原样返回)。
+
+    - 有数据:追加「【天气参考】…(实况) + 来源口径」;
+    - 无数据(城市缺失/上游失败):也补一句来源口径,保证口径一致;
+    - 回复里已经带过来源口径:不重复追加(避免双份附注)。
+    """
+    text = str(reply or "").strip()
+    if not text:
+        return text
+    if WEATHER_SOURCE_NOTE in text:
+        return text
+    note = format_weather_note(weather) or WEATHER_SOURCE_NOTE
+    return f"{text}\n\n{note}"

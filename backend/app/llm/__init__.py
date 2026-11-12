@@ -17,6 +17,7 @@ from app.llm.base import (
     INTENT_ORDER_JUDGE,
     INTENT_OTHER,
     INTENT_POLICY_QA,
+    INTENT_WEATHER,
     SCHEMA_INTENT,
     SCHEMA_REPLY,
     FakeLLM,
@@ -55,6 +56,7 @@ __all__ = [
     "INTENT_POLICY_QA",
     "INTENT_ORDER_JUDGE",
     "INTENT_HANDOFF",
+    "INTENT_WEATHER",
     "INTENT_OTHER",
 ]
 

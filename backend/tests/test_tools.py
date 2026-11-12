@@ -6,7 +6,7 @@
 - 同幂等键调两次只有一张退款申请单
 - refund 金额 > 实付被 BUSINESS_REJECT
 - 写工具返回 pending_confirm 卡片含四要素 + confirm_token 落库
-- 5 个工具九字段总表 dump
+- 6 个工具九字段总表 dump(W16 起含只读工具 weather__query)
 - tool_events 每次 invoke 一条事件、trace_id 贯穿
 
 顶层 ``import app.tools`` 会触发 events.py 的 ToolEvent/ConfirmRequest 注册进
@@ -87,15 +87,16 @@ def _ctx(
 # 九字段契约 / 注册表
 # ---------------------------------------------------------------------------
 
-FIVE_TOOLS = {"shop__get_order", "policy__search", "policy__check_return",
-              "refund__create", "handoff__create_ticket"}
+SIX_TOOLS = {"shop__get_order", "policy__search", "policy__check_return",
+             "refund__create", "handoff__create_ticket", "weather__query"}
 NINE_FIELDS = {"name", "description", "input_schema", "output_schema",
                "side_effect", "timeout_s", "retry", "idempotency_key",
                "requires_confirm"}
 
 
-def test_five_tools_registered():
-    assert {s.name for s in list_specs()} == FIVE_TOOLS
+def test_six_tools_registered():
+    """W16:新增只读工具 weather__query(范围内辅助信息),工具集合同步为六项。"""
+    assert {s.name for s in list_specs()} == SIX_TOOLS
 
 
 def test_specs_nine_fields():

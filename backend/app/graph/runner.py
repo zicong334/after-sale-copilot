@@ -50,6 +50,7 @@ from app.llm import (
     INTENT_ORDER_JUDGE,
     INTENT_OTHER,
     INTENT_POLICY_QA,
+    INTENT_WEATHER,
     LLMClient,
 )
 from app.models import ChatMessage, ChatSession, Ticket
@@ -62,8 +63,14 @@ from app.trace import (
     record_event,
 )
 
-#: 四类意图(仅用于兜底校验;分类结果由 classify 节点给出)。
-_INTENTS = (INTENT_POLICY_QA, INTENT_ORDER_JUDGE, INTENT_HANDOFF, INTENT_OTHER)
+#: 五类意图(仅用于兜底校验;分类结果由 classify 节点给出)。
+_INTENTS = (
+    INTENT_POLICY_QA,
+    INTENT_ORDER_JUDGE,
+    INTENT_HANDOFF,
+    INTENT_WEATHER,
+    INTENT_OTHER,
+)
 
 
 @dataclass

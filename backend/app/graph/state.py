@@ -17,6 +17,8 @@
 - ``observations``:已执行工具调用的摘要(对应 ``tool_calls`` 的对外九字段裁剪版);
 - ``draft``:compose 产出的回复文本(挂起那一轮也要有,HTTP 响应才能带 reply);
 - ``verdict``:判定事实包(compose 的输入,决定用哪套话术);
+- ``weather``:W16 天气工具取数结果(``{"ok": True, "data": {...}}`` 或 ``{"ok": False, "code": str}``),
+  compose 据此在回复末尾附天气口径(订单/政策类回复只作附注);
 - ``handoff``:是否走转人工分支(明示人工 / 连续 3 轮 / 金额争议 / 步数上限);
 - ``steps``:act 已执行圈数(``> NODE_STEP_LIMIT`` 强制转人工,第 9 圈不再调工具);
 - ``trace_id``:本轮 trace(跨"挂起 → 重启 → resume"保持不变,事件才能串成一条链);
@@ -54,6 +56,7 @@ class GraphState(TypedDict, total=False):
     observations: list[dict[str, Any]]
     draft: str
     verdict: dict[str, Any]
+    weather: dict[str, Any] | None
     handoff: bool
     steps: int
     trace_id: str
@@ -78,6 +81,7 @@ def initial_state(
         "observations": [],
         "draft": "",
         "verdict": {},
+        "weather": None,
         "handoff": False,
         "steps": 0,
         "trace_id": trace_id,

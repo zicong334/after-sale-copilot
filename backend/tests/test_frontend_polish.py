@@ -63,7 +63,7 @@ def test_welcome_screen_copy():
     assert "您好，我是「安心退」智能管家。" in CHAT_HTML
     assert "把繁琐售后交给我，把放心结果还给你。" in CHAT_HTML
     examples = re.findall(r'class="example-chip"[^>]*data-text="([^"]+)"', CHAT_HTML)
-    assert len(examples) == 3
+    assert len(examples) == 4
     assert all("转人工" not in text for text in examples), "快捷词不应引导用户转人工"
     assert "empty-badge" in CHAT_HTML
 
@@ -573,10 +573,10 @@ def test_w15_queue_card_remains_button():
 
 
 def test_w15_quick_chip_icons():
-    """U4:三个快捷词各带一枚 16px 线性 SVG 图标,W14 的胶囊契约不变。"""
+    """U4:快捷词各带一枚 16px 线性 SVG 图标,W14 的胶囊契约不变(W16 起第四枚为「查天气」)。"""
     chips = re.findall(r'class="example-chip"[^>]*data-text="([^"]+)"', CHAT_HTML)
-    assert len(chips) == 3
-    assert CHAT_HTML.count('<svg class="chip-icon"') == 3
+    assert len(chips) == 4
+    assert CHAT_HTML.count('<svg class="chip-icon"') == 4
     for chip in re.findall(r'<button[^>]*class="example-chip"[\s\S]*?</button>', CHAT_HTML):
         assert '<svg class="chip-icon"' in chip
         assert 'stroke="currentColor"' in chip
