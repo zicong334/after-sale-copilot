@@ -35,13 +35,30 @@ from app.llm.real_client import (
     UsageStats,
     has_real_key,
 )
-from app.llm.router import ModelRouter
+from app.llm.router import TIER_FALLBACK, TIER_PRIMARY, CircuitBreaker, ModelRouter
+
+#: 进程级共享熔断器(F4)。
+#:
+#: 为什么必须共享:``api/chat.py`` 每轮对话都调一次 ``build_llm()``。若每次都新建
+#: 熔断器,"连续 3 次失败开路 / 冷却 30s / 半开探针"这套状态机在真实 HTTP 路径上
+#: 跨请求永远不生效——每轮都从零开始,主用已知挂了也仍要先撞一次、付满超时才降级。
+#:
+#: 为什么只共享熔断器、不共享整个 router:``ModelRouter.attach_trace()`` 每轮改写
+#: 实例上的 ``_session``/``_trace_id``;共享 router 会让并发请求(异步端点 + 作业
+#: worker 线程)串错追踪归属。客户端仍按每轮新建,行为不变。
+#:
+#: 为什么在模块导入期就建好(而不是懒加载):模块导入受解释器导入锁保护,
+#: 天然免除"两个线程同时懒初始化"的竞态,比加锁懒加载更简单。
+#: 对象本身无 IO、无网络, FakeLLM 密封路径下也只是两个空壳。
+_PRIMARY_BREAKER = CircuitBreaker(name=TIER_PRIMARY)
+_FALLBACK_BREAKER = CircuitBreaker(name=TIER_FALLBACK)
 
 __all__ = [
     "LLMClient",
     "FakeLLM",
     "RealLLMClient",
     "build_llm",
+    "reset_shared_breakers",
     "has_real_key",
     "LLMApiError",
     "LLMBatchAbort",
@@ -82,6 +99,18 @@ def _build_fallback_client() -> RealLLMClient | None:
     return client
 
 
+def reset_shared_breakers() -> None:
+    """把进程级共享熔断器换回初始闭合态(**测试隔离用**,生产路径不调)。
+
+    与 ``security.reset_security_state()`` / ``semantic_cache.clear()`` 同一模式:
+    进程级单例必须逐用例重置,否则前一个用例把主用熔断成 open,后一个用例
+    拿到的就是脏状态。conftest 的 autouse fixture 前后各调一次。
+    """
+    global _PRIMARY_BREAKER, _FALLBACK_BREAKER
+    _PRIMARY_BREAKER = CircuitBreaker(name=TIER_PRIMARY)
+    _FALLBACK_BREAKER = CircuitBreaker(name=TIER_FALLBACK)
+
+
 def build_llm(**kwargs) -> LLMClient:
     """按环境变量选择 LLM 实现:有 ``LLM_API_KEY`` → RealLLMClient,否则 FakeLLM。
 
@@ -91,6 +120,8 @@ def build_llm(**kwargs) -> LLMClient:
     W13 接线:配置了备胎(``LLM_FALLBACK_API_KEY`` / ``LLM_FALLBACK_BASE_URL``)
     时返回 ``ModelRouter(primary, fallback)``——主用熔断后自动切备胎,两档都挂
     再用规则引擎兜底;没配备胎仍返回裸 ``RealLLMClient``(既有契约/测试不变)。
+
+    F4:两个熔断器取**进程级共享**实例,使熔断状态跨请求存活(见模块顶部说明)。
     """
     if not has_real_key():
         return FakeLLM()
@@ -98,4 +129,9 @@ def build_llm(**kwargs) -> LLMClient:
     fallback = _build_fallback_client()
     if fallback is None:
         return primary
-    return ModelRouter(primary, fallback)
+    return ModelRouter(
+        primary,
+        fallback,
+        breaker=_PRIMARY_BREAKER,
+        fallback_breaker=_FALLBACK_BREAKER,
+    )

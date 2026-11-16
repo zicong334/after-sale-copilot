@@ -27,13 +27,15 @@
 ## 3. 架构图(文字版)
 
 ```
-         买家(frontend/chat.html, SSE)                 客服(待做 UI,本期无)
+         买家(frontend/chat.html, SSE+WS)          客服(frontend/agent.html, WS)
                     │                                        │
                     └──────────────┬─────────────────────────┘
                                    ▼
                  FastAPI(backend/app/main.py)
-                 /health · /api/c/chat(SSE)· /api/c/confirm/* · /api/c/handoff
-                 /orders · /tickets · /refunds · /v1/maintenance
+                 /health · /metrics · /auth/login · /favicon.ico
+                 /api/c/*(买家:chat SSE / confirm / handoff / refunds)
+                 /api/b/*(坐席工作台)· /api/fulfillment/*(仓库回调,HMAC 签名)
+                 /api/kb/* · /v1/maintenance · /ws/buyer · /ws/agent
                                    ▼
    感知层 backend/app/perception        Pydantic 归一化(订单号/金额/诉求;失败=显式错误)
                                    ▼
@@ -42,14 +44,18 @@
                                               ↘ confirm 中断(先确认后执行,恢复不重放)
    handoff → compose(LLM 文案)
                                    ▼
-   工具层 backend/app/tools            九字段注册表 + 5 工具(三层校验:registry/service/policy)
-   read : shop__get_order / policy__search / policy__check_return
+   工具层 backend/app/tools            九字段注册表 + 6 工具(三层校验:registry/service/policy)
+   read : shop__get_order / policy__search / policy__check_return / weather__query
    write: refund__create / handoff__create_ticket(均 requires_confirm,落 confirm_request 确认卡)
                                    ▼
-   数据层 SQLite WAL(backend/dev.db) 17 张业务表 = PRD 14 张 + tool_events/confirm_request(0002)
-                                     + memory(0004);迁移 0001→0005(ticket.session_id)
+   检索层 backend/app/retrieval         BM25Plus + TF-IDF/SVD 双路 → 加权 RRF(k=60)
+                                        → 覆盖率闸(no_hit)→ Jaccard 重排 top-5
                                    ▼
-   评测层 backend/app/eval             硬断言(FAIL_HARD/FAIL_CRITICAL)→ FakeJudge 三维 rubric → 6 指标报告
+   数据层 SQLite WAL(backend/dev.db) 25 张表(其中 11 张直带 merchant_id);迁移 0001→0010
+                                     图断点独立库 data/checkpoints.db(thread_id=chat_session.id)
+                                   ▼
+   评测层 backend/app/eval             硬断言(FAIL_HARD/FAIL_CRITICAL)→ 裁判三维 rubric
+                                        (FakeJudge 密封 / 真实 LLM 裁判)→ 6 指标报告
 ```
 
 ## 4. 快速开始
@@ -133,7 +139,7 @@ curl -s -X POST http://127.0.0.1:8000/auth/login ^
 ## 5. 测试
 
 ```bat
-:: 全量测试(453 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(763 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
@@ -151,7 +157,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:760 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:763 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -270,9 +276,15 @@ fixture 固定为 internal 且关闭限流/防重放(测试毫秒级连发,不�
 
 MOCK 边界:W10-1 的「备」是 `MinimaxRealClient`(代码真实、默认 MOCK 声明,只有 `healthcheck()` 允许出网 1 次);
 语义缓存是进程内内存实现,多 worker 部署前需换 Redis/DB;异步队列是 SQLite 单文件单 worker,
-横向扩容前需换独立队列(接口已留 `JobQueue` ABC)。`build_llm()` 尚未接 `ModelRouter`(llm/`__init__.py` 在白名单外),
-`SemanticCache` 也尚未接 `api/chat.py` 的 classify 前链路(全仓唯一调用点是 `retrieval/hybrid.py` 的 `clear()`),
-两处生产链路接线均列为后续候选;本棒以 `test_router.py`/`test_cache.py` 作为 W10-1/W10-2 验收证据。
+横向扩容前需换独立队列(接口已留 `JobQueue` ABC)。
+**接线现状(W13 起已完成,2026-11-16 复核)**:`build_llm()` 已接 `ModelRouter`
+(`llm/__init__.py`,配了 `LLM_FALLBACK_*` 即返回 router);`SemanticCache` 已接
+`api/chat.py` 的 classify 前链路(命中直接构造 `TurnResult`,失败只记 `aux_degraded` 不 500)。
+**F4(2026-11-16)**:两个熔断器已提为进程级共享,使"连续 3 次失败开路 / 冷却 30s / 半开探针"
+跨请求真正生效(此前每轮 `build_llm()` 新建熔断器,该状态机在 HTTP 路径上等于失效);
+只共享熔断器不共享 router,避免 `attach_trace` 并发串错追踪归属。
+证据:`tests/test_router.py` 的 `test_build_llm_shares_breakers_across_calls` /
+`test_open_breaker_from_previous_turn_skips_primary` / `test_shared_breakers_start_closed_for_each_test`。
 
 ### 7.5 售后履约纵深清单(W11)
 
@@ -332,20 +344,31 @@ MOCK 边界:指标是"对既有事件表的离线聚合",不发任何外呼;坏�
    来自 provider 真实响应(`estimated: false`);`cost_usd` 因 deepseek-flash 单价未获官方确认而为 `null`(价目 TBD,
    token 数可复算,见 `data/eval/reports/w4c-*.json` 的 meta.tokens)。无 key 时回退 FakeLLM,usage 为 MOCK 估算(`estimated: true`)。
    证据:`backend/app/api/chat.py`、`backend/app/llm/real_client.py`。
-3. **与 PRD §1 条件 1 的偏差(主动汇报)**:PRD 原文要求「每张业务表带 `merchant_id`」;实际 14 张业务表中
-   7 张主体表直带该列,5 张纯从属表经主表推导(理由写在模型注释:
-   `backend/app/models/catalog.py:55`、`catalog.py:83`、`chat.py:50`、`orders.py:60`、`ticket.py:75`),
-   `eval_case` 为项目级资产(`backend/app/models/eval.py:21`),`merchant` 本身是租户根。
+3. **与 PRD §1 条件 1 的偏差(主动汇报;2026-11-16 按现状重算)**:PRD 原文要求「每张业务表带 `merchant_id`」;
+   实际 **25 张表中 11 张直带该列**(auth_user / badcase / chat_session / knowledge_item / memory /
+   order / product / refund_request / review / ticket / turn_audit),其余 12 张为:
+   7 张纯从属表经主表推导(chat_message / order_item / product_metric / product_variant /
+   refund_item / ticket_message / kb_vector,理由写在模型注释:
+   `backend/app/models/catalog.py:55`、`catalog.py:83`、`chat.py:50`、`orders.py:60`、`ticket.py:75`)、
+   3 张进程基建表(job_queue / request_nonce / token_usage)、
+   `eval_case` 为项目级资产(`backend/app/models/eval.py:21`)、`merchant` 本身是租户根。
    租户隔离的实际效果不受影响(查询/写操作都带租户条件,越权有 `AUTHZ_DENIED` 测试);
    若验收要求严格照字面「每张表都有列」,需补一条迁移并把从属表的写入路径改为显式传租户,
-   属结构性改动,本棒(交付棒)白名单外,列为 W4-C/后续候选。
-   证据:`grep -n "merchant_id" backend/app/models/*.py`(上面 5 条注释 + 7 个列定义)。
-4. **真实模型评测两轮结果(W4-C)**:第一轮(修复前)判「未达到」:0.6944/critical 6,报告
-   `data/eval/reports/w4c-20261107T144402Z-e3c303.json` + `docs/验收报告_W4C.md`;确定性护栏修复包(W4-C-FIX,
-   评测集升版 cs-eval-v1-20261108b)后第二轮判「部分达到(偏上)」:整体 133/144=0.9236(≥0.9 冲刺线)、critical=0、
-   agreement 0.9722、硬断言 92.36%(未达 100% 线)、cost 单价 TBD,报告 `data/eval/reports/w4c-20261107T172318Z-7b48c6.json`。
-   残余失败:CS-REFUND-006、CS-MEMORY-001 两条系统性(各 0/3)+ 5 次采样波动散发;无任何资损/越权/隐私失败。
-   完整判定与周一决策选项见 `docs/最终验收报告.md`。
+   属结构性改动,列为后续候选。
+   复算命令:`python -c "import app.models as m; t=m.Base.metadata.tables; print([n for n,c in t.items() if 'merchant_id' in c.columns])"`(在 backend/ 下执行)。
+4. **真实模型评测最新结果(2026-11-16 复核)**:全量 48×3 **第三轮(R3)判「达到」**——
+   整体 139/144=**0.9653**、critical=**0**、agreement 140/144=0.9722、p95 用户等待 8910ms,
+   报告 `data/eval/reports/w4c-20261109T141553Z-5bbfcb.json`。
+   分层:golden 52/57=0.9123、adversarial 42/42、edge 30/30、regression 15/15(加总 139,与总数一致)。
+   R3 内唯一系统性簇 `CS-MEMORY-001`(fact_mismatch ×3)**已修复并经单案真实复验闭环**:
+   `data/eval/reports/w8fix-verify2.json` 3/3 通过、零失败零簇
+   (此前 `w4c-20261110T025914Z-146fef.json` 仍 0/3,说明首版修法无效,改 gate 后才通过)。
+   ⚠️ 只读 R3 的 JSON 会看到 `systematic=true` 而误判有未修缺陷,**完整证据链是 R3 + w8fix-verify2 两份**。
+   成本口径:R3 报告 `pricing.status=TBD`,故 cost 字段为 0 占位,**token 用量是真实的**
+   (782,357 tokens / 468 请求);按 `data/eval/pricing_deepseek_20261109.md` 复算:
+   空闲 1.17 元 / 高峰 2.34 元(reasoning 属 completion 子集,不重复计费)。
+   裁判与被测模型同源(`judge_same_source_risk: true`),agreement **存在自偏好偏差**,不能当独立第三方一致性读。
+   历史两轮(0.6944 未达到 / 0.9236 部分达到)的完整判定过程见 `docs/最终验收报告.md` 与 `docs/验收记录.md`。
 
 ## 9. 不做清单(照 PRD §3,每项标注将来从哪长出来)
 
@@ -357,7 +380,7 @@ MOCK 边界:指标是"对既有事件表的离线聚合",不发任何外呼;坏�
 | 完整 i18n、多币种结算 | `currency` 列 + 话术资源文件(中文一套 + 英文资源文件) |
 | 分布式、消息队列、微服务 | 不留(SQLite WAL 单机是显式选择) |
 | 自研编排框架 | 不留(LangGraph 一张图) |
-| 向量检索 / FAISS | `retrieval` 接口 + `knowledge_item.embedding_model` / `dim` 列 |
+| 向量检索:FAISS / 神经语义 embedding | **W9 已实现本机混合检索**(BM25Plus + TF-IDF/SVD,见 §10);仍不做 FAISS 与神经 embedding,换真 embedding 走 `retrieval` 接口 + `kb_vector.model/dim` 列 |
 | 附件独立表 | `chat_message` 存 URL(禁 base64) |
 | 可视化评测大盘 | 评测报告 JSON(6 指标)是唯一口径 |
 
@@ -367,7 +390,7 @@ MOCK 边界:指标是"对既有事件表的离线聚合",不发任何外呼;坏�
 |---|---|---|
 | 多租户 | 所有业务表 `merchant_id` + 查询带租户条件;**W8 已把「当前 merchant/身份」从 JWT 注入请求上下文** | 改接 IdP 时只换 `security.create_token/decode_token` 与 `api/auth.py`,路由不动 |
 | 接入安全外置 | `security.py` 的 ABC/函数边界(JWT 签发校验、RateLimiter、nonce 表、PubSubBroker) | JWT 换 IdP/OAuth2;限流与 nonce 换 Redis;PubSub 换 Redis pub/sub(多 worker) |
-| 向量检索 | `retrieval` 模块接口 + `knowledge_item.embedding_model/dim` 列 | 在 `policy__search` 里换/加一个 retriever 实现,BM25 保留为兜底 |
+| 向量检索增强(换真 embedding) | **W9 已实现混合检索**:`retrieval/hybrid.py` 双路召回 + 加权 RRF(k=60)+ 覆盖率闸 + Jaccard 重排。稠密路当前是 `TfidfVectorizer(char_wb+word) → TruncatedSVD(dim=64) → L2` 的 **LSA,不是神经语义 embedding**;跨词泛化靠 `bm25_backend.QUERY_ALIASES` **手工别名表**(如「退钱」→「退款」) | 换/加一个 `VectorBackend` 实现即可,`kb_vector` 表已存 model/dim;BM25 保留为兜底 |
 | 新工具 | 九字段注册表(`backend/app/tools/registry.py:101`)+ `pricing.*`/`coupon.*` 命名空间 | 新增 `ToolSpec` + handler 并 `register()`,写工具必须 `requires_confirm=True` + `idempotency_key` |
 | 多币种 / i18n | `currency` 列 + 话术资源文件 | 金额仍存整数分,展示层换算;文案从资源文件取 |
 | 真实 LLM / 裁判 | `LLMClient` 抽象 + `FakeLLM` / `FakeJudge` 可注入(W4-C 换实现) | 实现 `LLMClient` 子类注入 `runner` / `engine`,不动图与断言 |
@@ -398,10 +421,13 @@ MOCK 边界:指标是"对既有事件表的离线聚合",不发任何外呼;坏�
 backend/
 ├── app/            main.py / db.py / models/ / api/(含 agent.py:工作台 API) / services/ /
 │                   tools/ / graph/ / memory/ / retrieval/ / eval/ / perception / schemas/ / trace
-├── alembic/        0001_initial → 0002_add_tool_events → 0003_ticket_summary → 0004_memory → 0005_ticket_session_id
+├── alembic/        0001_initial → 0002_add_tool_events → 0003_ticket_summary → 0004_memory
+│                   → 0005_ticket_session_id → 0006_auth → 0007_kb_vectors → 0008_jobs
+│                   → 0009_fulfillment → 0010_badcase(共 10 个迁移,25 张表)
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          453 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
+├── tests/          763 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台)
 └── README.md       本文件
 
-frontend/           chat.html / app.js / agent.html / agent.js / style.css(原生实现,零 CDN、零构建)
+frontend/           chat.html / app.js / agent.html / agent.js / login.html / api.js / ui.js / style.css
+                    (原生实现,零 CDN、零构建;api.js 是三页唯一持有底层网络调用的文件)
 ```

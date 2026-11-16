@@ -8,7 +8,7 @@
 | # | 决策 | 结论 | 理由 |
 |---|---|---|---|
 | D-01 | 是否用 browser-use | **不用**。技术栈 = FastAPI + SQLAlchemy 2.0 + Alembic + SQLite(WAL) + LangGraph 一张六节点图 + rank-bm25 | 售后域没有浏览器自动化需求;browser-use 只增加不可复现性(03§5.3 的"做"清单里也没有它) |
-| D-02 | 检索方案 | **v1 只做 BM25 + 条款号引用**;FAISS/向量检索留扩展点(`retrieval/vector_backend` 接口),不实现 | 降低依赖风险(faiss-cpu wheel 对 Python 版本敏感);政策文档量小,BM25+clause_id 已满足"答案带来源"的验收线;禁止 mock 冒充向量检索 |
+| D-02 | 检索方案(**已被 D-14 取代**,保留原文留痕) | **v1 只做 BM25 + 条款号引用**;FAISS/向量检索留扩展点(`retrieval/vector_backend` 接口),不实现 | 降低依赖风险(faiss-cpu wheel 对 Python 版本敏感);政策文档量小,BM25+clause_id 已满足"答案带来源"的验收线;禁止 mock 冒充向量检索 |
 | D-03 | Python 环境 | **Python 3.13.15,项目根 `.venv` 锁死**;依赖以 `requirements.lock.txt`(pip freeze)为准 | 本机 3.14/3.13 双版本共存,pip 与 python 不同版本是已暴露风险(记忆系统设计 pyproject 版本帽教训);任何会话不得用全局 python 装包 |
 | D-04 | 排期模型 | **不绑日历周**。按 W1→W4 阶段门推进,每阶段拆成"单产物 dsh 会话";阶段末由主会话按任务书验收标准验收,通过才进下一阶段 | 执行者是 dsh 会话而非人天;保留四周结构的验收门与产出定义,去掉日历约束 |
 | D-05 | LLM 接入 | **W1-W3 全程 FakeLLM/mock,无 key 全绿**;真实模型只在 W4-C 接入(LLMClient 抽象,DeepSeek 或 OpenAI 兼容,`.env` 不进 git) | G9 铁律:先冻结数据/契约,失败才能归因到层而不是采样运气;真实 key 待用户提供 |
@@ -20,6 +20,11 @@
 | D-11 | 验收口径治理(真实 LLM 行为评测) | 用户 2026-11-09 选 C 拍板:"硬断言 100%"在真实模型采样下按类分层——**critical 类硬断言(资损/越权/隐私/确认门绕过)100% + 整体 pass_rate ≥0.9 + agreement ≥0.8 + critical_fail=0 + cost/时延真实计量(价目来源存档 data/eval/pricing_deepseek_20261109.md)+ 评测集/rubric 版本化 + 回滚可用 = "达到"**;非 critical 硬断言失败记已知缺口并成簇分析(同类 ≥3 必须修复或用户显式豁免)。按新口径第二轮(0.9236/critical 0/agreement 0.9722/无资损越权隐私失败)复判为"达到";用户同时选 B,第三轮小修+重跑照做,**最终判定以第三轮为准** | 采样非确定性与 100% 硬线的原理性张力(最终验收报告 §3);用户裁决 BC 组合 |
 | D-12 | deepseek-flash 价目 | 输入(缓存未命中)空闲 1 元/高峰 2 元每百万;输入(命中)0.02/0.04;输出 4/8;周末及节假日全天空闲;reasoning_tokens 属输出子集不重复计费;行级 usage 未采缓存字段→成本按全未命中上界计,两轮实际 ≈2.53 元,第三轮预算 ≈2.5 元(高峰) | 用户 2026-11-09 提供官方价目,存档见 data/eval/pricing_deepseek_20261109.md |
 | D-13 | 调度策略 v2 与夜间事故留痕 | **2026-11-10 用户拍板:dsh 派发优先 `minimax-cn/MiniMax-M3.1-Flash`(5 小时额度、不花现金,effort=high);仅主会话验收判定质量不达标时回退 deepseek-flash(预授权,留痕);flash 高峰时段(工作日 9-12/14-18)尽量不排**。背景事故:2026-11-09 夜 W8 会话卡在 dsh 沙箱拦 playwright 截图(等审批+反复重试),主会话 watchdog 报过一次后未续挂、仅靠 wait 单信号,卡整晚并踏入高峰烧钱;处置:cancel+主会话亲收(产物完整、19 安全测试绿、生产默认 enforce),截图改主会话 playwright 补拍;纪律补丁入记忆 deepseek-harness-local(watchdog 必续挂/dsh 禁截图/steer 不注入即 cancel) | 2026-11-10 09:0x 主会话执行用户指令;**同日追加派发前探活协议**:`.uitools/probe_minimax.py` 1-token 探活(0=USABLE/2=EXHAUSTED/3=ERROR),EXHAUSTED/ERROR 当棒显式 flash+high 并留痕、下一棒重探;首跑即命中 429 额度满→W9 起首棒按协议回退 flash(12:2x 空闲时段) |
+
+| D-14 | 检索方案升级(**取代 D-02 的「向量不实现」**) | **W9 起实现本机混合检索**:BM25Plus(停用词清洗)+ `TfidfVectorizer(char_wb+word) → TruncatedSVD(dim=64) → L2` 双路各取 top-20 → 加权 RRF(k=60)→ 覆盖率乘子(`COVERAGE_BASE=0.2`)→ 融合分阈值 0.005 判 no_hit → Jaccard(权重 0.15)重排取 top-5。**仍不引入 FAISS,也不引入神经语义 embedding**:稠密路是 LSA 线性降维,跨词泛化靠 `bm25_backend.QUERY_ALIASES` 手工别名表 | 2026-11-16 主会话按现状追认留痕(W9 当时未补决策行,属治理漏项)。D-02 的依赖风险理由仍成立(faiss-cpu wheel 对 Python 版本敏感),sklearn 已在依赖内;阈值 0.005 = sqrt(覆盖句最低 0.008135 × 未覆盖句最高 0.003072),两侧余量 39%/63%,10 句定标表在 `tests/test_hybrid.py::CALIBRATION_CASES`,可手算复现 |
+| D-15 | 表数与幂等键现状(**取代 §5 的「14 张表」与旧幂等键公式**) | 实测 **25 张表 / 10 个迁移(0001→0010)**;11 张直带 `merchant_id`,7 张纯从属表经主表推导,3 张进程基建表(job_queue/request_nonce/token_usage),`eval_case` 项目级资产,`merchant` 租户根。`refund__create` 幂等键组成字段改为 **`order_id, reason, amount_cents, items`**(W11 部分退款引入 `items`,去掉 `target_state`);传 `items` 时按购买单价折算并忽略 `amount_cents` | 2026-11-16 主会话用 ORM 内省复算(`Base.metadata.tables`)后追认。表数增长来自 0002 tool_events+confirm_request / 0004 memory / 0006 auth_user+request_nonce+token_usage / 0007 kb_vector / 0008 job_queue+turn_audit / 0009 refund_item / 0010 badcase(逐迁移解析 `create_table` 核对,建表总数 25,与 ORM 内省一致) |
+| D-16 | 工具集扩为 6 个(**取代 §5 的「5 个工具」**) | 新增 **`weather__query`**(read,timeout 5s,无幂等键):Open-Meteo 免 key、TTL 10min、结构化错误信封、测试全 mock 零外呼。定位为「暴雨延误」类**售后辅助信息**,不做通用天气助手:白名单两档(强档=明确天气问句;弱档=天气词**必须叠加物流语境**),且**越界主题判定优先**,新增白名单不削弱既有越界拦截 | W16 用户功能指令,2026-11-12 验收通过;2026-11-16 追认决策行。体感温度字段在 `current_weather` 端点缺失时诚实留 `None`,不编造 |
+| D-17 | 模型网关熔断器跨请求共享(**F4 修复**) | `build_llm()` 每轮新建 `ModelRouter`,原先也新建 `CircuitBreaker`,导致「连续 3 次失败开路 / 冷却 30s / 半开探针」在真实 HTTP 路径上**跨请求永不生效**。改为**进程级共享两个熔断器**(模块导入期建好,免懒初始化竞态),**不共享整个 router**(`attach_trace` 每轮改写 session/trace_id,共享会串错追踪归属)。测试隔离用 `reset_shared_breakers()`,挂 conftest autouse | 2026-11-16 主会话实测发现并修复,3 条新测试先红后绿;全量 763 收集 / 762 通过 / 1 已知环境性失效,对比修前 759 通过为净增 3 条、零回归。**未加锁**:GIL 下构造不出失败的并发测试(栅栏对齐 0/60、8 线程×3000 累加 0/20 丢失),按「无失败测试不写生产代码」纪律停手;切 free-threaded Python 时必须补锁 |
 
 ## 1. 产品定义与 MVP 五条件
 
@@ -50,7 +55,7 @@ MVP = 一条最细的端到端链路同时满足五条件(逐条定义):
 | 完整 i18n、多币种结算 | `currency` 列 + 话术资源文件(中文一套 + 英文资源文件) |
 | 分布式、消息队列、微服务 | 不留(SQLite WAL 单机是显式选择) |
 | 自研编排框架 | 不留(LangGraph 一张图) |
-| 向量检索/FAISS | `retrieval` 接口 + `knowledge_item.embedding_model/dim` 列(见 D-02) |
+| 神经语义 embedding / FAISS | W9 已实现本机混合检索(BM25 + TF-IDF/SVD,见 D-14);换真 embedding 走 `retrieval` 接口 + `kb_vector.model/dim` 列 |
 | 附件独立表 | `chat_message` 存 URL(禁 base64),表结构见 W1-A 任务书 |
 | 可视化评测大盘 | 评测报告 JSON(6 指标)是唯一口径 |
 
@@ -65,12 +70,12 @@ MVP = 一条最细的端到端链路同时满足五条件(逐条定义):
 | 5 | **护栏阈值** | 所有写操作需确认卡(四要素:做什么/影响面/不可逆性/替代方案),超时 10 分钟=拒绝并留草稿;退款金额>订单实付→代码层直接拦;>¥500 或金额争议+投诉→RISKY 强制人工;act 自环 `steps>8`→强制 handoff;同一会话 10 分钟内重复内容=疑似重复,跳过;定价指令("以后打 8 折")→隔离,不入可执行记忆 |
 | 6 | **评测基线** | W1 先写 10 条 golden(断言业务结果:这单退了吗/金额对吗/回执对吗/禁调工具没调,不是 assert 200);W4 补到 48 条(19 golden/14 adversarial/10 edge/5 regression,17 字段落表);n=3;硬断言 100%、整体≥0.85(冲刺 0.9)、critical=0、judge agreement≥0.8 |
 
-## 5. 系统架构(五层 × 六节点 × 5 工具 × 14 表)
+## 5. 系统架构(五层 × 六节点 × 6 工具 × 25 表)
 
 - **五层契约**:感知(Pydantic 归一化)/编排(LangGraph)/工具(九字段注册表)/记忆(三层三时机)/评估(硬断言→裁判→人工抽检)。每层输入/输出/失败语义/可观测见 03§4.2.1,任务书逐层落地。
 - **六节点图**:`perceive(纯函数) → classify(LLM) → retrieve(IO) → act(IO,自环,steps>8 强制 handoff) → compose(LLM) → handoff(IO)`;State 可序列化;写操作前 `interrupt`(先确认后执行,恢复不重放);SqliteSaver checkpointer。
-- **5 个工具(九字段)**:`shop__get_order`(read)、`policy__search`(read)、`policy__check_return`(read)、`refund__create`(write,confirm,幂等键=sha256(order_id|target_state|reason|amount_cents))、`handoff__create_ticket`(write,confirm)。统一 `ToolResult{ok,data,error{code,message,retryable,param},meta}`;三层校验:registry=schema,service=resolve(存在性/归属),policy 层=业务规则。
-- **14 张表**(W1-A):merchant, product, product_variant, product_metric, review, "order", order_item, refund_request, chat_session, chat_message, ticket, ticket_message, knowledge_item, eval_case。金额=整数分;状态=CHECK+服务层守卫+迁移表三件套;守卫式更新(`UPDATE...WHERE status='旧'`,rowcount=1);时间 UTC;软删除 `deleted_at`;memory 表在 W3-B 加(第 15 张),attachment 独立表不做(URL 列)。
+- **6 个工具(九字段)**:`shop__get_order`(read)、`policy__search`(read)、`policy__check_return`(read)、`weather__query`(read,W16/D-16)、`refund__create`(write,confirm,幂等键组成字段=`order_id|reason|amount_cents|items`,见 D-15)、`handoff__create_ticket`(write,confirm)。统一 `ToolResult{ok,data,error{code,message,retryable,param},meta}`;三层校验:registry=schema,service=resolve(存在性/归属),policy 层=业务规则。
+- **25 张表 / 10 个迁移**(W1-A 起 14 张,逐包增长至 0010,见 D-15):W1-A 基线 merchant, product, product_variant, product_metric, review, "order", order_item, refund_request, chat_session, chat_message, ticket, ticket_message, knowledge_item, eval_case;后续追加 tool_events / confirm_request(0002)、memory(0004)、auth_user / request_nonce / token_usage(0006)、kb_vector(0007)、job_queue / turn_audit(0008)、refund_item(0009)、badcase(0010);0003 与 0005 只改列/索引,不建表。金额=整数分;状态=CHECK+服务层守卫+迁移表三件套;守卫式更新(`UPDATE...WHERE status='旧'`,rowcount=1);时间 UTC;软删除 `deleted_at`;attachment 独立表不做(URL 列)。图断点另用独立库 `data/checkpoints.db`,不进业务库。
 - **记忆三处放**:店铺规则→知识库(版本化,带 clause_id 检索);订单事实→DB(唯一事实源);买家偏好→长期记忆(白名单+source/TTL/scope,任务开始注入一次并声明"可能过时",任务结束才抽取,定价指令隔离)。
 
 ## 6. 评测与验收

@@ -17,6 +17,7 @@ from typing import Any, Iterator
 import httpx
 import pytest
 
+from app.llm import build_llm
 from app.llm.base import LLMClient
 from app.llm.minimax_client import MinimaxRealClient
 from app.llm.real_client import LLMApiError, LLMConfigError, UsageStats
@@ -615,3 +616,95 @@ def test_minimax_healthcheck_exception_is_captured(monkeypatch):
     assert result["ok"] is False
     assert result["status_code"] is None
     assert _PLACEHOLDER_KEY not in json.dumps(result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# 跨请求熔断持久化(F4 回归)
+# ---------------------------------------------------------------------------
+#
+# 背景:``api/chat.py`` 每轮对话都调一次 ``build_llm()``。原实现每次都新建
+# ``ModelRouter`` 与两个 ``CircuitBreaker``,于是"连续 3 次失败开路 / 冷却 30s /
+# 半开探针"这套状态机在**真实 HTTP 路径上跨请求永远不生效**——每一轮都从零开始,
+# 主用已知挂了也仍要先去撞一次、付满它的超时才降级。
+#
+# 原有 24 个网关测试都在**同一个 ModelRouter 实例**上连续驱动,验证的是熔断器
+# 类本身;走 HTTP 路径的测试又全部把 ``build_llm`` 换成桩。两条路的交集为空,
+# 所以这个缺口没有任何测试覆盖。下面两条补的就是这条交集。
+
+
+def _router_from_env(monkeypatch) -> ModelRouter:
+    """按环境变量造真实形态的 ModelRouter(只构造,不出网)。"""
+    monkeypatch.setenv("LLM_API_KEY", _PLACEHOLDER_KEY)
+    monkeypatch.setenv("LLM_FALLBACK_API_KEY", _PLACEHOLDER_KEY)
+    monkeypatch.setenv("LLM_FALLBACK_BASE_URL", "https://fallback.invalid/v1")
+    router = build_llm()
+    assert isinstance(router, ModelRouter), "配了备胎就该走 ModelRouter"
+    return router
+
+
+def _replace_clients(router: ModelRouter, primary: Any, fallback: Any) -> None:
+    """把真实客户端换成脚本化假客户端(先关原 httpx 连接,不留资源泄漏)。"""
+    router.primary.close()
+    router.fallback.close()
+    router.primary = primary
+    router.fallback = fallback
+
+
+def test_build_llm_shares_breakers_across_calls(monkeypatch):
+    """两次 build_llm() 必须共享同一对熔断器,否则熔断状态每轮归零。"""
+    first = _router_from_env(monkeypatch)
+    second = _router_from_env(monkeypatch)
+    try:
+        # 本轮只共享熔断器,不把 router 做成单例:attach_trace 每轮改写
+        # router 上的 session/trace_id,共享整个 router 会串错追踪归属。
+        assert first is not second
+        assert first.primary_breaker is second.primary_breaker
+        assert first.fallback_breaker is second.fallback_breaker
+    finally:
+        first.close()
+        second.close()
+
+
+def test_open_breaker_from_previous_turn_skips_primary(monkeypatch):
+    """上一轮把主用熔断后,下一轮的全新 router 不该再去撞主用。"""
+    first = _router_from_env(monkeypatch)
+    _replace_clients(
+        first,
+        _ScriptedClient("p1", [_api_error("主用 500", 500)] * 3),
+        _ScriptedClient("f1", ["备胎答复"] * 3),
+    )
+    for _ in range(3):
+        assert first.complete(_MESSAGES) == "备胎答复"
+    assert first.primary_breaker.state == CircuitBreaker.OPEN
+
+    # 下一轮:全新 router + 全新客户端,主用这次"能答"——但熔断开着就不该问它。
+    second = _router_from_env(monkeypatch)
+    _replace_clients(
+        second,
+        _ScriptedClient("p2", ["主用答复(熔断期间不该出现)"]),
+        _ScriptedClient("f2", ["备胎答复"]),
+    )
+    try:
+        assert second.complete(_MESSAGES) == "备胎答复"
+        assert second.primary.calls == [], "熔断开启期间主用不应被调用"
+    finally:
+        first.close()
+        second.close()
+
+
+def test_shared_breakers_start_closed_for_each_test(monkeypatch):
+    """进程级共享熔断器必须逐用例重置,否则用例之间互相污染。
+
+    本条**故意排在上一条(把主用熔断成 open)之后**:没有重置钩子时,
+    这里拿到的就是上一条留下的 open 状态,断言必红。
+    与 conftest 里 ``semantic_cache.clear()`` / ``security.reset_security_state()``
+    同一个道理——进程级单例必须逐用例清。
+    """
+    router = _router_from_env(monkeypatch)
+    try:
+        assert router.primary_breaker.state == CircuitBreaker.CLOSED
+        assert router.primary_breaker.failure_count == 0
+        assert router.fallback_breaker.state == CircuitBreaker.CLOSED
+        assert router.fallback_breaker.failure_count == 0
+    finally:
+        router.close()
