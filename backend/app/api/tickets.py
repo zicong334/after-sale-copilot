@@ -6,6 +6,11 @@ claim/close/add_message 全部委托 services.tickets 的守卫式实现;
 W13 ISS-60:该组路由原先无任何身份校验与租户过滤,现统一挂 ``current_identity``
 并按 ``identity.merchant_id`` 隔离(internal 模式不过滤);买家身份不能
 冒充人工坐席写入 ``author_type="agent"`` 的消息。
+
+A1(2026-11-16):ISS-60 只补了**认证**,本组仍是 ``ROLE_ANY`` 且只比租户,
+于是买家 token 能**冒充坐席 service_id 领单并关单**。现把建单/领单/关单/状态流转
+收归 agent(``require_agent``),``service_id`` 一律从 token 取。
+买家留言(``add_message``)仍是正当能力,保持 ``current_identity``。
 """
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api import get_db
+from app.api import get_db, require_agent
 from app.db import utc_now
 from app.errors import NotFoundError
 from app.models import RefundRequest, Ticket, TicketMessage
@@ -40,11 +45,21 @@ def _assert_tenant(identity: Identity, ticket: Ticket) -> None:
         raise NotFoundError(f"工单不存在: {ticket.id}")
 
 
+def _service_id(identity: Identity, claimed: str | None) -> str:
+    """领单/流转的坐席 id 一律取 token 主体(A1);请求体值无身份效力。
+
+    internal 模式(回归脚本)保留请求体值,与 ``merchant_id`` 既有约定一致。
+    """
+    if identity.is_internal:
+        return claimed or identity.sub
+    return identity.service_id or identity.sub
+
+
 @router.post("/tickets", response_model=TicketOut, status_code=status.HTTP_201_CREATED)
 def create_ticket(
     payload: TicketCreate,
     db: Session = Depends(get_db),
-    identity: Identity = Depends(current_identity),
+    identity: Identity = Depends(require_agent),
 ) -> Ticket:
     merchant_id = payload.merchant_id
     if not identity.is_internal:
@@ -109,7 +124,7 @@ def transition_status(
     ticket_id: str,
     payload: TicketStatusIn,
     db: Session = Depends(get_db),
-    identity: Identity = Depends(current_identity),
+    identity: Identity = Depends(require_agent),
 ) -> Receipt:
     """W11 B7:工单状态手动流转(仅 queued→claimed→waiting_customer→closed)。"""
     ticket = db.get(Ticket, ticket_id)
@@ -117,7 +132,7 @@ def transition_status(
         raise NotFoundError(f"工单不存在: {ticket_id}")
     _assert_tenant(identity, ticket)
     updated = ticket_svc.transition(
-        db, ticket_id, payload.to_status, service_id=payload.service_id
+        db, ticket_id, payload.to_status, service_id=_service_id(identity, payload.service_id)
     )
     return Receipt(
         ticket_id=updated.id,
@@ -131,13 +146,13 @@ def claim(
     ticket_id: str,
     payload: TicketClaim,
     db: Session = Depends(get_db),
-    identity: Identity = Depends(current_identity),
+    identity: Identity = Depends(require_agent),
 ) -> Receipt:
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         raise NotFoundError(f"工单不存在: {ticket_id}")
     _assert_tenant(identity, ticket)
-    ticket = ticket_svc.claim(db, ticket_id, payload.service_id)
+    ticket = ticket_svc.claim(db, ticket_id, _service_id(identity, payload.service_id))
     return Receipt(
         ticket_id=ticket.id,
         status=ticket.status,
@@ -149,7 +164,7 @@ def claim(
 def close(
     ticket_id: str,
     db: Session = Depends(get_db),
-    identity: Identity = Depends(current_identity),
+    identity: Identity = Depends(require_agent),
 ) -> Receipt:
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:

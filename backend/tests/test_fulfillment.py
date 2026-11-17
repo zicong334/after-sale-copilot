@@ -691,3 +691,61 @@ def test_w11_3_frontend_sla_badge_static():
     assert "SLA 超时" in agent_js
     css = (FRONTEND / "style.css").read_text(encoding="utf-8")
     assert ".badge-sla" in css
+
+
+# ---------------------------------------------------------------------------
+# A2(2026-11-16 审计):非 delivered 订单退全款的状态机死角
+# ---------------------------------------------------------------------------
+
+
+def test_rest_rejects_refund_on_non_refundable_order(client, engine):
+    """非 ``delivered`` 订单不得建退款单(从源头拒掉,不留脏单)。
+
+    缺陷:建单侧(服务层 + REST)不看 ``order.status``,而完成侧 ``refund_complete``
+    守卫要求 ``delivered``。于是 ``shipped`` 订单退全款时,最后一笔把残额退到 0
+    会 409 并 ``rollback``——**连退款单自身置「退款」的更新都被回滚**,
+    这笔退款永久卡在「审核」态。而 ``物流破损`` 是 schema 明确允许的退款原因,
+    天然发生在运输途中,属现实场景。
+
+    修法:REST 入口与工具层同口径(``tools/refund.REFUNDABLE_STATUSES``)。
+    门放在**入口**而不是服务层:服务层是机制(金额/幂等),入口才是政策落点,
+    这样只测金额数学的服务层单测不受影响。
+    """
+    with Session(engine) as session:
+        _seed(session, oid="o-shipped", order_status="shipped")
+    r = client.post(
+        "/refunds",
+        json={
+            "merchant_id": "m-f",
+            "order_id": "o-shipped",
+            "amount_cents": 13000,
+            "reason": "物流破损",
+            "idempotency_key": "a2-shipped",
+        },
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "STATE_CONFLICT"
+    with Session(engine) as session:
+        assert (
+            session.scalars(
+                select(RefundRequest).where(RefundRequest.order_id == "o-shipped")
+            ).first()
+            is None
+        ), "被拒的请求不得留下退款单"
+
+
+def test_rest_still_allows_refund_on_delivered_order(client, engine):
+    """正向:delivered 订单建单不受新门影响(防守卫过度)。"""
+    with Session(engine) as session:
+        _seed(session, oid="o-ok", order_status="delivered")
+    r = client.post(
+        "/refunds",
+        json={
+            "merchant_id": "m-f",
+            "order_id": "o-ok",
+            "amount_cents": 13000,
+            "reason": "质量问题",
+            "idempotency_key": "a2-delivered",
+        },
+    )
+    assert r.status_code == 201, r.text

@@ -260,7 +260,11 @@ def test_refund_create_idempotent(client, engine):
 
 def test_refund_amount_exceeds_paid(client, engine):
     _add_merchant(engine)
-    _add_order(engine, "o-1", "paid", 10000)
+    # A2(2026-11-16)夹具修正:原用 "paid" 状态订单,而 REST 入口新增了
+    # "仅已签收订单可退" 的政策门(与工具层同口径),会先返回 409 STATE_CONFLICT,
+    # 掩盖本用例真正要测的金额上限。改为 delivered 让金额校验成为首个触发点。
+    # **断言未放宽**:仍是 422 + AMOUNT_EXCEEDS_PAID,金额仍是 10001 > 实付 10000。
+    _add_order(engine, "o-1", "delivered", 10000)
     r = client.post("/refunds", json=_refund_payload(amount=10001))
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "AMOUNT_EXCEEDS_PAID"

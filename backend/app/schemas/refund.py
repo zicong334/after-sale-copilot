@@ -36,9 +36,15 @@ class RefundCreate(BaseModel):
 
 
 class RefundDecision(BaseModel):
-    """审核/驳回决策请求(decided_by = 决策人 id)。"""
+    """审核/驳回决策请求。
 
-    decided_by: str
+    A1(2026-11-16):``decided_by`` **不再具有身份效力**——enforce 模式下审核人
+    一律取 token 主体(见 ``api/refunds._decided_by``),与 W13 对 ``merchant_id``
+    的处理同一约定。字段保留为可选,仅为兼容既有调用方与 internal 回归脚本;
+    传了也会被忽略,不传则完全合法。
+    """
+
+    decided_by: str | None = None
 
 
 class RefundItemOut(BaseModel):

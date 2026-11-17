@@ -5,6 +5,10 @@
 W13 ISS-60:该组路由原先没有任何身份校验与租户过滤(enforce 模式下裸奔,
 任意登录者可跨店读写订单)。现统一挂 ``current_identity`` 并按
 ``identity.merchant_id`` 做租户隔离;``AUTH_MODE=internal``(回归脚本)下不过滤。
+
+A1(2026-11-16):ISS-60 只补了**认证**,``/orders`` 仍是 ``ROLE_ANY``,于是买家 token
+也能建单、推支付/发货/签收(甚至改同店**其他买家**的订单)。现把写操作收归 agent
+(``require_agent``),订单详情补 customer 归属校验(买家只能读自己的)。
 """
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api import get_db
+from app.api import assert_customer_scope, get_db, require_agent
 from app.db import utc_now
 from app.errors import NotFoundError
 from app.models import Order
@@ -35,7 +39,7 @@ def _assert_tenant(identity: Identity, order: Order) -> None:
 def create_order(
     payload: OrderCreate,
     db: Session = Depends(get_db),
-    identity: Identity = Depends(current_identity),
+    identity: Identity = Depends(require_agent),
 ) -> Order:
     merchant_id = payload.merchant_id
     if not identity.is_internal:
@@ -83,6 +87,9 @@ def get_order(
     if order is None:
         raise NotFoundError(f"订单不存在: {order_id}")
     _assert_tenant(identity, order)
+    # A1:买家只能读自己的订单(W11 B1 只修了列表,详情此前仍可越权读同店他人单)。
+    if not assert_customer_scope(identity, order.customer_id):
+        raise NotFoundError(f"订单不存在: {order_id}")
     return order
 
 
@@ -98,7 +105,7 @@ def _receipt(order: Order) -> Receipt:
 def pay(
     order_id: str,
     db: Session = Depends(get_db),
-    identity: Identity = Depends(current_identity),
+    identity: Identity = Depends(require_agent),
 ) -> Receipt:
     order = db.get(Order, order_id)
     if order is None:
@@ -111,7 +118,7 @@ def pay(
 def ship(
     order_id: str,
     db: Session = Depends(get_db),
-    identity: Identity = Depends(current_identity),
+    identity: Identity = Depends(require_agent),
 ) -> Receipt:
     order = db.get(Order, order_id)
     if order is None:
@@ -124,7 +131,7 @@ def ship(
 def deliver(
     order_id: str,
     db: Session = Depends(get_db),
-    identity: Identity = Depends(current_identity),
+    identity: Identity = Depends(require_agent),
 ) -> Receipt:
     order = db.get(Order, order_id)
     if order is None:

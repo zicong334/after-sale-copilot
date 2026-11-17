@@ -16,9 +16,14 @@ class TicketCreate(BaseModel):
 
 
 class TicketClaim(BaseModel):
-    """客服领单请求(claimed_by = 客服 id)。"""
+    """客服领单请求。
 
-    service_id: str
+    A1(2026-11-16):``service_id`` **不再具有身份效力**——enforce 模式下领单坐席
+    一律取 token 主体(见 ``api/tickets._service_id``),防止冒充他人领单。
+    字段保留为可选,仅为兼容既有调用方与 internal 回归脚本;传了也会被忽略。
+    """
+
+    service_id: str | None = None
 
 
 class TicketMessageIn(BaseModel):

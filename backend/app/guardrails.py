@@ -403,6 +403,12 @@ def audit_status_claims(
 
     返回 ``(新回复, 被替换的类别列表)``。有证据的声称原样保留;同一类别只替换一次
     连续出现的句子,避免模板刷屏。
+
+    A3(2026-11-16):**未被任何句子 match 覆盖的字符必须逐字保留**。
+    ``_SENTENCE_RE`` 的字符类排除了句读与换行,所以句首标点、连续标点、换行符
+    不属于任何 match;旧实现用 ``findall`` + ``"".join`` 重组,会把这些字符静默丢掉
+    (最明显是多段回复的段落换行丢失,两段被粘成一段),**即使没有任何替换发生也会改文本**。
+    现改用 ``finditer`` 并把 match 之间的空隙原样拷回,保证"没被替换的部分逐字不变"。
     """
     body = str(reply or "")
     if not body:
@@ -410,7 +416,13 @@ def audit_status_claims(
     replaced: list[str] = []
     out: list[str] = []
     previous_replacement: str | None = None
-    for sentence in _SENTENCE_RE.findall(body):
+    cursor = 0
+    for match in _SENTENCE_RE.finditer(body):
+        # 空隙(句首/连续句读、换行等)原样保留,不参与替换判定。
+        if match.start() > cursor:
+            out.append(body[cursor:match.start()])
+        cursor = match.end()
+        sentence = match.group(0)
         categories = [
             category
             for category, pattern in STATUS_CLAIM_RULES
@@ -431,6 +443,9 @@ def audit_status_claims(
         if replacement != previous_replacement:
             out.append(replacement)
         previous_replacement = replacement
+    # 尾部未覆盖字符(如结尾多出来的标点/换行)同样保留。
+    if cursor < len(body):
+        out.append(body[cursor:])
     return "".join(out), replaced
 
 

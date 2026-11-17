@@ -358,3 +358,39 @@ def test_ensure_memory_reference_appends_phrase_and_is_idempotent():
     assert guardrails.ensure_memory_reference(fixed, _INJECTED_SIZE_MEMORY) == fixed
     # 无偏好正文(空注入)→ 原样返回
     assert guardrails.ensure_memory_reference(forgetful, {"text": "无历史偏好", "count": 0}) == forgetful
+
+
+# ---------------------------------------------------------------------------
+# A3(2026-11-16 审计):反编造逐句重写必须保留非命中字符
+# ---------------------------------------------------------------------------
+
+
+def test_audit_status_claims_preserves_unmatched_characters():
+    """替换无证据的状态声称时,**不得静默丢弃**未命中的字符。
+
+    缺陷:``_SENTENCE_RE = [^。！？\n]+[。！？]?`` 的 ``findall`` 只抓
+    「一串非句读字符 + 最多一个句末标点」,句首标点、连续标点、换行符
+    都不被任何 match 覆盖,``"".join(out)`` 重组时被静默丢掉。
+    最明显的是多段回复的 ``\n\n`` 丢失 → 两段被粘成一段。
+    该函数跑在每条回复上,属「静默改数据」类缺陷。
+    """
+    # 只断言"未被任何 match 覆盖的字符"必须保留:句首/连续句读与换行。
+    # 注意括号、被替换句自带的那个句末标点属于**命中句本身**,随句子一起被替换
+    # 是预期行为,不算丢字符(原先把这两类也算成缺陷是过度归因)。
+    cases = [
+        ("。已为您退款。", lambda out: out.startswith("。")),
+        ("已退款\n\n好的", lambda out: "\n\n好的" in out),
+        ("？？已转人工！！", lambda out: out.startswith("？？") and out.endswith("！")),
+    ]
+    for body, check in cases:
+        out, replaced = guardrails.audit_status_claims(body, {})
+        assert replaced, f"应触发替换: {body!r}"
+        assert check(out), f"非命中字符被丢弃: 输入={body!r} 输出={out!r}"
+
+
+def test_audit_status_claims_keeps_evidenced_text_byte_identical():
+    """有证据时整段必须逐字不变(替换逻辑不得顺手改排版)。"""
+    body = "？？已为您退款！！\n\n感谢耐心等待。"
+    out, replaced = guardrails.audit_status_claims(body, {"refund_done": True})
+    assert replaced == []
+    assert out == body
