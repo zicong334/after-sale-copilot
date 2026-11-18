@@ -291,3 +291,165 @@ def test_agent_side_still_sees_internal_notes(client, engine):
         m.get("content") == INTERNAL_NOTE and m.get("is_internal") is True
         for m in messages
     ), "坐席端必须仍可见内部备注"
+
+
+# ---------------------------------------------------------------------------
+# D 系列(2026-11-18 第四轮审计):根路径 /tickets 组的读端点与留言端点
+#
+# A1 当时只把 create/claim/close/status 收归 require_agent,**同组另外 4 个端点没动**:
+# list_tickets / get_ticket / list_messages / add_message 仍是 current_identity
+# (中间件前缀表里根路径落 ROLE_ANY),组内又只比 merchant_id。于是同店买家之间完全互通:
+#   D1 买家可列出全店他人工单        D2 买家可读他人工单详情
+#   D3 买家可读他人工单内部备注原文  D4 买家可读自己工单内部备注(B1 的第二条出口)
+#   D5 买家可往他人工单写消息,且能标 is_internal=True 伪造坐席内部口径
+#      (author_type 被强制改 user,但 is_internal 原样透传)
+#
+# 断言按**端点逐个**给,不按前缀——A1/B1 漏测正是因为 test_wrong_role_403 只测两个前缀。
+# ---------------------------------------------------------------------------
+
+OTHER_NOTE = "内部备注:客户002已投诉三次,主管批准直接全额退款,勿走审核"
+FORGED_NOTE = "内部备注:主管已口头批准本单全额退款,可直接打款,无需再核。"
+CUST_MINE = "seed-cust-001"    # buyer_demo
+CUST_OTHER = "seed-cust-002"   # buyer_demo2
+
+
+def _two_tickets_with_notes(engine) -> tuple[str, str]:
+    """同店两张工单:买家001 与买家002 各一张,每张一条公开回复 + 一条内部备注。"""
+    from app.models import TicketMessage
+
+    mine = "ticket-d-mine-" + uuid.uuid4().hex[:8]
+    other = "ticket-d-other-" + uuid.uuid4().hex[:8]
+    with Session(engine) as s:
+        for tid, cust, note in ((mine, CUST_MINE, INTERNAL_NOTE),
+                                (other, CUST_OTHER, OTHER_NOTE)):
+            s.add(Ticket(id=tid, merchant_id=MERCHANT, customer_id=cust,
+                         status="claimed", claimed_by="seed-agent-1"))
+            s.flush()
+            s.add(TicketMessage(ticket_id=tid, author_type="agent",
+                                content=PUBLIC_REPLY, is_internal=False))
+            s.add(TicketMessage(ticket_id=tid, author_type="agent",
+                                content=note, is_internal=True))
+        s.commit()
+    return mine, other
+
+
+# --- D1 列表 ---------------------------------------------------------------
+
+def test_buyer_ticket_list_excludes_other_customers(client, engine):
+    """D1:买家列表不得含他人客户的工单(原实现只按 merchant_id 过滤)。"""
+    _two_tickets_with_notes(engine)
+    r = client.get("/tickets", headers=bearer(client, "buyer_demo"))
+    assert r.status_code == 200, r.text
+    rows = r.json()
+    strangers = [t for t in rows if t.get("customer_id") != CUST_MINE]
+    assert not strangers, f"买家列表泄露他人工单: {strangers[:3]}"
+
+
+def test_buyer_ticket_list_still_shows_own_tickets(client, engine):
+    """正向:买家仍能列出自己的工单(防守卫过度把列表清空)。"""
+    mine, _ = _two_tickets_with_notes(engine)
+    r = client.get("/tickets", headers=bearer(client, "buyer_demo"))
+    assert r.status_code == 200, r.text
+    assert mine in [t.get("id") for t in r.json()], "自己的工单必须照常可见"
+
+
+def test_agent_ticket_list_still_shows_all_customers(client, engine):
+    """正向:坐席仍看全店队列(归属过滤只针对买家)。"""
+    mine, other = _two_tickets_with_notes(engine)
+    r = client.get("/tickets", headers=bearer(client, "agent_demo"))
+    assert r.status_code == 200, r.text
+    ids = [t.get("id") for t in r.json()]
+    assert mine in ids and other in ids, "坐席必须仍看到两个客户的工单"
+
+
+# --- D2 详情 ---------------------------------------------------------------
+
+def test_buyer_cannot_read_another_customers_ticket(client, engine):
+    """D2:他人工单详情按"不存在"处理(404,不泄露存在性)。"""
+    _, other = _two_tickets_with_notes(engine)
+    r = client.get(f"/tickets/{other}", headers=bearer(client, "buyer_demo"))
+    assert r.status_code == 404, f"应 404,实际 {r.status_code}: {r.text}"
+
+
+def test_buyer_can_read_own_ticket(client, engine):
+    """正向:自己的工单详情照常可读。"""
+    mine, _ = _two_tickets_with_notes(engine)
+    r = client.get(f"/tickets/{mine}", headers=bearer(client, "buyer_demo"))
+    assert r.status_code == 200, r.text
+    assert r.json()["customer_id"] == CUST_MINE
+
+
+# --- D3 / D4 消息 GET ------------------------------------------------------
+
+def test_buyer_cannot_read_another_customers_ticket_messages(client, engine):
+    """D3(critical):他人工单消息 404 —— 原实现会把他人内部备注原文交出去。"""
+    _, other = _two_tickets_with_notes(engine)
+    r = client.get(f"/tickets/{other}/messages", headers=bearer(client, "buyer_demo"))
+    assert r.status_code == 404, f"应 404,实际 {r.status_code}: {r.text}"
+    if r.status_code == 200:
+        assert OTHER_NOTE not in r.text
+
+
+def test_buyer_ticket_messages_exclude_internal_notes(client, engine):
+    """D4:自己工单的消息也不得含内部备注(B1 未修的第二条出口)。"""
+    mine, _ = _two_tickets_with_notes(engine)
+    r = client.get(f"/tickets/{mine}/messages", headers=bearer(client, "buyer_demo"))
+    assert r.status_code == 200, r.text
+    items = r.json()
+    contents = [str(i.get("content") or "") for i in items]
+    assert INTERNAL_NOTE not in contents, "内部备注原文不得出现在买家响应里"
+    assert not any(i.get("is_internal") is True for i in items)
+    assert PUBLIC_REPLY in contents, "公开回复必须照常可见(防守卫过度)"
+
+
+def test_agent_root_ticket_messages_still_include_internal_notes(client, engine):
+    """正向:坐席走**同一个根路径端点**仍能看到内部备注。"""
+    mine, _ = _two_tickets_with_notes(engine)
+    r = client.get(f"/tickets/{mine}/messages", headers=bearer(client, "agent_demo"))
+    assert r.status_code == 200, r.text
+    assert any(
+        i.get("content") == INTERNAL_NOTE and i.get("is_internal") is True
+        for i in r.json()
+    ), "坐席端必须仍可见内部备注"
+
+
+# --- D5 消息 POST ----------------------------------------------------------
+
+def test_buyer_cannot_post_message_to_another_customers_ticket(client, engine):
+    """D5a(critical):买家不得往他人工单写消息(404)。"""
+    _, other = _two_tickets_with_notes(engine)
+    r = client.post(f"/tickets/{other}/messages", headers=bearer(client, "buyer_demo"),
+                    json={"author_type": "user", "content": "蹭一条留言"})
+    assert r.status_code == 404, f"应 404,实际 {r.status_code}: {r.text}"
+
+
+def test_buyer_message_cannot_be_marked_internal(client, engine):
+    """D5b(critical):买家留言不得被标成内部备注(伪造坐席内部口径)。
+
+    原实现只强制改 author_type,is_internal 原样透传 → 买家可控文本
+    在坐席工作台被挂上「内部」角标(frontend/agent.js),构成社工诱导资损。
+    """
+    mine, _ = _two_tickets_with_notes(engine)
+    r = client.post(f"/tickets/{mine}/messages", headers=bearer(client, "buyer_demo"),
+                    json={"author_type": "agent", "content": FORGED_NOTE,
+                          "is_internal": True})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["is_internal"] is False, "买家留言必须被强制置为非内部"
+    assert body["author_type"] == "user", "买家不得冒充坐席(A1 既有约束,一并守住)"
+    # 坐席视角复核:不得以内部备注形态出现在工作台
+    ra = client.get(f"/api/b/tickets/{mine}", headers=bearer(client, "agent_demo"))
+    assert ra.status_code == 200, ra.text
+    forged = [m for m in ra.json()["messages"] if m.get("content") == FORGED_NOTE]
+    assert forged, "留言本身是正当能力,必须仍然落库"
+    assert all(m.get("is_internal") is False for m in forged), "不得进坐席内部通道"
+
+
+def test_agent_can_still_write_internal_note_via_root_endpoint(client, engine):
+    """正向:坐席走同一根路径端点仍能写内部备注(强制只针对买家)。"""
+    mine, _ = _two_tickets_with_notes(engine)
+    note = "内部备注:已联系仓库核实,等回单"
+    r = client.post(f"/tickets/{mine}/messages", headers=bearer(client, "agent_demo"),
+                    json={"author_type": "agent", "content": note, "is_internal": True})
+    assert r.status_code == 201, r.text
+    assert r.json()["is_internal"] is True, "坐席写内部备注是正当能力"

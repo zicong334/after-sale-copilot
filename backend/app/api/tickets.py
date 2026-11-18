@@ -11,6 +11,13 @@ A1(2026-11-16):ISS-60 只补了**认证**,本组仍是 ``ROLE_ANY`` 且只比租
 于是买家 token 能**冒充坐席 service_id 领单并关单**。现把建单/领单/关单/状态流转
 收归 agent(``require_agent``),``service_id`` 一律从 token 取。
 买家留言(``add_message``)仍是正当能力,保持 ``current_identity``。
+
+D 系列(2026-11-18 第四轮审计):A1 只收口了**写操作**四个端点,**同组另外四个没动**
+——``list_tickets`` / ``get_ticket`` / ``list_messages`` / ``add_message`` 仍是
+``ROLE_ANY`` 且只比租户,于是同店买家之间完全互通:可列全店他人工单、读他人详情、
+**读他人工单的坐席内部备注原文**,还能往他人工单写消息并标 ``is_internal=True``
+伪造坐席内部口径。现统一补 ``_assert_customer``(复用 A1 的 ``assert_customer_scope``),
+内部备注按 ``_sees_internal`` 白名单在 **SQL 层**过滤,买家留言强制 ``is_internal=False``。
 """
 from __future__ import annotations
 
@@ -18,7 +25,7 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api import get_db, require_agent
+from app.api import assert_customer_scope, get_db, require_agent
 from app.db import utc_now
 from app.errors import NotFoundError
 from app.models import RefundRequest, Ticket, TicketMessage
@@ -43,6 +50,27 @@ def _assert_tenant(identity: Identity, ticket: Ticket) -> None:
         return
     if ticket.merchant_id != identity.merchant_id:
         raise NotFoundError(f"工单不存在: {ticket.id}")
+
+
+def _assert_customer(identity: Identity, ticket: Ticket) -> None:
+    """买家只能访问**自己**的工单;不满足按"不存在"处理(D 系列,2026-11-18)。
+
+    A1 只把 create/claim/close/status 收归 ``require_agent``,**同组的读端点与
+    留言端点没动**——它们仍是 ``current_identity``(中间件前缀表里根路径落
+    ``ROLE_ANY``),组内又只比 ``merchant_id``,于是同店买家之间完全互通。
+    这里复用 A1 已有的 ``assert_customer_scope`` 作单一事实源,不写第二份归属逻辑;
+    与 ``_assert_tenant`` 的跨租户口径一致(都按 404,不泄露存在性)。
+    """
+    if not assert_customer_scope(identity, ticket.customer_id):
+        raise NotFoundError(f"工单不存在: {ticket.id}")
+
+
+def _sees_internal(identity: Identity) -> bool:
+    """是否可见坐席内部备注:只有 ``agent`` 与 ``internal``。
+
+    白名单而非黑名单——新增角色默认不泄露(与 B1 在 ``api/chat.py`` 的口径一致)。
+    """
+    return identity.is_internal or identity.role == "agent"
 
 
 def _service_id(identity: Identity, claimed: str | None) -> str:
@@ -85,6 +113,10 @@ def list_tickets(
     stmt = select(Ticket).order_by(Ticket.created_at.desc())
     if not identity.is_internal:
         stmt = stmt.where(Ticket.merchant_id == identity.merchant_id)
+        # D1:买家只看自己的工单。原实现只按租户过滤,同店买家能列出全店他人工单
+        # (含 customer_id / order_id / 状态)。坐席仍看全店队列。
+        if identity.role == "buyer":
+            stmt = stmt.where(Ticket.customer_id == identity.customer_id)
     return list(db.execute(stmt).scalars())
 
 
@@ -99,6 +131,7 @@ def get_ticket(
     if ticket is None:
         raise NotFoundError(f"工单不存在: {ticket_id}")
     _assert_tenant(identity, ticket)
+    _assert_customer(identity, ticket)  # D2:买家不得读他人工单详情
     out = TicketOut.model_validate(ticket)
     refund = _latest_refund(db, ticket)
     if refund is not None:
@@ -193,16 +226,22 @@ def add_message(
     if ticket is None:
         raise NotFoundError(f"工单不存在: {ticket_id}")
     _assert_tenant(identity, ticket)
+    _assert_customer(identity, ticket)  # D5a:买家不得往他人工单写消息
     author_type = payload.author_type
-    if not identity.is_internal and identity.role == "buyer" and author_type != "user":
+    is_internal = bool(payload.is_internal)
+    if not identity.is_internal and identity.role == "buyer":
         # 买家不能冒充人工坐席/系统写工单消息。
         author_type = "user"
+        # D5b:买家也不能把自己的留言标成**内部备注**。原实现只改 author_type、
+        # is_internal 原样透传,于是买家可控文本在坐席工作台被挂上「内部」角标
+        # (frontend/agent.js),构成伪造坐席内部口径的社工诱导面。
+        is_internal = False
     return ticket_svc.add_message(
         db,
         ticket_id,
         author_type=author_type,
         content=payload.content,
-        is_internal=payload.is_internal,
+        is_internal=is_internal,
     )
 
 
@@ -222,6 +261,7 @@ def list_messages(
     if ticket is None:
         raise NotFoundError(f"工单不存在: {ticket_id}")
     _assert_tenant(identity, ticket)
+    _assert_customer(identity, ticket)  # D3:买家不得读他人工单消息
     items: list[dict] = []
     for row in ticket_svc.chat_prefix(db, ticket):
         items.append(
@@ -236,13 +276,12 @@ def list_messages(
                 "source": "chat",
             }
         )
-    rows = list(
-        db.execute(
-            select(TicketMessage)
-            .where(TicketMessage.ticket_id == ticket_id)
-            .order_by(TicketMessage.created_at)
-        ).scalars()
-    )
+    # D3/D4:内部备注在 **SQL 层**就不取出来(照 api/handoff.py 那份口径,
+    # 比行级 continue 更强:条数统计与将来分页也不会漏)。坐席/internal 不受限。
+    msg_stmt = select(TicketMessage).where(TicketMessage.ticket_id == ticket_id)
+    if not _sees_internal(identity):
+        msg_stmt = msg_stmt.where(TicketMessage.is_internal.is_(False))
+    rows = list(db.execute(msg_stmt.order_by(TicketMessage.created_at)).scalars())
     for row in rows:
         items.append(
             {

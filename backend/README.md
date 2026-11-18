@@ -139,7 +139,7 @@ curl -s -X POST http://127.0.0.1:8000/auth/login ^
 ## 5. 测试
 
 ```bat
-:: 全量测试(788 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(799 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
@@ -157,7 +157,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:788 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:799 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
 - critical 失败:0
@@ -425,8 +425,8 @@ backend/
 │                   → 0005_ticket_session_id → 0006_auth → 0007_kb_vectors → 0008_jobs
 │                   → 0009_fulfillment → 0010_badcase(共 10 个迁移,25 张表)
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          788 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台、
-│                   test_authz_refunds.py 越权与内部备注回归)
+├── tests/          799 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台、
+│                   test_authz_refunds.py 越权/内部备注/工单归属回归)
 └── README.md       本文件
 
 frontend/           chat.html / app.js / agent.html / agent.js / login.html / api.js / ui.js / style.css
