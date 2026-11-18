@@ -956,3 +956,19 @@ def test_w15_dom_snapshots_export():
     assert len(files) >= 4
     for name in files:
         assert (out_dir / name).exists()
+
+
+def test_citation_card_shows_title_not_internal_code():
+    """C1(2026-11-17 审计):引用卡可见文本不得出现内部条款代号。
+
+    W13 ISS-21 要求 RP-xx/LP-xx 不出现在买家可见文本里。后端 sanitize 覆盖了
+    draft 与 SSE delta,但 citations 是另一条路径:app.js 原先把 cite.clause_id
+    渲染成悬浮提示「查看条款 RP-02」与卡元信息「条款 RP-02 v1」。
+    改为显示 cite.title;data-clause 属性保留供内部定位(非可见文本)。
+    """
+    assert '"查看条款 " + (cite.title' in APP_JS, "悬浮提示应改用条款标题"
+    assert '"条款 " + (cite.title' in APP_JS, "引用卡元信息应改用条款标题"
+    for line in APP_JS.splitlines():
+        assert not ("条款 " in line and "clause_id" in line), (
+            f"可见文本仍在拼内部代号: {line.strip()}"
+        )

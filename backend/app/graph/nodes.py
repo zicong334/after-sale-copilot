@@ -944,6 +944,15 @@ def make_nodes(
 
         no_hit = bool(result.data.get("no_hit"))
         clauses = [] if no_hit else [dict(c) for c in (result.data.get("results") or [])[:3]]
+        # C1(2026-11-17):补条款标题。``policy__search`` 的返回结构只有
+        # clause_id/version/text/score(其 docstring 明确"返回结构保持不变",
+        # 不动工具契约),而买家侧引用卡要显示**标题**而非内部代号 RP-xx/LP-xx。
+        # 这里用已有的 _clause() 按 clause_id 回查知识库补 title(每轮 ≤3 次)。
+        for clause in clauses:
+            if not clause.get("title"):
+                row = _clause(clause.get("clause_id"))
+                if row:
+                    clause["title"] = row.get("title") or ""
         return {
             "retrieved": clauses,
             "observations": observations,

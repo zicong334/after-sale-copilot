@@ -361,3 +361,82 @@ def test_stats_reports_worker_state_and_counts(engine, session):
     stats = queue.stats()
     assert stats["pending"] == 1
     assert stats["done"] == 0
+
+
+# ---------------------------------------------------------------------------
+# B2(2026-11-17 审计):崩溃后残留 running 作业必须被回收
+# ---------------------------------------------------------------------------
+
+KIND_RECLAIM = "test_reclaim"
+
+
+def _pending_job(session: Session, *, kind: str, attempts: int = 0,
+                 max_attempts: int = 3) -> str:
+    """直接建一条 pending 作业行(enqueue 在无 worker 时会退化为内联执行)。"""
+    jid = gen_id()
+    session.add(Job(id=jid, kind=kind, payload='{"tag":"reclaim"}',
+                    status="pending", attempts=attempts, max_attempts=max_attempts))
+    session.commit()
+    return jid
+
+
+def test_start_reclaims_orphaned_running_job(engine, session, test_log_table):
+    """进程崩溃留下的 running 作业,重启后必须被回收并重新消费。
+
+    缺陷:STATUS_RUNNING 全仓只被写入(抢占时)、从未被查询回收,
+    无租约/心跳/启动清理。崩溃或重启会让作业永久停在 running——
+    既不重试也不进 dead-letter,而异步队列是生产必需路径且每轮对话入队。
+    """
+    done: list[str] = []
+
+    def handler(sess, payload):
+        done.append(payload.get("tag", "?"))
+        sess.commit()
+
+    jobs.register_handler(KIND_RECLAIM, handler)
+    try:
+        jid = _pending_job(session, kind=KIND_RECLAIM)
+        q1 = jobs.SQLiteJobQueue(engine)
+        claimed = q1._claim_next(set())          # 抢占成 running
+        assert claimed is not None and claimed.id == jid
+        with Session(engine) as s:
+            assert s.get(Job, jid).status == "running"
+        # 模拟崩溃:丢弃 q1,handler 从未执行
+        del q1
+        assert done == []
+
+        # 模拟重启:新队列实例 start() 应回收残留
+        q2 = jobs.SQLiteJobQueue(engine)
+        try:
+            q2.start()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                with Session(engine) as s:
+                    if s.get(Job, jid).status == "done":
+                        break
+                time.sleep(0.02)
+        finally:
+            q2.stop()
+        with Session(engine) as s:
+            job = s.get(Job, jid)
+            assert job.status == "done", f"残留作业未被回收消费,status={job.status}"
+        assert done == ["reclaim"], "handler 应被重新执行恰好一次"
+    finally:
+        jobs.unregister_handler(KIND_RECLAIM)
+
+
+def test_reclaim_sends_exhausted_running_job_to_dead_letter(engine, session):
+    """重试已耗尽的残留 running 作业,回收时直接进 dead-letter,不无限重试。"""
+    jid = _pending_job(session, kind=KIND_RECLAIM, attempts=2, max_attempts=3)
+    q1 = jobs.SQLiteJobQueue(engine)
+    claimed = q1._claim_next(set())              # attempts 变 3 = 已耗尽
+    assert claimed is not None and claimed.attempts == 3
+    del q1
+
+    q2 = jobs.SQLiteJobQueue(engine)
+    reclaimed = q2.reclaim_stale_running()
+    assert reclaimed == 1
+    with Session(engine) as s:
+        job = s.get(Job, jid)
+        assert job.status == "dead", f"耗尽的残留应进 dead-letter,实际 {job.status}"
+        assert job.finished_at is not None

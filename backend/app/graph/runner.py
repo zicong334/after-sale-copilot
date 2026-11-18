@@ -185,13 +185,19 @@ def _refresh_status(session: Session, session_row: ChatSession) -> str:
 
 
 def _citations(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """政策引用:索引从 1 开始,clause_id 必须来自真实检索结果。"""
+    """政策引用:索引从 1 开始,clause_id 必须来自真实检索结果。
+
+    C1(2026-11-17):额外带 ``title`` —— 买家侧引用卡要显示**条款标题**而不是
+    内部代号 ``RP-xx``/``LP-xx``(W13 ISS-21)。``clause_id`` 仍保留供内部定位
+    与坐席侧使用,但前端不得把它拼进买家可见文本。
+    """
     citations: list[dict[str, Any]] = []
     for index, clause in enumerate(state.get("retrieved") or [], start=1):
         citations.append(
             {
                 "index": index,
                 "clause_id": clause.get("clause_id"),
+                "title": str(clause.get("title") or ""),
                 "version": clause.get("version"),
                 "snippet": str(clause.get("text") or "")[:120],
             }

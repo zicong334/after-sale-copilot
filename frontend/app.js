@@ -389,7 +389,7 @@
       var n = cite.index || idx + 1;
       var ref = el("button", "citation-ref", "[" + n + "]");
       ref.type = "button";
-      ref.title = "查看条款 " + (cite.clause_id || "");
+      ref.title = "查看条款 " + (cite.title || "相关规定");
       ref.setAttribute("aria-label", "展开第 " + n + " 条政策条款");
       ref.setAttribute("aria-expanded", "false");
       var card = el("div", "clause-card");
@@ -398,8 +398,11 @@
       body.appendChild(el("mark", "", cite.snippet || "(条款原文缺失)"));
       card.appendChild(body);
       var version = cite.version ? " · 版本 " + cite.version : "";
+      /* C1:买家可见文本一律用条款标题,不显示内部代号 RP-xx/LP-xx(W13 ISS-21)。
+         标题缺失时回退「相关规定」,与后端 sanitize_customer_text 的兜底同口径;
+         绝不回退到 clause_id,否则代号又从这条路径漏出去。 */
       card.appendChild(el("div", "clause-meta",
-        "条款 " + (cite.clause_id || "—") + version));
+        "条款 " + (cite.title || "相关规定") + version));
       ref.addEventListener("click", function () {
         var isSame = ref.classList.contains("active");
         cards.forEach(function (item) {

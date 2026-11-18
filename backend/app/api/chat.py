@@ -676,6 +676,15 @@ def session_messages(
             .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
         ).scalars()
         for row in ticket_rows:
+            # B1(2026-11-17 审计):内部备注**只对坐席/内部身份可见**,买家侧直接跳过。
+            # 原实现全量 append 只带 is_internal 标记,靠前端不渲染来"隐藏"——
+            # 但 API 已把原文交给买家,抓包/脚本/DevTools 都能读到。
+            # WS 推送(api/agent.py)本来就过滤,这里补齐历史拉取路径,口径一致。
+            # 用白名单(只有 agent/internal 才带)而非黑名单,新增角色默认不泄露。
+            if row.is_internal and not (
+                identity.is_internal or identity.role == "agent"
+            ):
+                continue
             items.append(
                 {
                     "id": f"ticket:{row.id}",

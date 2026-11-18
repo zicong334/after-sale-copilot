@@ -231,3 +231,63 @@ def test_buyer_can_still_create_refund_for_own_order(client, engine):
     r = _create_refund(client, bh, order)
     assert r.status_code == 201, r.text
     assert r.json()["status"] == "申请"
+
+# ---------------------------------------------------------------------------
+# B1(2026-11-17 审计):买家历史消息不得包含坐席内部备注
+# ---------------------------------------------------------------------------
+
+INTERNAL_NOTE = "内部备注:该买家疑似恶意退款,先拖延处理,勿告知客户"
+PUBLIC_REPLY = "您好,已为您登记,正在核实。"
+
+
+def _session_with_notes(engine) -> tuple[str, str]:
+    """建一个属于 buyer_demo 的会话 + 工单,工单里一条公开回复 + 一条内部备注。"""
+    from app.models import ChatSession, TicketMessage
+
+    sid = "sess-b1-" + uuid.uuid4().hex[:8]
+    tid = "ticket-b1-" + uuid.uuid4().hex[:8]
+    with Session(engine) as s:
+        s.add(ChatSession(id=sid, merchant_id=MERCHANT,
+                          customer_id="seed-cust-001", status="handed_off"))
+        s.add(Ticket(id=tid, merchant_id=MERCHANT, customer_id="seed-cust-001",
+                     session_id=sid, status="claimed", claimed_by="seed-agent-1"))
+        s.flush()
+        s.add(TicketMessage(ticket_id=tid, author_type="agent",
+                            content=PUBLIC_REPLY, is_internal=False))
+        s.add(TicketMessage(ticket_id=tid, author_type="agent",
+                            content=INTERNAL_NOTE, is_internal=True))
+        s.commit()
+    return sid, tid
+
+
+def test_buyer_history_excludes_agent_internal_notes(client, engine):
+    """买家历史接口**不得返回**内部备注(不是"返回但打标记")。
+
+    缺陷:WS 推送(api/agent.py)与前端渲染(app.js)都过滤 is_internal,
+    唯独 /api/c/sessions/{id}/messages 全量 append 只带标记 →
+    任何持买家 token 的人直接调 API 就能读到坐席内部备注原文。
+    前端不渲染 ≠ 数据没交出去。
+    """
+    sid, _ = _session_with_notes(engine)
+    h = bearer(client, "buyer_demo")
+    r = client.get(f"/api/c/sessions/{sid}/messages", headers=h)
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    contents = [str(item.get("content") or "") for item in items]
+    assert INTERNAL_NOTE not in contents, "内部备注原文不得出现在买家响应里"
+    assert not any(INTERNAL_NOTE in c for c in contents)
+    assert not any(item.get("is_internal") is True for item in items)
+    assert PUBLIC_REPLY in contents, "公开回复必须照常可见(防守卫过度)"
+
+
+def test_agent_side_still_sees_internal_notes(client, engine):
+    """正向:坐席端工单详情仍能看到内部备注(过滤只针对买家侧)。"""
+    _, tid = _session_with_notes(engine)
+    h = bearer(client, "agent_demo")
+    r = client.get(f"/api/b/tickets/{tid}", headers=h)
+    assert r.status_code == 200, r.text
+    messages = r.json()["messages"]
+    assert any(
+        m.get("content") == INTERNAL_NOTE and m.get("is_internal") is True
+        for m in messages
+    ), "坐席端必须仍可见内部备注"

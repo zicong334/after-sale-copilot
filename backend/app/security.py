@@ -348,6 +348,14 @@ class RateLimiter(ABC):
     def consume(self, key: str, now: float | None = None) -> tuple[bool, float]:
         """消费一次配额;返回 ``(是否放行, 拒绝时建议的 Retry-After 秒数)``。"""
 
+    def refund(self, key: str) -> None:
+        """补回一次已消费的配额(B4:两级限流中后级拒绝时回滚前级)。
+
+        默认空实现,便于 Redis 等外部实现按需覆盖(Redis 侧可用 DECR 或直接
+        改成"两级先 peek 再一起 consume"的 Lua 原子脚本)。
+        """
+        return None
+
 
 class MemoryRateLimiter(RateLimiter):
     """进程内令牌桶:每秒补充 ``rate`` 个令牌,桶容量 ``burst``。"""
@@ -370,6 +378,15 @@ class MemoryRateLimiter(RateLimiter):
             retry_after = (1.0 - tokens) / self.rate if self.rate > 0 else 1.0
             return False, max(retry_after, 0.001)
 
+    def refund(self, key: str) -> None:
+        """补回一个令牌(不超过桶容量);桶不存在时无需补。"""
+        with self._lock:
+            entry = self._buckets.get(key)
+            if entry is None:
+                return
+            tokens, last = entry
+            self._buckets[key] = (min(float(self.burst), tokens + 1.0), last)
+
 
 _user_limiter = MemoryRateLimiter(USER_RATE_PER_SECOND, USER_BURST)
 _tenant_limiter = MemoryRateLimiter(TENANT_RATE_PER_SECOND, TENANT_BURST)
@@ -386,6 +403,8 @@ def check_rate_limit(
         return retry_after
     allowed, retry_after = _tenant_limiter.consume(identity.merchant_id, now)
     if not allowed:
+        # B4:租户级拒绝时把刚扣掉的用户令牌补回,否则租户被打满会白耗个人配额。
+        _user_limiter.refund(identity.sub)
         return retry_after
     return None
 

@@ -158,3 +158,43 @@ def test_daily_token_quota_exceeded_429(client: TestClient, engine, monkeypatch)
     # 配额检查在会话创建之前:超限的那一轮不产生任何 ChatSession 写入。
     with Session(engine) as session:
         assert session.scalar(select(func.count()).select_from(ChatSession)) == 0
+
+
+# ---------------------------------------------------------------------------
+# B4(2026-11-17 审计):租户级拒绝不得白扣用户令牌
+# ---------------------------------------------------------------------------
+
+
+def test_tenant_rejection_refunds_user_token(monkeypatch):
+    """租户桶打满时,用户桶那一个令牌必须被补回。
+
+    缺陷:check_rate_limit 先 consume 用户桶成功、再 consume 租户桶失败就直接返回,
+    用户令牌已经扣掉。租户被打满时 individual 用户的配额被无谓消耗。
+    """
+    monkeypatch.setattr(security, "RATE_LIMIT_ENABLED", True)
+    security.reset_security_state()
+    ident = security.Identity(sub="u-b4", role="buyer", merchant_id="m-b4")
+    now = 1000.0
+
+    # 用户桶满(burst),租户桶抽干
+    user_before = security.USER_BURST
+    security._tenant_limiter._buckets[ident.merchant_id] = (0.0, now)
+
+    retry = security.check_rate_limit(ident, now=now)
+    assert retry is not None, "租户桶为空应拒绝"
+
+    tokens, _last = security._user_limiter._buckets.get(ident.sub, (float(user_before), now))
+    assert tokens == pytest.approx(float(user_before)), (
+        f"租户拒绝后用户令牌应被补回,实际剩 {tokens}(原 {user_before})"
+    )
+
+
+def test_both_levels_allow_still_consumes_user_token(monkeypatch):
+    """正向:两级都放行时,用户令牌照常扣 1(防守卫过度)。"""
+    monkeypatch.setattr(security, "RATE_LIMIT_ENABLED", True)
+    security.reset_security_state()
+    ident = security.Identity(sub="u-b4-ok", role="buyer", merchant_id="m-b4-ok")
+    now = 2000.0
+    assert security.check_rate_limit(ident, now=now) is None
+    tokens, _ = security._user_limiter._buckets[ident.sub]
+    assert tokens == pytest.approx(float(security.USER_BURST) - 1.0)

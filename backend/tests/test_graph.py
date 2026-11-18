@@ -898,3 +898,17 @@ def test_fix9_empty_memory_turn_does_not_cite_preference(db, ckpt):
 
     assert result.intent == "other"
     assert graph_nodes.guardrails.MEMORY_REFERENCE_PREFIX not in result.reply
+
+
+def test_citations_carry_clause_title(db, ckpt):
+    """C1(2026-11-17 审计):citations 必须带条款标题。
+
+    买家侧引用卡要显示**条款标题**而不是内部代号 RP-xx/LP-xx(W13 ISS-21)。
+    原实现 runner._citations 只透传 clause_id/version/snippet,前端拿不到标题,
+    只能把内部代号渲染成「条款 RP-02」给买家看。
+    """
+    row = new_row(db)
+    result = run_turn(db, row, POLICY_TEXT, ckpt=ckpt, trace_id=new_trace_id())
+    assert result.citations, "政策回答必须带引用"
+    for cite in result.citations:
+        assert cite.get("title"), f"citation 缺少 title,前端无法显示标题: {cite}"

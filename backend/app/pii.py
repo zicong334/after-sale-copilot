@@ -39,12 +39,17 @@ class PIIMasker:
         self._reverse: dict[str, str] = {}
         #: 各类型已分配的最大序号
         self._counters: dict[str, int] = {}
+        #: B3:原文里**本来就存在**的同形字面量(如用户自己写的 "[PHONE_1]"),
+        #: 分配编号时必须跳过,否则 restore 会把用户原文改写成真实 PII。
+        self._reserved: set[str] = set()
 
     def mask(self, text: str) -> str:
         """把文本里的手机号/身份证/地址替换为占位符;无 PII 时原样返回。"""
         body = str(text or "")
         if not body:
             return body
+        # B3:先登记原文已有的同形字面量(必须在任何替换之前),再发号。
+        self._reserved.update(match.group(0) for match in PII_PLACEHOLDER_RE.finditer(body))
         for kind, pattern in PII_PATTERNS:
             body = pattern.sub(lambda match, kind=kind: self._placeholder(kind, match.group(0)), body)
         return body
@@ -68,9 +73,14 @@ class PIIMasker:
         existing = self._reverse.get(value)
         if existing is not None:
             return existing
-        index = self._counters.get(kind, 0) + 1
+        index = self._counters.get(kind, 0)
+        # B3:跳过原文已占用的同形编号,保证 restore 只反解"本轮真分配过的"占位符。
+        while True:
+            index += 1
+            placeholder = PLACEHOLDER_TEMPLATE.format(kind=kind, index=index)
+            if placeholder not in self._reserved:
+                break
         self._counters[kind] = index
-        placeholder = PLACEHOLDER_TEMPLATE.format(kind=kind, index=index)
         self.mapping[placeholder] = value
         self._reverse[value] = placeholder
         return placeholder

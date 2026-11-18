@@ -269,3 +269,47 @@ def test_chat_without_pii_restore_is_empty(client, engine) -> None:
             ).all()
         }
     assert roles["user"].content == text
+
+
+# ---------------------------------------------------------------------------
+# B3(2026-11-17 审计):占位符不得与用户原文里的同形字面量撞号
+# ---------------------------------------------------------------------------
+
+
+def test_placeholder_skips_literal_collision():
+    """用户原文里已有 ``[PHONE_1]`` 字面量时,真实号码必须另分配编号。
+
+    缺陷:_placeholder 按类型顺序发号,不看原文是否已存在同形串;
+    restore 全局替换无法区分"本轮分配的"与"用户自己写的",
+    于是用户字面文本被静默改写成真实号码。
+    (masker 每请求独立,不构成跨用户泄露,属改写原文的健壮性问题。)
+    """
+    from app.pii import PIIMasker
+
+    masker = PIIMasker()
+    raw = "我的备用标记是[PHONE_1],真实号码13800138000"
+    masked = masker.mask(raw)
+    assert "[PHONE_1]" in masked, "用户字面量应原样留在 mask 结果里"
+    assert masked.count("[PHONE_1]") == 1, "真实号码不该复用用户已占用的编号"
+    assert masker.restore(masked) == raw, "restore 后必须与原文逐字一致"
+
+
+def test_placeholder_skips_collision_with_two_numbers():
+    """两个字面量 + 两个真实号码:编号全部避开,restore 逐字还原。"""
+    from app.pii import PIIMasker
+
+    masker = PIIMasker()
+    raw = "标记[PHONE_1]和[PHONE_2] 号码A 13800138000 号码B 13900139000"
+    masked = masker.mask(raw)
+    assert masker.restore(masked) == raw
+    assert "13800138000" not in masked and "13900139000" not in masked
+
+
+def test_no_collision_case_keeps_original_numbering():
+    """无字面量时编号仍从 1 开始(防守卫过度改变既有口径)。"""
+    from app.pii import PIIMasker
+
+    masker = PIIMasker()
+    masked = masker.mask("联系13800138000")
+    assert masked == "联系[PHONE_1]"
+    assert masker.restore(masked) == "联系13800138000"

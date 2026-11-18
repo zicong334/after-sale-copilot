@@ -38,6 +38,7 @@ import threading
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from datetime import timezone
 from typing import Any
 
 from sqlalchemy import Engine, func, select, update
@@ -259,16 +260,69 @@ class SQLiteJobQueue(JobQueue):
 
     # -- worker 生命周期 ---------------------------------------------------
     def start(self) -> None:
-        """启动 worker 线程(幂等)。"""
+        """启动 worker 线程(幂等);启动前先回收上次进程留下的残留 running 作业。"""
         with self._lock:
             if self._worker_active():
                 return
+            # B2:必须先回收再起线程,否则残留 running 永远不会被 _claim_next 看到
+            # (它只 select pending)。回收失败不能挡住 worker 启动。
+            try:
+                self.reclaim_stale_running()
+            except Exception:  # pragma: no cover - 回收失败只影响残留作业
+                logger.exception("启动回收残留 running 作业失败(忽略,继续启动 worker)")
             self._stop_event.clear()
             thread = threading.Thread(
                 target=self._run_loop, name="job-worker", daemon=True,
             )
             self._thread = thread
             thread.start()
+
+    def reclaim_stale_running(self, *, max_age_seconds: float | None = None) -> int:
+        """回收残留 ``running`` 作业:重试未耗尽 → ``pending``,耗尽 → ``dead``。
+
+        B2(2026-11-17 审计):``STATUS_RUNNING`` 原先**只被写入**(抢占时)、
+        从未被任何查询回收,也没有租约/心跳。进程崩溃、被 kill、部署重启或
+        worker 线程异常退出后,那条作业就**既不重试也不进 dead-letter**,永久悬空;
+        而异步队列是生产必需路径(``main.lifespan``),每轮对话都入队,
+        一次重启就可能让若干买家的那轮请求永远没有结果。
+
+        口径:本项目显式选择**单机单 worker**(SQLite 单文件),所以 ``start()`` 时
+        任何 ``running`` 行都是上次进程的残留,默认全部回收(``max_age_seconds=None``)。
+        将来多 worker / 独立队列部署时,传 ``max_age_seconds`` 只回收超龄的,
+        或改由租约(``lease_expires_at``)驱动——**不要**在多进程下用默认全量回收。
+
+        返回回收条数。``attempts`` 保留(抢占时已 +1),因此耗尽判定与正常失败一致。
+        """
+        now = utc_now()
+        reclaimed = 0
+        with self._session_factory() as sess:
+            for job in list(sess.scalars(select(Job).where(Job.status == STATUS_RUNNING))):
+                if max_age_seconds is not None and job.started_at is not None:
+                    started = job.started_at
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    if (now - started).total_seconds() < float(max_age_seconds):
+                        continue
+                attempts = int(job.attempts or 0)
+                if attempts >= int(job.max_attempts or DEFAULT_MAX_ATTEMPTS):
+                    job.status = STATUS_DEAD
+                    job.finished_at = now
+                    job.last_error = job.last_error or "进程中断且重试已耗尽(启动回收)"
+                    logger.error(
+                        "作业 %s(%s) 残留 running 且已尝试 %d 次,回收进 dead-letter",
+                        job.id, job.kind, attempts,
+                    )
+                else:
+                    job.status = STATUS_PENDING
+                    job.started_at = None
+                    logger.warning(
+                        "作业 %s(%s) 残留 running(已尝试 %d 次),回收为 pending 待重试",
+                        job.id, job.kind, attempts,
+                    )
+                job.updated_at = now
+                reclaimed += 1
+            sess.commit()
+        return reclaimed
 
     def stop(self, timeout: float = 5.0) -> None:
         """优雅停止 worker 线程(超时只告警,不强制终止)。"""
