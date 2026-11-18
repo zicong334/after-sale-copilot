@@ -423,7 +423,8 @@ def test_engine_refund_confirm_flow(engine):
         user_input="3 天前收到,有质量问题,要退款",
         context={
             "order_id": "seed-order-020",
-            "days_since_delivery": 3,
+            # F1:不再手动传 days_since_delivery —— 走真实推导(seed 020 签收 3 天前),
+            # 否则测的是生产永不走的显式分支。
             "current_customer_id": "seed-cust-010",
         },
         ground_truth={"refund_created": True, "refund_amount_cents": 11900},

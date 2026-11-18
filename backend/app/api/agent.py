@@ -533,13 +533,29 @@ _SUGGEST_SUMMARY_MAX = 120
 _SUGGEST_CACHE: dict[str, dict[str, Any]] = {}
 
 
+def _model_visible(message: TicketMessage) -> bool:
+    """该消息能否作为**模型输入**(G1,2026-11-18 第四轮审计)。
+
+    内部备注一律不进。两条 prompt 输入路径(``_suggest_user_texts`` 拼检索 query、
+    ``_suggest_transcript`` 拼 prompt 转录)**共用这一个判定**,不各写一份过滤——
+    修前前者过滤、后者不过滤,同一概念两处口径分叉。
+
+    为什么必须过滤(用户裁定选项二):转录每行只标 ``author_type``、**不标 is_internal**,
+    提示词里也没有"禁止对客引用内部信息"的指令,所以内部备注在模型看来与
+    "客服已经对客户说过的话"完全一样;而输出侧两道护栏(去条款代号 / 去承诺话术)
+    都不匹配风控评价,拦不住。坐席在工作台同一屏本来就看得到内部备注,
+    过滤失去的只是模型的上下文。
+    """
+    return not message.is_internal
+
+
 def _suggest_user_texts(messages: list[TicketMessage]) -> list[str]:
     """取买家可见消息正文(created_at asc),作为生成建议的转录输入。"""
     return [
         message.content.strip()
         for message in messages
         if message.author_type == "user"
-        and not message.is_internal
+        and _model_visible(message)
         and message.content.strip()
     ]
 
@@ -594,11 +610,15 @@ _SUGGEST_PROMPT_TEMPLATE = (
 
 
 def _suggest_transcript(messages: list[TicketMessage]) -> str:
-    """把工单消息压成 prompt 里的转录段(最近 12 条,标注作者)。"""
+    """把工单消息压成 prompt 里的转录段(最近 12 条**可进模型的**消息,标注作者)。
+
+    G1:先按 ``_model_visible`` 过滤内部备注,**再**取最近 12 条——
+    顺序很重要:若先切片后过滤,尾部内部备注一多就会把有效转录挤空。
+    """
+    usable = [m for m in messages if _model_visible(m) and m.content.strip()]
     lines = [
         f"- {message.author_type}: {message.content.strip()}"
-        for message in messages[-12:]
-        if message.content.strip()
+        for message in usable[-12:]
     ]
     return "\n".join(lines) or "- (无消息)"
 

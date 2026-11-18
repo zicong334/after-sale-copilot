@@ -43,6 +43,9 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "total_cents": {"type": "integer"},
         "currency": {"type": "string"},
         "created_at": {"type": "string"},
+        # F1:签收时间。政策窗口从签收起算,下游据此算天数;
+        # 历史数据/非签收态为 null —— 缺失时下游**不臆断**,转人工核实。
+        "delivered_at": {"type": ["string", "null"]},
     },
     "required": ["order_id", "status", "total_cents", "currency", "created_at"],
     "additionalProperties": False,
@@ -92,6 +95,7 @@ def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         "total_cents": order.total_cents,
         "currency": order.currency,
         "created_at": order.created_at.isoformat(),
+        "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
     }
 
 

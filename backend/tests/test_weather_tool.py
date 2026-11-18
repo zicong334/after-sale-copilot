@@ -298,7 +298,7 @@ def test_weather_note_does_not_break_order_chain(db, ckpt, http):
         row,
         "武汉暴雨导致我的快递没到，订单一直没更新",
         ckpt=ckpt,
-        context={"order_id": "seed-order-020", "days_since_delivery": 3},
+        context={"order_id": "seed-order-020"},
     )
 
     assert result.intent == "order_judge"

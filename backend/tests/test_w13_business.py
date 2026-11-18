@@ -130,7 +130,7 @@ def test_iss05_graph_reply_for_delivered_order_uses_chinese_label(db, ckpt):
         row,
         "订单 seed-order-019 我要退货",
         ckpt=ckpt,
-        context={"order_id": "seed-order-019", "days_since_delivery": 9},
+        context={"order_id": "seed-order-019"},
     )
     assert "delivered" not in result.reply, f"回复泄漏英文枚举: {result.reply}"
     assert "已签收" in result.reply, result.reply

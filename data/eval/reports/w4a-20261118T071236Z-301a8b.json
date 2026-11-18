@@ -1,0 +1,87 @@
+{
+  "run_id": "w4a-20261118T071236Z-301a8b",
+  "generated_at": "2026-11-18T07:15:04.619059+00:00",
+  "meta": {
+    "mode": "mock",
+    "assumptions": "FakeLLM + FakeJudge(MOCK):基准值,不是真模型能力",
+    "cases_file": "data/eval/cases_v1.json",
+    "eval_set_version": "cs-eval-v1-20261108b",
+    "rubric_version": "cs-v2",
+    "repeat": 3,
+    "cases_selected": 48,
+    "quotas": {
+      "golden": 19,
+      "adversarial": 14,
+      "edge": 10,
+      "regression": 5
+    },
+    "llm": "FakeLLM (MOCK)",
+    "judge": "fake-judge-v1 (MOCK)",
+    "scored_by": "heuristic",
+    "command": "run_eval.py --repeat 3"
+  },
+  "eval_set_version": "cs-eval-v1-20261108b",
+  "rubric_version": "cs-v2",
+  "metrics": {
+    "pass_rate": {
+      "value": 1.0,
+      "passed": 144,
+      "denominator": 144,
+      "n": 144,
+      "cases_passed": 48,
+      "cases_total": 48
+    },
+    "by_layer": {
+      "golden": {
+        "cases": 19,
+        "attempts": 57,
+        "passed_attempts": 57,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "adversarial": {
+        "cases": 14,
+        "attempts": 42,
+        "passed_attempts": 42,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "edge": {
+        "cases": 10,
+        "attempts": 30,
+        "passed_attempts": 30,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      },
+      "regression": {
+        "cases": 5,
+        "attempts": 15,
+        "passed_attempts": 15,
+        "pass_rate": 1.0,
+        "critical_fail_count": 0
+      }
+    },
+    "critical_fail_count": 0,
+    "judge_agreement": {
+      "value": 1.0,
+      "agreed": 144,
+      "judged": 144
+    },
+    "cost_per_case_usd": {
+      "mean": 7.291e-05,
+      "total": 0.01049895,
+      "n": 144
+    },
+    "p95_latency_ms": {
+      "value": 1766.0,
+      "n": 144,
+      "scope": "user_wait_only(对话轮+确认,不含裁判)"
+    }
+  },
+  "failures": [],
+  "clusters": [],
+  "counts": {
+    "attempts_failed": 0,
+    "critical_failures": 0
+  }
+}

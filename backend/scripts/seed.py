@@ -103,15 +103,24 @@ def _seed_orders(session: Session, now) -> list[str]:
             created_at = now - timedelta(days=3)
         else:
             created_at = now - timedelta(days=idx % 12)
+        # F1(2026-11-18):签收态订单补签收时间。
+        # 取值刻意 = created_at,即**把原兜底算法的隐含假设显式化**:
+        # 修前 _days_since_delivery 拿 created_at 当签收时间,既有夹具(019=9天/020=3天)
+        # 就是按这个数写的。这样补字段后既有口径一字不变,零无关回归;
+        # 而新用例走真实签收流转(services.orders.deliver)会写入真实当下时间。
+        # 非签收态订单不回填(缺失即未知,下游转人工核实,不臆造)。
+        status = _ORDER_STATUSES[idx]
+        delivered_at = created_at if status in ("delivered", "closed", "refunded") else None
         session.add(
             Order(
                 id=order_id,
                 merchant_id=MERCHANT_ID,
                 customer_id=customer_id,
-                status=_ORDER_STATUSES[idx],
+                status=status,
                 total_cents=10000 + idx * 100,
                 currency="CNY",
                 created_at=created_at,
+                delivered_at=delivered_at,
             )
         )
         order_ids.append(order_id)

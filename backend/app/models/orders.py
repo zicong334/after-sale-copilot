@@ -44,6 +44,13 @@ class Order(Base):
         DateTime(timezone=True), nullable=False,
         default=utc_now, server_default=func.current_timestamp(),
     )
+    #: F1(2026-11-18 第四轮审计):签收时间。七天无理由等政策窗口从**签收**起算,
+    #: 原模型只有 created_at,导致 _days_since_delivery 拿下单时间兜底 →
+    #: 系统性高估签收天数 → 误拒正当退货。可空:历史数据与非签收态订单没有该值,
+    #: 缺失时**不臆断天数**,转人工核实物流(见 graph/nodes.py 的兜底分支)。
+    delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     __table_args__ = (
         CheckConstraint(

@@ -9,18 +9,25 @@ from __future__ import annotations
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from app.db import utc_now
 from app.errors import NotFoundError, StateConflictError
 from app.models import Order, RefundRequest
 
 
 def _advance(
-    session: Session, order_id: str, from_status: str, to_status: str
+    session: Session, order_id: str, from_status: str, to_status: str,
+    *, extra_values: dict | None = None,
 ) -> Order:
-    """通用守卫式状态推进(单步迁移)。"""
+    """通用守卫式状态推进(单步迁移)。
+
+    ``extra_values`` 用于随流转一并写入的时间戳(如签收时间,F1),
+    与状态更新在**同一条 UPDATE** 里,不会出现"状态改了时间没写"的中间态。
+    """
+    values = {"status": to_status, **(extra_values or {})}
     result = session.execute(
         update(Order)
         .where(Order.id == order_id, Order.status == from_status)
-        .values(status=to_status)
+        .values(**values)
     )
     if result.rowcount != 1:
         session.rollback()
@@ -45,8 +52,15 @@ def ship(session: Session, order_id: str) -> Order:
 
 
 def deliver(session: Session, order_id: str) -> Order:
-    """签收:shipped → delivered。"""
-    return _advance(session, order_id, "shipped", "delivered")
+    """签收:shipped → delivered,并写入签收时间(F1)。
+
+    签收时间是政策窗口(七天无理由 / 15 天质量问题)的**唯一正确锚点**,
+    必须在这里落库,否则下游只能拿下单时间兜底而系统性误拒。
+    """
+    return _advance(
+        session, order_id, "shipped", "delivered",
+        extra_values={"delivered_at": utc_now()},
+    )
 
 
 def refund_complete(session: Session, order_id: str) -> Order:

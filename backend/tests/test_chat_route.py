@@ -203,7 +203,7 @@ def test_order_judge_overdue_refuses_with_zero_write(client, engine):
         client,
         "9 天前买的裙子还没穿，不喜欢了想退，能退吗？",
         customer_id=CUSTOMER_019,
-        context={"order_id": "seed-order-019", "days_since_delivery": 9},
+        context={"order_id": "seed-order-019"},
     )
     data = r.json()
     assert data["intent"] == "order_judge"
@@ -224,7 +224,7 @@ def test_order_judge_eligible_creates_confirm_card_only(client, engine):
         client,
         "3 天前收到的衣服有线头，是质量问题，我要退货退款",
         customer_id=CUSTOMER_020,
-        context={"order_id": "seed-order-020", "days_since_delivery": 3},
+        context={"order_id": "seed-order-020"},
     )
     data = r.json()
     names = tool_names(r)

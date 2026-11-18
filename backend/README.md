@@ -139,7 +139,7 @@ curl -s -X POST http://127.0.0.1:8000/auth/login ^
 ## 5. 测试
 
 ```bat
-:: 全量测试(799 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(831 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
@@ -157,14 +157,14 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:799 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:831 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
-- FakeLLM 基线通过率:141/144 = 0.9792(edge 层 27/30 = 0.9000)
+- FakeLLM 基线通过率:144/144 = 1.0000(edge 层 30/30 = 1.0000)
 - critical 失败:0
-- 裁判一致率:141/144 = 0.9792
-- p95 用户等待:1162.0 ms
-- 单条成本(估算):$0.00007293;整轮合计 $0.0105021
-- 基线报告:`data/eval/reports/w4a-20261107T164830Z-7b5b3c.json`
+- 裁判一致率:144/144 = 1.0000
+- p95 用户等待:1334.0 ms
+- 单条成本(估算):$0.00007291;整轮合计 $0.0104989
+- 基线报告:`data/eval/reports/w4a-20261118T074122Z-837dc9.json`
 <!-- gen_readme_numbers:end -->
 
 口径说明:以上是 **FakeLLM + FakeJudge 的 Mock 基线**(`meta.mode="mock"`),**不代表真模型能力**;
@@ -423,10 +423,12 @@ backend/
 │                   tools/ / graph/ / memory/ / retrieval/ / eval/ / perception / schemas/ / trace
 ├── alembic/        0001_initial → 0002_add_tool_events → 0003_ticket_summary → 0004_memory
 │                   → 0005_ticket_session_id → 0006_auth → 0007_kb_vectors → 0008_jobs
-│                   → 0009_fulfillment → 0010_badcase(共 10 个迁移,25 张表)
+│                   → 0009_fulfillment → 0010_badcase → 0011_order_delivered_at
+│                   (共 11 个迁移,25 张表;0011 只加列不建表)
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          799 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台、
-│                   test_authz_refunds.py 越权/内部备注/工单归属回归)
+├── tests/          831 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台、
+│                   test_authz_refunds.py 越权/内部备注/工单归属回归、
+│                   test_eval_numbers.py 评测数字校验边界)
 └── README.md       本文件
 
 frontend/           chat.html / app.js / agent.html / agent.js / login.html / api.js / ui.js / style.css

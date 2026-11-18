@@ -36,7 +36,7 @@ CUSTOMER = "seed-cust-001"
 HANDOFF_TEXT = "我不跟你聊了,直接给我转人工客服"
 ELIGIBLE_TEXT = "3 天前收到的衣服有线头,是质量问题,我要退货退款"
 POLICY_TEXT = "退货的话,来回运费是谁出？"
-REFUND_CONTEXT = {"order_id": "seed-order-020", "days_since_delivery": 3}
+REFUND_CONTEXT = {"order_id": "seed-order-020"}
 POLICY_DIR = Path(__file__).resolve().parents[2] / "data" / "policies"
 
 

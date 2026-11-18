@@ -694,3 +694,76 @@ def test_agent_workbench_suggest_dom_keywords():
         "/* --------------------------------- 动作"
     )[0]
     assert "/messages" not in fill_block, "填入建议不得自动发送回复"
+
+
+# ---------------------------------------------------------------------------
+# G1(2026-11-18 第四轮审计):内部备注不得进模型 prompt
+#
+# 缺陷:两条 prompt 输入路径口径不一致——
+#   _suggest_user_texts  过滤 `and not message.is_internal`  → 内部备注不进检索 query
+#   _suggest_transcript  **不过滤**                          → 内部备注进模型 prompt
+# 而转录每行只标 author_type、**不标 is_internal**,提示词里也没有任何"禁止对客引用"
+# 的指令,所以内部备注在模型看来与"客服已经对客户说过的话"完全一样。
+# 输出侧两道护栏(去条款代号 / 去承诺话术)都不匹配风控评价,拦不住。
+#
+# 用户裁定选项二:**拼装 prompt 前直接过滤掉内部备注**,并让两条路径共用同一口径。
+# 坐席在工作台同一屏本来就看得到内部备注,失去的只是模型的上下文。
+# ---------------------------------------------------------------------------
+
+G1_INTERNAL = "内部备注:该买家疑似恶意退款,先拖延处理,勿告知客户"
+G1_PUBLIC_AGENT = "您好,我帮您看看"
+G1_BUYER_ASK = "收到的锅是坏的,我要退款,这是质量问题"
+
+
+def test_suggest_prompt_excludes_internal_notes(client, engine):
+    """G1:内部备注原文不得出现在 suggest 的模型 prompt 里。
+
+    prompt 由响应原样回传(agent.py 的 data["prompt"]),所以这是行为级观测,
+    不是打桩推测。
+    """
+    ticket_id = _make_suggest_ticket(engine, "tk-g1-internal")
+    _add_ticket_message(engine, ticket_id, "agent", G1_INTERNAL, is_internal=True)
+    resp = client.post(f"/api/b/tickets/{ticket_id}/suggest")
+    assert resp.status_code == 200, resp.text
+    prompt = str(resp.json()["data"]["prompt"])
+    assert G1_INTERNAL not in prompt, "内部备注原文不得进模型 prompt"
+    assert "疑似恶意退款" not in prompt, "内部风控评价不得以任何片段进 prompt"
+
+
+def test_suggest_prompt_keeps_public_transcript(client, engine):
+    """正向:公开对话必须照常进 prompt(防守卫过度把转录清空)。"""
+    ticket_id = _make_suggest_ticket(engine, "tk-g1-public")
+    _add_ticket_message(engine, ticket_id, "agent", G1_INTERNAL, is_internal=True)
+    resp = client.post(f"/api/b/tickets/{ticket_id}/suggest")
+    assert resp.status_code == 200, resp.text
+    prompt = str(resp.json()["data"]["prompt"])
+    assert G1_BUYER_ASK in prompt, "买家提问必须仍在 prompt 里"
+    assert G1_PUBLIC_AGENT in prompt, "坐席公开回复必须仍在 prompt 里"
+
+
+def test_suggest_two_input_paths_share_one_internal_filter(client, engine):
+    """G1 口径统一:检索输入与 prompt 转录对内部备注的取舍必须一致。
+
+    直接断言两条路径共用同一判定,而不是各写一份过滤——
+    「同一概念两处定义必分叉」是本轮 11 条发现里 3 条的共同病根。
+    """
+    ticket_id = _make_suggest_ticket(engine, "tk-g1-paths")
+    _add_ticket_message(engine, ticket_id, "agent", G1_INTERNAL, is_internal=True)
+    with Session(engine) as db:
+        messages = list(
+            db.scalars(
+                select(TicketMessage)
+                .where(TicketMessage.ticket_id == ticket_id)
+                .order_by(TicketMessage.created_at.asc(), TicketMessage.id.asc())
+            )
+        )
+    user_texts = agent_api._suggest_user_texts(messages)
+    transcript = agent_api._suggest_transcript(messages)
+    assert not any(G1_INTERNAL in t for t in user_texts), "检索输入不得含内部备注"
+    assert G1_INTERNAL not in transcript, "prompt 转录不得含内部备注"
+    # 两条路径必须调同一个判定函数(口径单一事实源)
+    assert hasattr(agent_api, "_model_visible"), "应有共用的模型输入可见性判定"
+    internal_row = next(m for m in messages if m.content == G1_INTERNAL)
+    public_row = next(m for m in messages if m.content == G1_PUBLIC_AGENT)
+    assert agent_api._model_visible(internal_row) is False
+    assert agent_api._model_visible(public_row) is True

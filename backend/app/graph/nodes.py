@@ -271,14 +271,23 @@ def _parse_dt(value: Any) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _days_since_delivery(context: dict[str, Any], created_at_iso: Any) -> int:
-    """签收天数:上下文显式值优先(评测用例给定时),否则按订单创建时间推算。"""
+def _days_since_delivery(context: dict[str, Any], order: dict[str, Any]) -> int | None:
+    """签收天数:上下文显式值优先,**否则按签收时间**;都没有则返回 ``None``。
+
+    F1(2026-11-18 第四轮审计):原实现兜底用 ``created_at``(下单时间)。
+    政策窗口(RP-01 七天无理由 / RP-03 十五天质量问题)从**签收**起算,
+    而下单 ≤ 签收 ⇒ 系统性高估天数 ⇒ **误拒正当退货**。
+    实测 10 天前下单、今天签收的单被判超期;同一单显式给 0 天立刻受理。
+
+    **缺签收时间时返回 None,绝不臆断**:调用方据此转人工核实物流,
+    既不放行也不拒绝。返回 0 会把真正超期的也放行,方向反过来变成资损。
+    """
     explicit = context.get("days_since_delivery")
     if isinstance(explicit, int) and explicit >= 0:
         return explicit
-    dt = _parse_dt(created_at_iso)
+    dt = _parse_dt((order or {}).get("delivered_at"))
     if dt is None:
-        return 0
+        return None
     days = (utc_now() - dt).days
     return max(0, int(days))
 
@@ -288,6 +297,17 @@ def _rewrite_query(text: str) -> str | None:
         if any(h in text for h in hints):
             return rewritten
     return None
+
+
+def _with_notice(verdict: dict[str, Any], body: str) -> str:
+    """把上游的 notice 前置到对客回复(F1,2026-11-18)。
+
+    ``notice`` 说明「为什么判不了」(如未查询到签收时间记录)。
+    转人工有**两条渲染路径**(挂确认卡时的"待确认"话术 / 无卡时的通用 handoff 模板),
+    两条都必须前置同一句解释 —— 所以收在这一个函数里,不在两处各写一遍。
+    """
+    notice = str((verdict or {}).get("notice") or "").strip()
+    return f"{notice}{body}" if notice else body
 
 
 def _friendly_reason(reason: str) -> str:
@@ -1158,14 +1178,40 @@ def make_nodes(
                     },
                 }
             reason_text = _extract_reason(text)
-            days = _days_since_delivery(context, order.get("created_at"))
+            days = _days_since_delivery(context, order)
+            if days is None and order.get("status") in refund_tool.REFUNDABLE_STATUSES:
+                # F1:**已签收却没有签收时间**(历史数据/未回填)→ 不臆断超期,转人工核实物流。
+                # 状态门用工具层常量做单一事实源:未发货/在途订单本来就没有签收时间,
+                # 那是**正常**的,应走 policy__check_return 的状态引导(取消/核对订单号),
+                # 不能被这条兜底劫走 —— 否则未发货订单会被误报"查不到签收记录"。
+                return {
+                    "plan": [],
+                    "handoff": True,
+                    "verdict": {
+                        # 这个 kind 只是中间态标记:handoff 节点会把 kind 改写成 "handoff",
+                        # 对客解释靠下面的 notice 传递(_with_notice 前置),不靠 kind 选模板。
+                        "kind": "delivery_time_unknown",
+                        # 刻意不含「人工」「转接」二词:map_handoff_reason 会把它们
+                        # 映射成 explicit_request(用户主动要求人工),那是错的归因。
+                        "handoff_reason": "签收时间缺失:需核实物流签收记录",
+                        "notice": (
+                            f"已核验订单 {order.get('order_id')},"
+                            "但未查询到签收时间记录,无法自动判定是否超过退货期限。"
+                        ),
+                        "order": _order_summary(order),
+                        "order_id": order.get("order_id"),
+                        "reason_text": reason_text,
+                    },
+                }
+            # 非签收态订单:天数无意义,工具的状态门会先返回引导话术,这里给 0 占位。
+            days_for_check = 0 if days is None else days
             return {
                 "plan": [{
                     "name": "policy__check_return",
                     "args": {
                         "order_status": order.get("status"),
                         "reason": reason_text,
-                        "days_since_delivery": days,
+                        "days_since_delivery": days_for_check,
                     },
                 }],
                 "verdict": {
@@ -1296,6 +1342,9 @@ def make_nodes(
                     f"将为您转接人工(待确认):转接原因「{reason_label}」{suffix}。"
                     "请回复“确认”后,我再为您创建人工工单。"
                 )
+                # F1:上游挂了 notice(如「未查询到签收时间记录」)时必须先讲清缺什么,
+                # 否则买家只看到一句通用转人工,不知道自己为什么判不了。
+                draft = _with_notice(verdict, draft)
             if confirm and not confirm.get("replied"):
                 out = {"draft": draft, "confirm": {**confirm, "replied": True}}
             else:
@@ -1388,11 +1437,12 @@ def make_nodes(
         if kind == "refund_create_failed":
             return "退款申请未能创建(工具返回失败),请稍后重试或转人工客服。"
         if kind == "handoff":
-            return _render({
+            # F1:notice 说明「为什么判不了」,与"待确认"话术共用 _with_notice 同一口径。
+            return _with_notice(verdict, _render({
                 "kind": "handoff",
                 "reason": verdict.get("reason"),
                 "order_id": verdict.get("order_id"),
-            }, state)
+            }, state))
         if kind == "step_limit":
             return "您的问题需要更多步骤处理,已为您转接人工客服继续跟进。"
         if kind == "order_checked":
@@ -1544,6 +1594,8 @@ def make_nodes(
             "handoff": True,
             "confirm": built,
             "observations": observations,
+            # F1:`**verdict` 会把上游的 notice(如「未查询到签收时间记录」)带过来,
+            # kind 虽被改写成 handoff,那句解释不会丢(_reply_for 的 handoff 分支会前置它)。
             "verdict": {**verdict, "kind": "handoff", "reason": label,
                         "order_id": order_id, "handoff_reason": reason_enum},
         }

@@ -45,8 +45,7 @@ from typing import Any, Callable, Mapping, Sequence
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from app.guardrails import (
-    PII_ID_CARD_RE,
-    PII_PHONE_RE,
+    PII_PATTERNS as GUARD_PII_PATTERNS,
     PII_PLACEHOLDER_RE,
 )
 
@@ -218,13 +217,16 @@ ORDER_NUMBER_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 """订单号识别正则组(任一命中即不可缓存)。"""
 
-#: PII 形态:占位符(``[PHONE_1]``/``[ID_1]``/``[ADDR_1]``)与原文手机号/身份证号。
+#: PII 形态:占位符(``[PHONE_1]``/``[ID_1]``/``[ADDR_1]``)+ **主链路那份完整定义**。
+#:
+#: E3(2026-11-18 第四轮审计):原实现只手写了 占位符/手机/身份证 三条,**缺收货地址**,
+#: 与 ``guardrails.PII_PATTERNS`` 分叉。这里改成**从主链路那份派生**,
+#: 主链路以后新增 PII 类型自动跟上,不再靠人记得同步两处。
 PII_PATTERNS: tuple[re.Pattern[str], ...] = (
     PII_PLACEHOLDER_RE,
-    PII_PHONE_RE,
-    PII_ID_CARD_RE,
+    *(pattern for _kind, pattern in GUARD_PII_PATTERNS),
 )
-"""PII 识别正则组(含占位符与原文)。"""
+"""PII 识别正则组(占位符 + 主链路 PII_PATTERNS 派生,含地址)。"""
 
 
 # ---------------------------------------------------------------------------
@@ -328,9 +330,28 @@ def _has_order_number(text: str) -> bool:
 
 
 def _has_pii(text: str) -> bool:
-    """文本是否含 PII 占位符或原文(手机号 / 身份证号)。"""
+    """文本是否含 PII 占位符或原文(手机号 / 身份证号 / 收货地址)。"""
     body = str(text or "")
     return any(pattern.search(body) for pattern in PII_PATTERNS)
+
+
+def _has_buyer_specific_facts(reply: str, citations: list[dict]) -> bool:
+    """**回复侧**是否含买家专属事实(PII 或订单号)。E1,2026-11-18。
+
+    缓存是买家可见回复的一条出口,而 ``lookup`` 只有 merchant 维度、没有 customer 维度
+    ——同店所有买家共享。所以「含 PII / 订单号永不缓存」这条不变量必须**两侧都守**:
+    query 侧由 ``is_cacheable`` 守,回复侧由本函数守。
+
+    引用片段同时看 ``snippet``(真实链路 ``runner._citations`` 的键)与 ``text``
+    (部分调用方/测试夹具用的键),两个键都是出口,不能只守一个。
+    """
+    texts = [str(reply or "")]
+    for item in citations:
+        for key in ("snippet", "text"):
+            value = item.get(key)
+            if isinstance(value, str):
+                texts.append(value)
+    return any(_has_pii(body) or _has_order_number(body) for body in texts)
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +658,11 @@ class SemanticCache:
         不可缓存 → 返回 ``False`` 且不入库;成功 → ``True``。
         超出 ``max_entries`` 时按 LRU 淘汰最久未使用条目(容量是进程级资源,
         跨租户共享)。
+
+        E1(2026-11-18):**两侧都守**——query 侧走 ``is_cacheable``,
+        回复侧(reply + citations 的 snippet/text)走 ``_has_buyer_specific_facts``。
+        因为 ``lookup`` 没有 customer 维度,同店买家共享缓存,
+        任何带买家专属事实的回复都不得入库。
         """
         merchant = str(merchant_id or "")
         with self._lock:
@@ -668,6 +694,13 @@ class SemanticCache:
                 confidence = float(data.get("confidence") or 0.0)
             except (TypeError, ValueError):
                 confidence = 0.0
+            # E1(2026-11-18 第四轮审计):**回复侧也要过同一道隐私门**。
+            # 原实现只扫 query,而 api/chat.py 是先 masker.restore 再写缓存,
+            # 进缓存的 reply 是已反解的真实 PII;lookup 又只有 merchant 维度、
+            # 没有 customer 维度(同店买家共享),于是一条带买家专属事实的回复
+            # 会被交给同店其他买家。探针已证管道可达。
+            if _has_buyer_specific_facts(reply, citations):
+                return False
             entry = CacheEntry(
                 reply=reply,
                 citations=citations,

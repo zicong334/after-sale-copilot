@@ -137,8 +137,13 @@ def _sqlite_table_exists(db_path: Path, table: str) -> bool:
 
 
 def _sqlite_column_exists(db_path: Path, table: str, column: str) -> bool:
+    # 表名必须加引号:`order` 是 SQL 关键字,不加引号 PRAGMA 会报 near "order" 语法错。
+    # (F1 新增 0011 断言 order.delivered_at 时踩到;此前只查过 ticket/refund_request 等非关键字。)
+    safe = table.replace('"', '""')
     with sqlite3.connect(str(db_path)) as conn:
-        return column in [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+        return column in [
+            row[1] for row in conn.execute(f'PRAGMA table_info("{safe}")')
+        ]
 
 
 def _markers() -> tuple[str, str]:
@@ -264,7 +269,7 @@ def test_rollback_drill(tmp_dir):
     db_url = f"sqlite:///{db_path.as_posix()}"
 
     up = rollback.upgrade_database(db_url)
-    assert up["current_revision"] == "0010_badcase"
+    assert up["current_revision"] == "0011_order_delivered_at"
     assert up["integrity_check"] == "ok"
     assert up["foreign_key_violations"] == 0
     assert _sqlite_table_exists(db_path, "memory")
@@ -277,6 +282,8 @@ def test_rollback_drill(tmp_dir):
     assert _sqlite_column_exists(db_path, "refund_request", "tracking_no")  # W11
     assert _sqlite_column_exists(db_path, "ticket", "sla_breached")  # W11
     assert _sqlite_table_exists(db_path, "badcase")  # W12 新增 0010
+    # F1 新增 0011:只加列不建表
+    assert _sqlite_column_exists(db_path, "order", "delivered_at")
 
     down = rollback.downgrade_database(db_url, "0003", backup_dir=tmp_dir / "backup")
     assert down["target"] == "0003_ticket_summary"
@@ -292,9 +299,12 @@ def test_rollback_drill(tmp_dir):
     assert not _sqlite_table_exists(db_path, "turn_audit")
     assert not _sqlite_table_exists(db_path, "refund_item")
     assert not _sqlite_table_exists(db_path, "badcase")  # W12 0010 一并回滚
+    # F1 0011 一并回滚(batch_alter_table 兼容 SQLite 的 DROP COLUMN)
+    assert not _sqlite_column_exists(db_path, "order", "delivered_at")
 
     up2 = rollback.upgrade_database(db_url)
-    assert up2["current_revision"] == "0010_badcase"
+    assert up2["current_revision"] == "0011_order_delivered_at"
+    assert _sqlite_column_exists(db_path, "order", "delivered_at")  # F1 再升级后列回来
     assert _sqlite_table_exists(db_path, "memory")
     assert _sqlite_column_exists(db_path, "ticket", "session_id")
     assert _sqlite_table_exists(db_path, "auth_user")

@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 FAIL_HARD = "FAIL_HARD"
@@ -75,6 +76,70 @@ class HardResult:
 
 def _reply_text(artifact: dict[str, Any]) -> str:
     return str(artifact.get("reply") or "")
+
+
+# ---------------------------------------------------------------------------
+# H1(2026-11-18 第四轮审计):数字校验的语义边界
+#
+# 原实现是 `number in reply` —— 裸数字子串。cases_v1.json 的 expected_numbers
+# 全是裸数字('7'/'15'/'8'/'99'/'119'/'11900'/'48'/'1-7'),于是:
+#   假阳性:订单号 seed-order-007 里的 7、¥115.00 里的 15、电话 137… 里的 7 都白送分;
+#   假阴性:「十五天」讲对了反判失败。
+# 这一项原本**不具备判别力**,不能据总分声称「数字口径已对齐 PRD」。
+#
+# 修法:①中文数字归一化;②数字必须带业务上下文(量词或货币符号)且有词边界。
+# **不改冻结评测集**:期望值仍是裸数字,量词要求落在校验器里。
+# ---------------------------------------------------------------------------
+
+_CN_DIGITS: dict[str, int] = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+    "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_CN_UNITS: dict[str, int] = {"十": 10, "百": 100, "千": 1000}
+_CN_RUN_RE = re.compile(r"[零〇一二两三四五六七八九十百千]+")
+
+#: 业务量词:政策窗口(天/日/工作日)、时效(小时/分钟)、金额(元/块/角/分)。
+_NUMBER_UNIT_RE = r"(?:\s*个?(?:工作日|自然日|天|日|小时|分钟|元|块|角|分))"
+
+
+def _cn_run_to_int(run: str) -> int:
+    """把一段中文数字转成整数(十五→15、四十八→48、一百一十九→119、十→10)。"""
+    section = 0
+    number = 0
+    for char in run:
+        if char in _CN_DIGITS:
+            number = _CN_DIGITS[char]
+        elif char in _CN_UNITS:
+            # 「十五」的十前面没有数字,按 1 计。
+            section += (number or 1) * _CN_UNITS[char]
+            number = 0
+    return section + number
+
+
+def _normalize_cn_numbers(text: str) -> str:
+    """中文数字归一化为阿拉伯数字(**只用于数字匹配,不改对客文案**)。"""
+    return _CN_RUN_RE.sub(lambda m: str(_cn_run_to_int(m.group(0))), str(text or ""))
+
+
+def _number_in_business_context(number: str, reply: str) -> bool:
+    """期望数字是否**带业务上下文**出现在回复里。
+
+    两条通路:
+    1. 数字 + 量词:``7 天`` / ``15天`` / ``48 小时`` / ``1-7 个工作日`` / ``8 元`` / ``11900 分``;
+    2. 货币前缀:``¥119.00`` / ``￥119``。
+
+    数字本身必须有词边界(左右都不是数字或小数点),所以 ``seed-order-007`` 的 7、
+    ``¥115.00`` 的 15、``13700137000`` 的 7 都不再算命中。
+    """
+    token = str(number or "").strip()
+    if not token:
+        return False
+    body = _normalize_cn_numbers(reply)
+    escaped = re.escape(token)
+    bounded = rf"(?<![\d.]){escaped}(?![\d.])"
+    if re.search(bounded + _NUMBER_UNIT_RE, body):
+        return True
+    return bool(re.search(rf"[¥￥]\s*{escaped}(?:\.0+)?(?!\d)", body))
 
 
 def _tool_names(artifact: dict[str, Any]) -> list[str]:
@@ -187,7 +252,13 @@ def evaluate(case: dict[str, Any], artifact: dict[str, Any]) -> HardResult:
 
     # 5) 回复文本:数字 / 必含 / 禁止短语
     for number in case.get("expected_numbers") or []:
-        check("expected_number", number in reply, f"回复缺少数字 {number}")
+        # H1:带语义边界匹配(中文数字归一化 + 量词/货币上下文 + 词边界),
+        # 不再是裸数字子串 —— 否则订单号/无关金额里的数字会白送分。
+        check(
+            "expected_number",
+            _number_in_business_context(number, reply),
+            f"回复缺少带上下文的数字 {number}(需量词或货币符号,且非更长数字的一部分)",
+        )
     for text in gt.get("must_contain") or []:
         check("must_contain", text in reply, f"回复缺少必含内容 {text!r}")
     for phrase in case.get("forbidden_phrases") or []:

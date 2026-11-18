@@ -629,9 +629,11 @@ def test_b5_suggest_prompt_dynamic(client, engine):
         handoff_reason="quality",
         summary="买家称衣服有破洞",
     )
+    # G1(2026-11-18):转录现在按 _model_visible 过滤内部备注,桩对象需带 is_internal
+    # 字段(真实 TicketMessage 该列 nullable=False,本就有值)。**只补字段,断言一字未改。**
     messages = [
-        SimpleNamespace(author_type="user", content="衣服破了,我要退货"),
-        SimpleNamespace(author_type="agent", content="已为您登记,请稍等"),
+        SimpleNamespace(author_type="user", content="衣服破了,我要退货", is_internal=False),
+        SimpleNamespace(author_type="agent", content="已为您登记,请稍等", is_internal=False),
     ]
     citations = [
         SimpleNamespace(clause_id="RP-12", title="质量问题退货", text="7 天内可退换")

@@ -359,13 +359,25 @@ def _handle_order(
         )
 
     reason_text = _extract_reason(text)
-    days = _days_since_delivery(context, order.get("created_at"))
+    days = _days_since_delivery(context, order)
+    from app.tools.refund import REFUNDABLE_STATUSES
+
+    if days is None and order.get("status") in REFUNDABLE_STATUSES:
+        # F1:已签收却无签收时间 → 不臆断超期,转人工核实(与 graph/nodes.py 同口径)。
+        # 未发货/在途订单没有签收时间是正常的,走下面工具的状态引导,不被这条劫走。
+        return _turn(
+            decision, path,
+            f"已核验订单 {order_id},但未查询到签收时间记录,"
+            "无法自动判定是否超过退货期限。已为您转接人工客服核实物流签收状态,请稍等。",
+            [], None, calls, session_row,
+        )
     checked = invoke(
         "policy__check_return",
         {
             "order_status": order.get("status"),
             "reason": reason_text,
-            "days_since_delivery": days,
+            # 非签收态订单天数无意义(状态门先返回引导),给 0 占位而不是 None。
+            "days_since_delivery": 0 if days is None else days,
         },
         ctx,
     )
@@ -582,16 +594,17 @@ def _claimed_amounts_cents(text: str, context: dict[str, Any]) -> list[int]:
     return amounts
 
 
-def _days_since_delivery(context: dict[str, Any], created_at_iso: Any) -> int:
-    """签收天数:上下文显式值优先(评测用例给定时),否则按订单创建时间推算。"""
-    explicit = context.get("days_since_delivery")
-    if isinstance(explicit, int) and explicit >= 0:
-        return explicit
-    dt = _parse_dt(created_at_iso)
-    if dt is None:
-        return 0
-    days = (utc_now() - dt).days
-    return max(0, int(days))
+def _days_since_delivery(context: dict[str, Any], order: dict[str, Any]) -> int | None:
+    """签收天数:**与 ``graph/nodes.py`` 共用同一实现**(F1,2026-11-18)。
+
+    本模块目前全仓无人 import(旧编排,已知死代码),但它原先带着同一份错算法
+    ——拿下单时间兜底推签收天数,系统性高估导致误拒。留一份错的在这里,
+    将来有人复活它就再犯一次,所以改成**委托**而不是各留一份。
+    局部 import 避免模块加载期的循环依赖。
+    """
+    from app.graph.nodes import _days_since_delivery as _shared
+
+    return _shared(context, order)
 
 
 def _parse_dt(value: Any) -> datetime | None:

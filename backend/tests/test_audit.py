@@ -42,7 +42,7 @@ POLICIES_DIR = ROOT / "data" / "policies"
 MERCHANT_ID = "seed-merchant-1"
 CUSTOMER_REFUND = "seed-cust-010"
 ELIGIBLE_TEXT = "3 天前收到的衣服有线头,是质量问题,我要退货退款"
-REFUND_CONTEXT = {"order_id": "seed-order-020", "days_since_delivery": 3}
+REFUND_CONTEXT = {"order_id": "seed-order-020"}
 POLICY_TEXT = "你们的退货政策规定质量问题几天内可以退?"
 
 

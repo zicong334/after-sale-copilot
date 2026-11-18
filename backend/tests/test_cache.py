@@ -353,3 +353,79 @@ def test_concurrent_lookup_store_stays_bounded() -> None:
 
     assert not errors
     assert cache.stats()["size"] <= 8
+
+
+# ---------------------------------------------------------------------------
+# E 系列(2026-11-18 第四轮审计):「PII 永不缓存」必须同时守 query 与 reply 两侧
+#
+# 缺陷:is_cacheable 只扫**买家问的那句话**,store 从不扫 payload 里的 reply/citations;
+# 而 api/chat.py 是**先 masker.restore 再写缓存**,所以进缓存的 reply 是已反解的真实 PII。
+# lookup 又只有 merchant 维度、**没有 customer 维度**(同店所有买家共享),
+# 于是只要一条可缓存 query 的回复带了买家专属事实,它就会被交给同店其他买家。
+# 探针已证管道可达:只替换模型回复文本,买家002 命中缓存拿到 001 的手机号 + 订单号。
+#
+# 另:cache 的 PII 集合只有 占位符/手机/身份证,**缺收货地址**,与 guardrails 那份分叉。
+# ---------------------------------------------------------------------------
+
+E_PHONE_REPLY = "您的订单已发货,收货手机 13800138000,退货运费由买家承担。"
+E_ORDER_REPLY = "您的订单 seed-order-019 已发货,退货运费由买家承担。"
+E_ADDR_REPLY = "已按杭州市西湖区文一西路 100 号 3 单元 501 这个地址为您登记。"
+E_CLEAN_QUERY = "退货运费谁承担"
+
+
+def test_store_rejects_reply_containing_phone(cache: SemanticCache) -> None:
+    """E1:reply 含手机号 → 不入库,且查不到(query 本身干净)。"""
+    assert cache.store(E_CLEAN_QUERY, _payload(E_PHONE_REPLY), merchant_id="m1") is False
+    assert cache.lookup(E_CLEAN_QUERY, merchant_id="m1") is None
+
+
+def test_store_rejects_reply_containing_order_number(cache: SemanticCache) -> None:
+    """E1:reply 含订单号 → 不入库(订单号也是买家专属事实)。"""
+    assert cache.store(E_CLEAN_QUERY, _payload(E_ORDER_REPLY), merchant_id="m1") is False
+    assert cache.lookup(E_CLEAN_QUERY, merchant_id="m1") is None
+
+
+def test_store_rejects_reply_containing_address(cache: SemanticCache) -> None:
+    """E3:reply 含收货地址 → 不入库(原 cache 的 PII 集合缺地址)。"""
+    assert cache.store(E_CLEAN_QUERY, _payload(E_ADDR_REPLY), merchant_id="m1") is False
+    assert cache.lookup(E_CLEAN_QUERY, merchant_id="m1") is None
+
+
+def test_query_with_address_is_not_cacheable(cache: SemanticCache) -> None:
+    """E3:query 侧同样要认地址(与主链路口径一致)。"""
+    assert cache.is_cacheable("送到杭州市西湖区文一西路 100 号 3 单元 501 的快递能退吗") is False
+
+
+def test_store_rejects_citation_snippet_containing_pii(cache: SemanticCache) -> None:
+    """E1:citations 的原文片段也是出口,含 PII 一样不入库。"""
+    payload = _payload("退货运费由买家承担。")
+    payload["citations"] = [{"clause_id": "RP-02", "snippet": E_PHONE_REPLY}]
+    assert cache.store(E_CLEAN_QUERY, payload, merchant_id="m1") is False
+    payload2 = _payload("退货运费由买家承担。")
+    payload2["citations"] = [{"clause_id": "RP-02", "text": E_PHONE_REPLY}]
+    assert cache.store(E_CLEAN_QUERY, payload2, merchant_id="m1") is False
+
+
+def test_cache_pii_dictionary_is_guardrails_dictionary() -> None:
+    """E3 口径单一事实源:cache 不得维护第二份更窄的 PII 定义。
+
+    「同一概念在两模块各有一份定义就必分叉」是本轮 11 条发现里 3 条的共同病根,
+    所以这里断言的是**复用关系**(主链路每一条正则都在 cache 的集合里),
+    而不是"这次手工补齐了地址"——后者下次主链路加类型又会分叉。
+    """
+    from app import cache as cache_mod
+    from app.guardrails import PII_PATTERNS as GUARD_PII
+
+    guard_patterns = {pattern for _kind, pattern in GUARD_PII}
+    assert guard_patterns, "主链路 PII 定义不应为空(前提)"
+    assert any(kind == "ADDR" for kind, _ in GUARD_PII), "主链路应含地址(前提)"
+    missing = guard_patterns - set(cache_mod.PII_PATTERNS)
+    assert not missing, f"cache 未复用主链路的 PII 正则: {missing}"
+
+
+def test_clean_policy_reply_still_cached(cache: SemanticCache) -> None:
+    """正向:纯政策回复照常入库并命中(防守卫过度把缓存废掉)。"""
+    assert cache.store(E_CLEAN_QUERY, _payload(), merchant_id="m1") is True
+    hit = cache.lookup(E_CLEAN_QUERY, merchant_id="m1")
+    assert hit is not None
+    assert "7 天" in hit.reply
