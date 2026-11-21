@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # R3 一键运行时验证(2026-11-21 企业工程评审)
 #
-# ⚠️⚠️ **本脚本从未被执行过** ⚠️⚠️
-# 产出它的机器上 `docker` / `psql` / `redis-server` **全部不存在**,
-# 所以只做了 `bash -n` 语法校验与结构自检,**没有任何一步是"已验证"的**。
-# 在**有 Docker 的机器**上跑它,才算把 R3 与 Redis 三项的「未运行时验证」标记清掉。
+# ⚠️ **本脚本自身仍未被执行过** ⚠️
+# 产出它的机器上 `docker` / `psql` / `redis-server` **全部不存在**,只做过 `bash -n` 与结构自检。
+# 写它的时候顺手发现自身两处缺陷(只有真跑才会暴露):curl 端口写成 80(nginx 实际映射 8080)、
+# PG 口令默认值与 compose 不一致 —— 均已修,但**修完也还没跑过**。
+#
+# ✅ 等价验证已改由 CI 承担(2026-11-21 用户裁定的"总开关"):
+#   - `.github/workflows/ci.yml` 的 **pg-redis** job:真 PG16 + 真 Redis7(service container),
+#     覆盖本脚本 `pg` 阶段与 Redis 三条断言;
+#   - **container** job:runner 本身就是 Docker 机器,**真 build 本项目镜像** + `compose up`
+#     + Prometheus + SIGTERM 停机,覆盖本脚本 `minimal` 与 `obs` 阶段。
+#   清「未运行时验证」标记请以**那两个 job 的原始输出**为准,不是以本脚本存在为准。
+#   本脚本保留给「手上有 Docker、想在本机复现一遍」的场景。
 #
 # 用法(项目根执行):
 #   bash deploy/verify_runtime.sh            # 全阶段
@@ -91,7 +99,8 @@ cols = [c["name"] for c in inspect(eng).get_columns("order")]
 raise SystemExit(0 if "delivered_at" in cols else 1)
 PY
   say "2c) 全量测试跑在 PG 上(SQLite 专属文件自动跳过)"
-  # ⚠️ 需要 PG 驱动:requirements.lock.txt 目前**不含** psycopg,按报错装 dev 侧驱动后再跑
+  # PG 驱动已在生产锁里(psycopg==3.3.9 / psycopg-binary==3.3.9,2026-11-21 用户裁定:
+  # 迁 PG 是既定方向,驱动属运行时依赖)。装好 requirements.lock.txt 即可,不必再补 dev 侧驱动。
   if TEST_DATABASE_URL="$PG_URL" PYTHONPATH="$ROOT/backend" TMPDIR="$ROOT/.tmp" \
      python -m pytest backend/tests -q -p no:cacheprovider; then
     ok "测试在 PG 上通过(SQLite 专属两文件已跳过)"

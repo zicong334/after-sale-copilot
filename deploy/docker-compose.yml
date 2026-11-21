@@ -1,7 +1,12 @@
 # W12-3 交付物:本地/单机编排(backend + nginx 静态入口;可选 profiles 带 PG/Redis/监控)。
 #
-# ⚠️ 未在本机运行时验证(本机无 Docker);本文件只经过 deploy/lint_artifacts.py 的
-#    结构级 YAML 校验(services/ports/volumes/profile 键齐全、镜像与健康检查存在)。
+# 验证口径(2026-11-21 更新,别只看"本机没 Docker"就以为全没验过):
+# - **本机**确实无 Docker,本文件在本机只过 deploy/lint_artifacts.py 的结构级 YAML 校验;
+# - **CI 已真跑**:container job 真 `docker compose build backend` + `up -d backend nginx`
+#   + 经 nginx 冒烟 + Prometheus + SIGTERM 停机;pg-redis job 用真 PG16/Redis7 跑通
+#   11 条迁移双向与全量测试。**清标记以那两个 job 的原始输出为准。**
+# - ⚠️ container job 首轮即抓出真缺陷:nginx 此前只反代 /api/,
+#   /auth /orders /refunds /tickets /v1 全落静态 404(部署栈登不进去)。已修 + 加两条永久守卫。
 #
 # 用法:
 #   docker compose -f deploy/docker-compose.yml up -d --build                 # 最小栈:SLA 用 SQLite
@@ -11,7 +16,8 @@
 # 说明:
 # - backend 默认 DATABASE_URL 指向命名卷里的 SQLite;要切 PostgreSQL 请同时:
 #   1) 开 --profile full;2) 设 DATABASE_URL=postgresql+psycopg://...。
-#   PG 方言适配属于 W12-4,本仓库当前只保证 SQLite 口径。
+#   PG 方言已由 CI pg-redis job 实证(11 条迁移 upgrade/downgrade/再 upgrade + 全量测试跑在 PG 上);
+#   psycopg 驱动已进生产锁。**默认仍是 SQLite**,切 PG 需显式设 URL。
 # - backend 不映射宿主端口,外部只经 nginx;nginx 对 /metrics 做了内网限定。
 
 services:

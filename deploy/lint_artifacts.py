@@ -192,13 +192,34 @@ def check_ci(doc: dict, text: str) -> list[str]:
     jobs = doc.get("jobs") or {}
     if not isinstance(jobs, dict):
         return ["ci.yml 缺少 jobs 映射"]
-    for name in ("lint", "pytest", "eval", "deploy"):
+    # 2026-11-21:从四门禁扩到六门禁。pg-redis / container 是把「未运行时验证」
+    # 变成**可执行验证**的唯一手段(本机无 docker/psql/redis-server),
+    # 被误删就退回"写了但没验",而本 lint 原先根本不看它们。
+    for name in ("lint", "pytest", "eval", "deploy", "pg-redis", "container"):
         if name not in jobs:
             errors.append(f"ci.yml 缺少 job:{name}")
+
+    # 每 job 必须有超时:无 job 级超时那次,PG 全量步骤**卡死 121 分钟**没有任何信号。
+    for name, job in jobs.items():
+        if isinstance(job, dict) and "timeout-minutes" not in job:
+            errors.append(f"ci.yml job {name} 未设 timeout-minutes(卡死将无信号)")
 
     def job_text(name: str) -> str:
         job = jobs.get(name) or {}
         return yaml.safe_dump(job, allow_unicode=True, sort_keys=True) if isinstance(job, dict) else ""
+
+    pg_text = job_text("pg-redis")
+    if pg_text:
+        if "postgres" not in pg_text or "redis" not in pg_text:
+            errors.append("ci.yml pg-redis job 未起真 PG/Redis service container")
+        if "upgrade head" not in pg_text or "downgrade" not in pg_text:
+            errors.append("ci.yml pg-redis job 未验迁移双向(upgrade head + downgrade)")
+    ct_text = job_text("container")
+    if ct_text:
+        if "build" not in ct_text or "docker compose" not in ct_text:
+            errors.append("ci.yml container job 未真 build 本项目镜像(service container 不算)")
+        if "docker stop" not in ct_text:
+            errors.append("ci.yml container job 未验优雅停机(docker stop 后看退出码)")
 
     lint_text = job_text("lint")
     if "compileall" not in lint_text:
@@ -289,7 +310,10 @@ def lint(root: Path) -> tuple[list[str], list[str]]:
         errs = check_ci(ci_doc if isinstance(ci_doc, dict) else {}, ci_text)
         errors.extend(errs)
         if not errs:
-            oks.append(".github/workflows/ci.yml:lint/pytest/eval/deploy 四门禁 + 密封 env")
+            oks.append(
+                ".github/workflows/ci.yml:六门禁(lint/pytest/eval/deploy + 真 PG/Redis + 真镜像/停机)"
+                " + 每 job 超时 + 密封 env"
+            )
 
     dockerignore = root / ".dockerignore"
     if not dockerignore.is_file():

@@ -2,14 +2,24 @@
 
 本目录是"单机可交付"的容器化产物:**多阶段后端镜像 + nginx 静态入口 + 可选 PG/Redis/监控 profile**。
 
-> ⚠️ **未在本机运行时验证**
+> ⚠️ **未在本机运行时验证**(但**已由 CI 真跑**,两者别混为一谈)
 >
 > 开发机没有 Docker、Docker Compose、PostgreSQL、Redis,Grafana/Prometheus 也未启动过。
-> 本目录中的镜像构建、编排启动、抓取链路**只经过结构级静态校验**
-> (`python deploy/lint_artifacts.py` + `backend/tests/test_deploy_artifacts.py`),
-> 包括 YAML 可解析、服务/端口/卷/profiles 键齐全、Dockerfile 多阶段/非 root/HEALTHCHECK、
-> nginx 的 `/metrics` allow/deny 指令存在。**没有任何一条在本机真实跑通过。**
-> 首次在有 Docker 的机器上执行时,请按下面"首次落地核对单"逐条确认。
+> 在**本机**,本目录只经过结构级静态校验
+> (`python deploy/lint_artifacts.py` + `backend/tests/test_deploy_artifacts.py`):
+> YAML 可解析、服务/端口/卷/profiles 键齐全、Dockerfile 多阶段/非 root/HEALTHCHECK、
+> nginx 的 `/metrics` allow/deny 指令存在。
+>
+> ✅ **2026-11-21 起,GitHub Actions 承担了真实运行时验证**(runner 本身就是 Docker 机器):
+> - `pg-redis` job:真 PG16 + 真 Redis7,11 条迁移双向 + 全量测试跑在 PG 上 + 真 Redis 四条断言;
+> - `container` job:**真 build 本项目镜像** + `compose up backend nginx` + 经 nginx 冒烟
+>   + Prometheus 抓取/指标/告警规则 + SIGTERM 优雅停机看退出码。
+>
+> 清「未运行时验证」标记请以**那两个 job 的原始输出**为准。
+> ⚠️ `container` job **首轮就抓出真缺陷**:nginx 此前只反代 `/api/`,
+> `/auth` `/orders` `/refunds` `/tickets` `/v1` 共 19 个端点全落静态 404 —— **部署栈登不进去**。
+> 已修,并加两条永久守卫(API 不得落静态 / 静态不得被反代吞)。
+> 首次在有 Docker 的机器上执行时,仍请按下面"首次落地核对单"逐条确认。
 
 ## 1. 目录内容
 
@@ -18,7 +28,7 @@
 | `Dockerfile` | 多阶段镜像:builder 按 `requirements.lock.txt` 装依赖;runtime 用 `python:3.13-slim`,UID 10001 非 root,`HEALTHCHECK` 探 `/health` |
 | `entrypoint.sh` | 容器入口:`alembic upgrade head` → 空库 seed(可关)→ `uvicorn app.main:app` |
 | `docker-compose.yml` | `backend` + `nginx` 为最小栈;`postgres`/`redis`(profile `full`)、`prometheus`/`grafana`(profile `observability`)可选 |
-| `nginx.conf` | 静态前端 + `/api/`、`/ws/` 反代 + `/metrics` 仅回环/私网 |
+| `nginx.conf` | 静态前端 + 反代 `/api/`、`/auth`、`/orders`、`/refunds`、`/tickets`、`/v1`、`/ws/`、`/health*` + `/metrics` 仅回环/私网。**新增 router 必须同步这里**,两条守卫会卡 |
 | `prometheus.yml` | 抓取 `backend:8000/metrics`,15s 间隔 |
 | `lint_artifacts.py` | 交付物静态自检(无 Docker 可跑),CI 与本机共用 |
 
@@ -28,7 +38,7 @@
 # 最小栈:backend(SQLite,命名卷)+ nginx,浏览器开 http://127.0.0.1:8080
 docker compose -f deploy/docker-compose.yml up -d --build
 
-# 额外带 PG/Redis 容器(注意:后端当前仍走 DATABASE_URL,PG 方言适配是 W12-4)
+# 额外带 PG/Redis 容器(后端仍走 DATABASE_URL;PG 方言已由 CI pg-redis job 实证)
 docker compose -f deploy/docker-compose.yml --profile full up -d
 
 # 额外带 Prometheus/Grafana
@@ -40,7 +50,7 @@ docker compose -f deploy/docker-compose.yml --profile observability up -d
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `DATABASE_URL` | `sqlite:////app/data/dev.db` | 镜像内数据落在命名卷 `copilot-data`;切 PG 时形如 `postgresql+psycopg://...`(未验证) |
+| `DATABASE_URL` | `sqlite:////app/data/dev.db` | 镜像内数据落在命名卷 `copilot-data`;切 PG 时形如 `postgresql+psycopg://...`(方言与迁移已由 CI 在真 PG16 上验过;驱动 `psycopg` 已进生产锁) |
 | `SEED_ON_EMPTY` | `1` | 容器启动时 merchant 表为空才 seed,避免覆盖业务数据 |
 | `SERVE_HOST` / `SERVE_PORT` | `0.0.0.0` / `8000` | uvicorn 监听;对外只经 nginx |
 | `METRICS_ENABLED` | `1` | 关闭后 `/metrics` 返回 404 |
@@ -61,7 +71,7 @@ docker compose -f deploy/docker-compose.yml --profile observability up -d
 - [ ] `curl -fsS http://127.0.0.1:8080/health` 返回 200
 - [ ] `curl -fsS http://127.0.0.1:8080/metrics | head` 出现 `copilot_metrics_last_refresh_unixtime`
 - [ ] 从非私网地址访问 `/metrics` 返回 403
-- [ ] `docker compose --profile full up -d` 后 PG/Redis 容器 healthy(业务链路未切 PG,见 W12-4)
+- [ ] `docker compose --profile full up -d` 后 PG/Redis 容器 healthy(切 PG 需显式设 `DATABASE_URL`;方言已由 CI 验,本机切换仍需自查)
 - [ ] `--profile observability` 后 Prometheus target 为 UP、Grafana 能加数据源
 - [ ] 重启 backend 容器后数据仍在(`copilot-data` 卷)
 
@@ -77,15 +87,30 @@ docker compose -f deploy/docker-compose.yml --profile observability up -d
 
 ## 7. CI
 
-`.github/workflows/ci.yml` 含四门禁:`lint`(compileall + 交付物 lint)、`pytest`(密封
-FakeLLM 环境,不注入任何真实 key)、`eval`(`run_eval.py --smoke`,报告写 runner 临时目录,
-不脏 `data/eval/reports`)、`deploy`(交付物 lint 单独成 job)。
+`.github/workflows/ci.yml` 含**六门禁**,每 job 都设 `timeout-minutes`(无超时那次 PG 步骤卡死 121 分钟无信号):
 
-> 本仓库本地**没有配置 remote**,该 workflow 在推送后才真正生效;本地只能做 YAML 解析校验。
+| job | 做什么 |
+| --- | --- |
+| `lint` | compileall 全量语法 + 交付物 lint |
+| `pytest` | 密封 FakeLLM 全量测试 + **增量覆盖率门禁**(diff line ≥ 80%) |
+| `eval` | `run_eval.py --smoke`,报告写 runner 临时目录,不脏 `data/eval/reports` |
+| `deploy` | 交付物 lint 单独成 job |
+| `pg-redis` | **真 PG16 + 真 Redis7**(service container):11 条迁移 upgrade→downgrade base→再 upgrade、关键列核对、全量测试跑在 PG 上、真 Redis 四条断言 |
+| `container` | **真 build 本项目镜像** + `compose up backend nginx` + 经 nginx 冒烟 + Prometheus 抓取/新指标/告警规则 + `docker stop` 看退出码(137 = 被 SIGKILL,判优雅停机失效) |
+
+全部 job 不注入任何真实模型 key(无 key 时 `build_llm` 自动回退 FakeLLM)。
+
+> 远端:https://github.com/zicong334/after-sale-copilot (2026-11-21 已公开,workflow 已真跑)。
 
 ## 8. 已知限制
 
-- 未在本机运行时验证(见文首)。
-- 后端默认 SQLite;`postgres`/`redis` 服务目前只是"容器形态就位",业务代码尚未接 PG 方言与 Redis 队列(W12-4 范围)。
+- **未在本机运行时验证**(见文首);真实运行时验证由 CI 的 `pg-redis` / `container` 两 job 承担。
+- 后端**默认仍是 SQLite**。PG 方言与迁移已在真 PG16 上验过,但**业务默认口径没切**;
+  Redis 限流(`ratelimit_redis.py`)与 L2 缓存(`cache_l2.py`)已实现且经真 Redis 断言,
+  但**按 env 开关启用,默认走进程内实现** —— 单机形态下进程内实现才是正确默认。
+- **横向扩容对 SQLite 形态无效**(单写者 + 进程内限流/缓存/队列三坑咬合):
+  顺序必须 **先 PG → 再 Redis → 才多实例**。依据见 `docs/性能基线_20261121.md`(写路径负伸缩实测)。
+- 本编排**无 Alertmanager**:告警规则只在 Prometheus UI 可见,**不发通知**(用户裁定:无专职运维时多一个组件是负担)。
 - Grafana 未预置 dashboard/datasource provisioning,需手工加 Prometheus 数据源。
 - 镜像未做 SBOM/漏洞扫描;`python:3.13-slim` 与前端 `nginx:1.27-alpine` 的补丁需按组织基线定期刷新。
+- `verify_runtime.sh` **自身仍未被执行过**(只过 `bash -n`);它与 CI 两 job 覆盖同样的地面,留作本机复现用。

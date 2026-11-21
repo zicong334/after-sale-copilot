@@ -166,3 +166,168 @@ def test_no_unfinished_markers_in_delivery_artifacts():
         text = _read(rel)
         for marker in markers:
             assert marker not in text, f"{rel} 含未完成标记"
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-21 CI container job 抓到的真缺陷:nginx 只反代 /api/,
+# 而应用还有 /auth /orders /refunds /tickets /v1 四组根级路由 ——
+# 它们全部落进静态 `location /`(try_files … =404),**经 nginx 根本登不进去**。
+# 静态 lint 查"键齐不齐"查不出这个;只有真起栈冒烟才暴露。
+#
+# 这里把「枚举全部出口」做成永久守卫:**不硬编码前缀清单**(那样新增 router 又会漏),
+# 而是从 app.openapi() 取全部真实路径,按 nginx 匹配语义算出每条路径命中的 location,
+# 断言它必须 proxy_pass 到后端。
+# ---------------------------------------------------------------------------
+
+
+def _nginx_locations() -> list[tuple[str, str, str]]:
+    """解析 location 块 → [(kind, pattern, body)],kind ∈ {'exact','prefix'}。
+
+    本项目的 nginx.conf 只用精确(=)与前缀 location,没有正则;
+    真加了正则本解析会显式报错,而不是静默给出错误的匹配结论。
+    """
+    text = _read("deploy/nginx.conf")
+    out: list[tuple[str, str, str]] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = re.match(r"\s*location\s+(.+?)\s*\{", lines[i])
+        if not m:
+            i += 1
+            continue
+        head = m.group(1).strip()
+        if head.startswith("~"):
+            raise AssertionError("nginx.conf 出现正则 location,本守卫的匹配模型需同步升级")
+        kind = "exact" if head.startswith("=") else "prefix"
+        pattern = head[1:].strip() if kind == "exact" else head
+        depth = 1
+        body: list[str] = []
+        i += 1
+        while i < len(lines) and depth > 0:
+            depth += lines[i].count("{") - lines[i].count("}")
+            if depth > 0:
+                body.append(lines[i])
+            i += 1
+        out.append((kind, pattern, "\n".join(body)))
+    assert out, "没解析到任何 location —— 解析器坏了,不是配置对了"
+    return out
+
+
+def _nginx_match(path: str, locs: list[tuple[str, str, str]]) -> tuple[str, str, str]:
+    """nginx 匹配语义:精确 `=` 优先,否则**最长前缀**胜出。"""
+    for kind, pattern, body in locs:
+        if kind == "exact" and pattern == path:
+            return kind, pattern, body
+    best: tuple[str, str, str] | None = None
+    for kind, pattern, body in locs:
+        if kind == "prefix" and path.startswith(pattern):
+            if best is None or len(pattern) > len(best[1]):
+                best = (kind, pattern, body)
+    assert best is not None, f"{path} 没有命中任何 location(连 location / 都没有?)"
+    return best
+
+
+def test_nginx_proxies_every_openapi_path_instead_of_serving_static():
+    """全部 OpenAPI 路径经 nginx 都必须反代到后端,不能落进静态 404。"""
+    from app.main import app
+
+    paths = sorted(app.openapi()["paths"])
+    assert len(paths) > 20, f"OpenAPI 路径数异常({len(paths)}),取数口径可能坏了"
+    locs = _nginx_locations()
+    fell_into_static = []
+    for p in paths:
+        probe = re.sub(r"\{[^}]+\}", "1", p)  # 路径参数换成占位值,不影响前缀匹配
+        _kind, pattern, body = _nginx_match(probe, locs)
+        if "proxy_pass" not in body:
+            fell_into_static.append(f"{p} -> location {pattern}")
+    assert not fell_into_static, (
+        "以下路径经 nginx 落到静态 handler(404),部署栈上这些接口不可用:\n  "
+        + "\n  ".join(fell_into_static)
+    )
+
+
+def test_nginx_static_frontend_files_are_not_swallowed_by_proxy():
+    """反向守卫:补反代前缀时**不能反过来把静态文件吞掉**。
+
+    真实风险:前端有 `api.js`,若把 `location /api/` 写成 `location /api`(去掉尾斜杠),
+    `/api.js` 就会被反代到后端 → 前端整个挂掉。本用例枚举 frontend/ 全部文件,
+    断言它们仍由静态 handler 提供。
+
+    末尾的合成对照是**门禁有效性自检**(本项目红线:假门禁比没门禁更糟):
+    构造一个去掉尾斜杠的 /api 前缀,确认匹配器真会把 api.js 判给它 ——
+    否则这条守卫可能只是因为匹配器坏了才"通过"。
+    """
+    locs = _nginx_locations()
+    static_files = sorted(p.name for p in (_ROOT / "frontend").iterdir() if p.is_file())
+    assert static_files, "frontend/ 空了?取数口径坏了"
+    swallowed = []
+    for name in static_files:
+        _kind, pattern, body = _nginx_match(f"/{name}", locs)
+        if "proxy_pass" in body:
+            swallowed.append(f"/{name} -> location {pattern}")
+    assert not swallowed, "静态文件被反代吞掉,前端会挂:\n  " + "\n  ".join(swallowed)
+
+    # 有效性自检:去掉尾斜杠的 /api 必须真能吞掉 api.js(证明本守卫有判别力)
+    collision = [(k, "/api" if p == "/api/" else p, b) for k, p, b in locs]
+    _kind, pattern, body = _nginx_match("/api.js", collision)
+    assert pattern == "/api" and "proxy_pass" in body, (
+        "匹配器没能识别出尾斜杠缺失导致的静态吞噬 —— 本守卫失去判别力"
+    )
+
+
+def _ci_doc_minimal() -> dict:
+    """构造一份能过既有 check_ci 的最小 ci doc,用于负控(故意抽掉某项看它是否真报错)。"""
+    return {
+        "jobs": {
+            "lint": {
+                "timeout-minutes": 20,
+                "steps": [{"run": "python -m compileall -q backend/app"},
+                          {"run": "python deploy/lint_artifacts.py"}],
+            },
+            "pytest": {"timeout-minutes": 20, "steps": [{"run": "python -m pytest backend/tests -q"}]},
+            "eval": {"timeout-minutes": 20, "steps": [
+                {"run": "python backend/scripts/run_eval.py --smoke --out-dir /tmp/r"}]},
+            "deploy": {"timeout-minutes": 20, "steps": [{"run": "python deploy/lint_artifacts.py"}]},
+            "pg-redis": {
+                "timeout-minutes": 20,
+                "services": {"postgres": {"image": "postgres:16"}, "redis": {"image": "redis:7"}},
+                "steps": [{"run": "python -m alembic -c backend/alembic.ini upgrade head"},
+                          {"run": "python -m alembic -c backend/alembic.ini downgrade base"}],
+            },
+            "container": {
+                "timeout-minutes": 25,
+                "steps": [{"run": "docker compose -f deploy/docker-compose.yml build backend"},
+                          {"run": "docker stop $CID"}],
+            },
+        }
+    }
+
+
+def test_ci_lint_requires_runtime_jobs_and_per_job_timeout():
+    """lint 必须校验**运行时两 job**与**每 job 超时**,不能只认老四门禁。
+
+    两条都是真事故换来的:
+    - pg-redis / container 是把「未运行时验证」变成可执行验证的唯一手段,
+      被误删就退回"写了但没验",而 lint 原先**根本不看它们**;
+    - 无 job 级超时那次,PG 全量步骤**卡死 121 分钟**没有任何信号。
+    """
+    import copy
+
+    full = _ci_doc_minimal()
+    assert lint_mod.check_ci(full, yaml.safe_dump(full, allow_unicode=True)) == []
+
+    for missing in ("pg-redis", "container"):
+        doc = copy.deepcopy(full)
+        del doc["jobs"][missing]
+        errs = lint_mod.check_ci(doc, yaml.safe_dump(doc, allow_unicode=True))
+        assert any(missing in e for e in errs), f"抽掉 {missing} job 竟不报错:{errs}"
+
+    doc = copy.deepcopy(full)
+    del doc["jobs"]["container"]["timeout-minutes"]
+    errs = lint_mod.check_ci(doc, yaml.safe_dump(doc, allow_unicode=True))
+    assert any("timeout-minutes" in e for e in errs), f"抽掉 job 超时竟不报错:{errs}"
+
+    doc = copy.deepcopy(full)
+    doc["jobs"]["container"]["steps"] = [{"run": "echo noop"}]
+    errs = lint_mod.check_ci(doc, yaml.safe_dump(doc, allow_unicode=True))
+    assert errs, "container job 不 build 镜像也不验停机,竟不报错"
