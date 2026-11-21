@@ -35,6 +35,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 import time
@@ -434,6 +435,8 @@ class _Record:
     merchant_id: str
     normalized: str
     entry: CacheEntry
+    #: R10:该条目**自己的**有效 TTL(含确定性抖动),不是统一 base。
+    ttl: float = 0.0
 
 
 def _now() -> float:
@@ -466,12 +469,18 @@ class SemanticCache:
         threshold: float = 0.92,
         ttl_seconds: int = 1800,
         max_entries: int | None = 512,
+        ttl_jitter_ratio: float = 0.2,
+        l2: Any | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._threshold = float(threshold)
         self._ttl = float(ttl_seconds)
+        # R10:TTL 抖动比例(±)。**确定性派生,不用 random()** —— 见 effective_ttl_seconds。
+        self._ttl_jitter = max(0.0, min(1.0, float(ttl_jitter_ratio)))
         self._max_entries = None if max_entries is None else max(0, int(max_entries))
         self._clock: Callable[[], float] = clock if clock is not None else _now
+        # R8:可选 L2(Redis 精确键)。**默认 None = 纯 L1,存量路径一字不变**。
+        self._l2 = l2
         self._records: OrderedDict[str, _Record] = OrderedDict()
         self._hits = 0
         self._misses = 0
@@ -488,8 +497,30 @@ class SemanticCache:
 
     @property
     def ttl_seconds(self) -> float:
-        """条目存活时长(秒)。"""
+        """条目存活时长基数(秒);单条实际 TTL 见 ``effective_ttl_seconds``。"""
         return self._ttl
+
+    def effective_ttl_seconds(self, key: str) -> float:
+        """该 key 的**有效 TTL** = base × (1 ± jitter),R10(2026-11-21)。
+
+        为什么加抖动:原先所有 key 共用固定 1800s,**同秒集中失效**(「TTL 统一」反模式)。
+        本层是进程内 L1、上限 512 条,爆炸半径远小于 Redis 集群,故定 P2 而非照抄 P1。
+
+        为什么**确定性派生而不是 random()**:
+        ① 项目质量判据明写「业务代码无裸 now()/random(),统一 Clock/IdGenerator 注入」;
+        ② **不能用内置 hash()** —— str 的 hash 带进程级随机盐(PYTHONHASHSEED),
+           跨进程不可复现,会让抖动变成不可调试的随机行为。
+        sha256 首字节映射到 [-1, 1] 既把到期时间打散,又可复现、可断言。
+        ``ttl_jitter_ratio=0`` 时精确等于 base(保留原语义,便于对照与压测)。
+        """
+        if self._ttl_jitter <= 0:
+            return self._ttl
+        # 用**归一后的查询串**派生:store 内部 key 含租户前缀,
+        # 若拿内部 key 派生,调用方用原始问句算出的 TTL 会与实际不一致(不可断言)。
+        basis = _normalize(str(key)) or str(key)
+        digest = hashlib.sha256(basis.encode("utf-8")).digest()
+        offset = (digest[0] / 255.0) * 2.0 - 1.0
+        return self._ttl * (1.0 + self._ttl_jitter * offset)
 
     @property
     def max_entries(self) -> int | None:
@@ -507,7 +538,7 @@ class SemanticCache:
         stale = [
             key
             for key, record in self._records.items()
-            if now - record.entry.created_at > self._ttl
+            if now - record.entry.created_at > record.ttl
         ]
         for key in stale:
             self._records.pop(key, None)
@@ -581,6 +612,34 @@ class SemanticCache:
             return False
         return True
 
+    def _from_l2(self, query: str, merchant: str) -> CacheEntry | None:
+        """L1 未命中时查 L2(精确键),命中则回填 L1 并计一次命中。R8。
+
+        ⚠️ L2 **只做精确键**,不做语义相似 —— 改述仍只有 L1 能命中(有意取舍)。
+        L2 故障返回 None,绝不影响主链路。调用时**不得持锁**(内部自行加锁回填)。
+        """
+        if self._l2 is None:
+            return None
+        entry = self._l2.get(merchant, query)
+        if entry is None:
+            return None
+        with self._lock:
+            key = self._key(merchant, query)
+            self._records[key] = _Record(
+                merchant_id=merchant, normalized=query, entry=entry,
+                ttl=self.effective_ttl_seconds(query),
+            )
+            self._records.move_to_end(key)
+            self._version += 1
+            self._matrix_cache = None
+            self._hits += 1
+        return CacheEntry(
+            reply=entry.reply,
+            citations=[dict(item) for item in entry.citations],
+            intent=entry.intent, confidence=entry.confidence,
+            intent_reason=entry.intent_reason, created_at=entry.created_at,
+        )
+
     def lookup(self, text: str, *, merchant_id: str = "") -> CacheEntry | None:
         """查缓存。
 
@@ -608,6 +667,9 @@ class SemanticCache:
             candidates = tuple(self._records[key].normalized for key in keys)
             version = self._version
         if not keys:
+            l2_hit = self._from_l2(query, merchant)
+            if l2_hit is not None:
+                return l2_hit
             with self._lock:
                 self._misses += 1
             return None
@@ -627,6 +689,9 @@ class SemanticCache:
                 or best_score < self._threshold
                 or record.normalized != candidates[best_index]
             ):
+                l2_hit = self._from_l2(query, merchant)
+                if l2_hit is not None:
+                    return l2_hit
                 self._misses += 1
                 return None
             self._hits += 1
@@ -722,9 +787,13 @@ class SemanticCache:
                 merchant_id=merchant,
                 normalized=normalized,
                 entry=entry,
+                ttl=self.effective_ttl_seconds(text),
             )
             self._version += 1
             self._stores += 1
+            # R8:写穿 L2(故障只告警,不影响 L1 成功)。
+            if self._l2 is not None:
+                self._l2.set(merchant, normalized, entry)
             return True
 
     def clear(self, *, merchant_id: str | None = None) -> None:
@@ -746,6 +815,10 @@ class SemanticCache:
                     self._records.pop(key, None)
             self._version += 1
             self._matrix_cache = None
+        # R8:广播失效,让其他实例也清掉自己的 L1(否则一致性窗口仍= TTL)。
+        # 放在锁外:Pub/Sub 是网络调用,不能占着 RLock。
+        if self._l2 is not None:
+            self._l2.invalidate(str(merchant_id or "") if merchant_id is not None else "")
 
     def stats(self) -> dict:
         """统计:``{"size": n, "hits": h, "misses": m, "stores": s}``。
@@ -764,4 +837,7 @@ class SemanticCache:
 
 
 #: 模块级单例:调用方直接用它,不要各处 ``new``(否则缓存不共享)。
-semantic_cache = SemanticCache()
+# R8:按 REDIS_URL 决定是否挂 L2;**未设时 build_l2() 返回 None,纯 L1 路径一字不变**。
+from app.cache_l2 import build_l2 as _build_l2
+
+semantic_cache = SemanticCache(l2=_build_l2())

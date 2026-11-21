@@ -24,3 +24,15 @@ pytest-cache-files-*/
 
 # UI 诊断工具venv(主会话验收用,非项目产物)
 .uitools/
+
+# 覆盖率产物(R2 增量覆盖率门禁,2026-11-21)
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# 坏例草稿(R14,2026-11-21):草稿含买家原话与坐席对客回复,
+# 即使已脱敏也属**待人工评审的中间产物**,不该默认进仓。
+# 已在 build_case 里用主链路 PIIMasker 脱敏;此处再加一道出仓闸。
+# 注:按 git 语义,**已被跟踪的历史草稿文件仍保留**(它们是已核验无 PII 的演示证据,不删证据)。
+data/eval/drafts/

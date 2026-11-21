@@ -21,6 +21,13 @@ services:
       dockerfile: deploy/Dockerfile
     image: after-sale-copilot-backend:local
     restart: unless-stopped
+    # R11(2026-11-21):停机优雅期。默认 10s 不够 ——
+    # 框架侧压测(docs/性能基线_20261121.md)写路径 max 达 5612ms,
+    # reference 判据 grace ≥ 最长请求×1.2 ≈ 6.7s;取 30s 留余量。
+    # ⚠️ 该 max 是 FakeLLM 框架侧口径,真模型档未测;真模型更长时需按新数据重算。
+    # 配套 entrypoint 的 --timeout-graceful-shutdown 20 **必须小于本值**,
+    # 否则 uvicorn 还在等长连接就被 SIGKILL 截断,grace 白设。
+    stop_grace_period: 30s
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/dev.db}
       METRICS_ENABLED: "1"
@@ -89,6 +96,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # R6:死信告警规则(无 Alertmanager,只在 Prometheus UI 可见,不发通知)
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     ports:
       - "9090:9090"

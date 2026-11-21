@@ -341,12 +341,24 @@ def effective_identity(
 # ---------------------------------------------------------------------------
 
 
+# R4/R5:Redis 后端与分档策略。**惰性依赖** —— ratelimit_redis 模块级不 import security,
+# 其 build_limiters 内部才反向取本模块常量,故无循环导入。
+from app.ratelimit_redis import build_limiters as _build_rate_limiters
+from app.ratelimit_redis import fail_mode_for_path as _fail_mode_for_path
+
+
 class RateLimiter(ABC):
     """限流器接口(生产缝:Redis INCR + EXPIRE 实现同签名)。"""
 
     @abstractmethod
-    def consume(self, key: str, now: float | None = None) -> tuple[bool, float]:
-        """消费一次配额;返回 ``(是否放行, 拒绝时建议的 Retry-After 秒数)``。"""
+    def consume(
+        self, key: str, now: float | None = None, fail_mode: str | None = None,
+    ) -> tuple[bool, float]:
+        """消费一次配额;返回 ``(是否放行, 拒绝时建议的 Retry-After 秒数)``。
+
+        ``fail_mode``(R4/R5):外部后端故障时的策略覆盖("open"/"closed")。
+        进程内实现无外部依赖,忽略该参数。
+        """
 
     def refund(self, key: str) -> None:
         """补回一次已消费的配额(B4:两级限流中后级拒绝时回滚前级)。
@@ -366,7 +378,10 @@ class MemoryRateLimiter(RateLimiter):
         self._buckets: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
 
-    def consume(self, key: str, now: float | None = None) -> tuple[bool, float]:
+    def consume(
+        self, key: str, now: float | None = None, fail_mode: str | None = None,
+    ) -> tuple[bool, float]:
+        # fail_mode 只对 Redis 等外部后端有意义;进程内无外部依赖,忽略。
         current = time.monotonic() if now is None else now
         with self._lock:
             tokens, last = self._buckets.get(key, (float(self.burst), current))
@@ -388,20 +403,23 @@ class MemoryRateLimiter(RateLimiter):
             self._buckets[key] = (min(float(self.burst), tokens + 1.0), last)
 
 
-_user_limiter = MemoryRateLimiter(USER_RATE_PER_SECOND, USER_BURST)
-_tenant_limiter = MemoryRateLimiter(TENANT_RATE_PER_SECOND, TENANT_BURST)
+# R4/R5:后端按 REDIS_URL 选;**未设时仍是进程内实现,默认路径一字不变**。
+# 设了 Redis 但连不上 → build_limiters 内部降级回进程内并告警(不阻断启动)。
+_user_limiter, _tenant_limiter = _build_rate_limiters()
 
 
 def check_rate_limit(
-    identity: Identity, *, now: float | None = None
+    identity: Identity, *, now: float | None = None, path: str | None = None
 ) -> float | None:
     """用户级 + 租户级双重令牌桶;放行返回 None,拒绝返回 Retry-After 秒数。"""
     if not RATE_LIMIT_ENABLED:
         return None
-    allowed, retry_after = _user_limiter.consume(identity.sub, now)
+    # R4/R5:按链路分档决定外部后端故障时放行还是拒绝(资损/写 fail-close,纯读 fail-open)。
+    mode = _fail_mode_for_path(path) if path else None
+    allowed, retry_after = _user_limiter.consume(identity.sub, now, fail_mode=mode)
     if not allowed:
         return retry_after
-    allowed, retry_after = _tenant_limiter.consume(identity.merchant_id, now)
+    allowed, retry_after = _tenant_limiter.consume(identity.merchant_id, now, fail_mode=mode)
     if not allowed:
         # B4:租户级拒绝时把刚扣掉的用户令牌补回,否则租户被打满会白耗个人配额。
         _user_limiter.refund(identity.sub)
@@ -651,6 +669,7 @@ def publish_event(channel: str, event_type: str, **payload: Any) -> None:
 PUBLIC_PATHS = (
     "/",
     "/health",
+    "/healthz/ready",
     "/metrics",
     "/favicon.ico",
     "/favicon.svg",
@@ -754,6 +773,6 @@ def error_response(status_code: int, code: str, message: str, *, retryable: bool
 def reset_security_state() -> None:
     """重置进程内安全状态(限流桶 / 订阅表);测试 fixture 与 logout 场景用。"""
     global _user_limiter, _tenant_limiter, BROKER
-    _user_limiter = MemoryRateLimiter(USER_RATE_PER_SECOND, USER_BURST)
-    _tenant_limiter = MemoryRateLimiter(TENANT_RATE_PER_SECOND, TENANT_BURST)
+    # R4/R5:走同一后端选择,避免 reset 把 Redis 后端悄悄换回进程内。
+    _user_limiter, _tenant_limiter = _build_rate_limiters()
     BROKER = InMemoryBroker()

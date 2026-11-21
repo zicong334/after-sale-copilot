@@ -285,6 +285,29 @@ def _queue_depth(session: Session) -> dict[str, int]:
     return depth
 
 
+def _dead_oldest_age_seconds(session: Session) -> float:
+    """最老死信的年龄(秒)。R6(2026-11-21 企业工程评审)。
+
+    为什么光有 `copilot_job_queue_depth{status="dead"}` 不够:
+    计数看不出"有一条已经躺了一周"。**年龄才是可行动的信号** ——
+    告警应基于它(阈值属运维决策,本轮不拍数字)。
+    无死信返回 0.0。
+    """
+    rows = session.execute(
+        select(Job.created_at).where(Job.status == "dead").limit(EVENT_ROW_LIMIT)
+    ).all()
+    stamps = [r[0] for r in rows if r[0] is not None]
+    if not stamps:
+        return 0.0
+    now = utc_now()
+    ages = []
+    for stamp in stamps:
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        ages.append((now - stamp).total_seconds())
+    return float(max(ages)) if ages else 0.0
+
+
 def _cache_stats() -> dict[str, int | float]:
     """进程内语义缓存统计(延迟导入,避免未启用时也拉起 sklearn 依赖)。"""
     try:
@@ -430,6 +453,14 @@ def render_metrics(session: Session) -> str:
         lines.append(
             "copilot_job_queue_depth" + _labels(status=status) + " " + _num(depth[status])
         )
+    # R6:最老死信年龄 —— 计数看不出"躺了一周",年龄才是可行动信号。
+    lines.append(
+        "# HELP copilot_job_dead_oldest_age_seconds 最老死信(dead)的存活秒数;无死信为 0"
+    )
+    lines.append("# TYPE copilot_job_dead_oldest_age_seconds gauge")
+    lines.append(
+        "copilot_job_dead_oldest_age_seconds " + _num(_dead_oldest_age_seconds(session))
+    )
 
     # 7) 缓存命中率
     cache = _cache_stats()

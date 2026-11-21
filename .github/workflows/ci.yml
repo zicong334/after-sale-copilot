@@ -39,27 +39,53 @@ jobs:
         run: python deploy/lint_artifacts.py
 
   pytest:
-    name: pytest(密封 FakeLLM)
+    name: pytest(密封 FakeLLM + 增量覆盖率门禁)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # R2:diff-cover 需要历史才能算增量;默认 fetch-depth=1 会让门禁看不到 diff。
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: requirements.lock.txt
-      - name: 安装依赖(锁文件)
-        run: python -m pip install -r requirements.lock.txt
+          cache-dependency-path: |
+            requirements.lock.txt
+            requirements-dev.txt
+      - name: 安装依赖(生产锁 + dev 覆盖率工具)
+        run: python -m pip install -r requirements.lock.txt -r requirements-dev.txt
       - name: 确认未注入真实模型凭据
         run: |
           test -z "${LLM_API_KEY:-}" || { echo "检测到 LLM_API_KEY,密封测试不允许"; exit 1; }
           test -z "${MINIMAX_API_KEY:-}" || { echo "检测到 MINIMAX_API_KEY,密封测试不允许"; exit 1; }
-      - name: 全量测试
+      - name: 全量测试(带覆盖率)
         env:
           TMPDIR: ${{ runner.temp }}
         run: |
           python -m pytest backend/tests -q -p no:cacheprovider \
-            --basetemp="$RUNNER_TEMP/pytest"
+            --basetemp="$RUNNER_TEMP/pytest" \
+            --cov --cov-report=xml:coverage.xml --cov-report=term-missing:skip-covered
+      - name: 增量覆盖率门禁(diff line ≥ 80%)
+        # R2(2026-11-21 企业工程评审):本项目三次实证「用例数 ≠ 覆盖」
+        # (762 全绿时有 critical 越权 / B1 断言测错端点 / C1 路径从未被断言),
+        # 所以必须卡**增量覆盖率**而不是数用例条数。
+        # 落地时已实测:故意加一个未覆盖函数 → 门禁 rc=1 并指出缺失行号。
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+          else
+            BASE="HEAD~1"
+          fi
+          echo "对比基线: $BASE"
+          python -m diff_cover.diff_cover_tool coverage.xml \
+            --compare-branch="$BASE" --fail-under=80
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
 
   eval:
     name: eval(--smoke,mock 基线)

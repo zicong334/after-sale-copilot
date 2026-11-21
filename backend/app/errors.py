@@ -1,4 +1,4 @@
-"""统一错误体 + 8 个异常处理器。
+"""统一错误体 + 9 个异常处理器。
 
 约定(PRD §4 失败语义 + 五层契约 ToolResult.error):
 - 错误响应体恒为 ``{ok: false, error: {code, message, retryable, param}}``,失败必须 ok:false 冒泡
@@ -14,10 +14,37 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = logging.getLogger("app.errors")
+
+
+#: R16:可判为「存储忙,稍后可重试」的错误特征(小写子串匹配)。
+#: SQLite 锁竞争 + PG 序列化失败/死锁。**刻意不含** schema 错与磁盘 I/O 错 ——
+#: 那些不是"稍后重试就好",伪装成 503 会让调用方白重试并掩盖真 bug。
+_STORAGE_BUSY_MARKERS: tuple[str, ...] = (
+    "database is locked",
+    "database table is locked",
+    "database is busy",
+    "could not serialize access",
+    "deadlock detected",
+)
+
+#: 存储忙时建议的退避秒数。**起步值,需按 SLO 校准**(本轮无 SLO,不拍最终值)。
+_STORAGE_BUSY_RETRY_AFTER = 1
+
+
+def is_storage_busy(exc: BaseException) -> bool:
+    """该异常是否属于「存储忙,稍后可重试」(R16,2026-11-21 压测发现)。
+
+    只对 ``OperationalError`` 生效,且按错误文本匹配锁/序列化/死锁特征。
+    与存储无关的调用方错误、schema 错、磁盘错一律 False。
+    """
+    if not isinstance(exc, OperationalError):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _STORAGE_BUSY_MARKERS)
 
 
 class AppError(Exception):
@@ -91,8 +118,9 @@ def _body(
     message: str,
     retryable: bool = False,
     param: Any = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
-    """统一错误响应体。"""
+    """统一错误响应体。``headers`` 用于 503 的 Retry-After(R16)。"""
     return JSONResponse(
         status_code=status_code,
         content={
@@ -104,11 +132,12 @@ def _body(
                 "param": param,
             },
         },
+        headers=headers,
     )
 
 
 def register_error_handlers(app: FastAPI) -> None:
-    """注册 8 个异常处理器(顺序与优先级无关,Starlette 按异常 MRO 匹配最近的)。"""
+    """注册 9 个异常处理器(顺序与优先级无关,Starlette 按异常 MRO 匹配最近的)。"""
 
     # 1. 状态机冲突 → 409 STATE_CONFLICT(带当前真实状态)
     @app.exception_handler(StateConflictError)
@@ -144,7 +173,24 @@ def register_error_handlers(app: FastAPI) -> None:
         logger.warning("数据库约束冲突: %s", exc)
         return _body(409, "DB_CONSTRAINT", "数据库约束冲突", False, None)
 
-    # 7. Starlette/FastAPI HTTPException → 透传为统一错误体
+    # 7. R16(2026-11-21 压测发现):存储锁竞争 → **503 STORAGE_BUSY + Retry-After**。
+    #    压测在写并发 8 时抓到裸 500 `database is locked`(chat.py:_resolve_session)。
+    #    500 会招致客户端与网关重试,在已饱和的写路径上放大流量;503+Retry-After 才是受控降级。
+    #    ⚠️ 刻意**不做整请求自动重试**:reference 明写「非幂等操作禁止自动重试」,
+    #    对话 POST 可能已有工具自行 commit,重放会双写。重试交给持幂等键的调用方。
+    #    非锁类 OperationalError(schema 错/磁盘错)仍走 500,不伪装成"稍后重试"。
+    @app.exception_handler(OperationalError)
+    async def handle_operational_error(_req, exc: OperationalError):
+        if is_storage_busy(exc):
+            logger.warning("存储忙(锁竞争/序列化冲突),受控降级 503: %s", exc)
+            return _body(
+                503, "STORAGE_BUSY", "存储繁忙,请稍后重试", True, None,
+                headers={"Retry-After": str(_STORAGE_BUSY_RETRY_AFTER)},
+            )
+        logger.exception("数据库操作失败(非锁竞争)")
+        return _body(500, "INTERNAL_ERROR", "服务器内部错误", True, None)
+
+    # 8. Starlette/FastAPI HTTPException → 透传为统一错误体
     @app.exception_handler(StarletteHTTPException)
     async def handle_starlette_http(_req, exc: StarletteHTTPException):
         return _body(
@@ -155,7 +201,7 @@ def register_error_handlers(app: FastAPI) -> None:
             None,
         )
 
-    # 8. 未捕获异常 → 500 INTERNAL_ERROR,不泄露堆栈
+    # 9. 未捕获异常 → 500 INTERNAL_ERROR,不泄露堆栈
     @app.exception_handler(Exception)
     async def handle_uncaught(_req, exc: Exception):
         logger.exception("未捕获异常(详情仅记录日志,不返回给客户端)")

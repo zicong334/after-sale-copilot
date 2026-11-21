@@ -159,10 +159,17 @@ def _no_real_network(monkeypatch):
 
 
 def test_circuit_breaker_state_machine_full_path():
-    """状态机转移表:closed → open → half-open → closed。"""
+    """状态机转移表:closed → open → half-open → closed。
+
+    R12(2026-11-21):默认半开探测数由 1 提到 5(reference 建议 5-10,单探针样本过小)。
+    本用例测的是**转移表**而不是探测并发策略,故显式 `half_open_limit=1` 固定住;
+    **断言一字未改**(仍断言"探针未结束不再放")。
+    探测数与冷却递增的行为由 `test_breaker_backoff.py` 覆盖。
+    """
     clock = _FakeClock()
     breaker = CircuitBreaker(
-        name="primary", failure_threshold=3, recovery_timeout=30.0, clock=clock
+        name="primary", failure_threshold=3, recovery_timeout=30.0,
+        half_open_limit=1, clock=clock,
     )
 
     assert breaker.state == "closed"

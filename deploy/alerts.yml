@@ -1,0 +1,43 @@
+# R6(2026-11-21 企业工程评审):死信告警规则。
+#
+# 背景:`job_queue` 的 dead 行原先留在表里就没人管 —— 无消费者、无告警、无重放入口。
+# 本轮补了「最老死信年龄」指标 + agent-only 幂等重放入口,这里补告警规则。
+#
+# ⚠️ **能力边界(诚实标注)**:compose 的 observability profile **只起了 Prometheus 与 Grafana,
+# 没有 Alertmanager**。所以这些规则会在 Prometheus UI 的 Alerts 页触发并可见,
+# 但**不会发出通知**(邮件/钉钉/短信)。要真正闭环需再加 Alertmanager 并配 receivers ——
+# 那属运维决策(通知渠道、值班人),不在本轮范围。**不要把"规则已写"当成"告警已闭环"。**
+#
+# ⚠️ **阈值是起步值,不是 SLO**:本项目没有给定 SLA/值班要求。
+# 下面的 1h / 10 条是**待运维签认**的起点,不是拍板的合规或可用性承诺。
+groups:
+  - name: copilot-dead-letter
+    rules:
+      - alert: CopilotDeadLetterAging
+        # 最老死信躺超过 1 小时:说明没人处理,而不是"刚失败还在重试"。
+        expr: copilot_job_dead_oldest_age_seconds > 3600
+        for: 5m
+        labels:
+          severity: warning
+          service: after-sale-copilot
+        annotations:
+          summary: "死信积压未处理(最老已超 1 小时)"
+          description: >-
+            最老 dead 作业存活 {{ $value | humanizeDuration }}。
+            处置:查 /metrics 的 copilot_job_queue_depth{status="dead"} 计数,
+            定位 last_error 后由坐席经 POST /api/b/jobs/{job_id}/replay 幂等重放
+            (同一死信重复重放返 409,不会排两次执行)。
+            阈值 1h 为起步值,待运维签认。
+
+      - alert: CopilotDeadLetterBurst
+        # 死信条数突增:一次性失败一批,通常指下游或 schema 出了系统性问题。
+        expr: copilot_job_queue_depth{status="dead"} > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: after-sale-copilot
+        annotations:
+          summary: "死信条数超过 10(疑系统性失败)"
+          description: >-
+            dead 计数 {{ $value }}。优先查 last_error 是否同因(下游不可用 / 迁移未执行 /
+            schema 漂移),而不是逐条重放。阈值 10 为起步值,待运维签认。

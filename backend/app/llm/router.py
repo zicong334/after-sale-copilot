@@ -75,12 +75,18 @@ class CircuitBreaker:
 
     def __init__(
         self, *, name: str = "client", failure_threshold: int = 3,
-        recovery_timeout: float = 30.0, half_open_limit: int = 1,
+        recovery_timeout: float = 30.0, half_open_limit: int = 5,
+        max_recovery_timeout: float = 300.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.name = name
         self.failure_threshold = max(1, int(failure_threshold))
+        #: base 冷却(公开属性语义不变);实际冷却见 _current_recovery_timeout。
         self.recovery_timeout = float(recovery_timeout)
+        # R12:半开探针失败后冷却**翻倍**,上限 max_recovery_timeout(reference:5min)。
+        # 原实现固定 30s,下游长期挂会每 30s 撞一次满超时、永不退避。
+        self.max_recovery_timeout = max(float(max_recovery_timeout), float(recovery_timeout))
+        self._current_recovery_timeout = float(recovery_timeout)
         self.half_open_limit = max(1, int(half_open_limit))
         self._clock = clock
         self._state = self.CLOSED
@@ -109,9 +115,12 @@ class CircuitBreaker:
         if self._state == self.CLOSED:
             return True
         if self._state == self.OPEN:
-            if self._seconds_since_open() < self.recovery_timeout:
+            if self._seconds_since_open() < self._current_recovery_timeout:
                 return False
-            self._transition(self.HALF_OPEN, reason=f"熔断停留满 {self.recovery_timeout}s,转半开探测")
+            self._transition(
+                self.HALF_OPEN,
+                reason=f"熔断停留满 {self._current_recovery_timeout}s,转半开探测",
+            )
         if self._probes_in_flight >= self.half_open_limit:
             return False
         self._probes_in_flight += 1
@@ -122,14 +131,24 @@ class CircuitBreaker:
         self._probes_in_flight = max(0, self._probes_in_flight - 1)
         self._failure_count = 0
         if self._state == self.HALF_OPEN:
-            self._transition(self.CLOSED, reason="半开探针成功,恢复放行")
+            # R12:恢复后冷却回到 base,否则一次故障会让后续永久处于长退避。
+            self._current_recovery_timeout = self.recovery_timeout
+            self._transition(self.CLOSED, reason="半开探针成功,恢复放行(冷却重置为 base)")
 
     def record_failure(self, *, reason: str = "") -> None:
         """记一次熔断失败:连续达阈值则开路;半开探针失败则重新开路。"""
         self._probes_in_flight = max(0, self._probes_in_flight - 1)
         if self._state == self.HALF_OPEN:
             self._failure_count = self.failure_threshold
-            self._transition(self.OPEN, reason=reason or "半开探针失败,重新熔断")
+            # R12:冷却翻倍并截断到上限,避免固定间隔反复撞满超时。
+            self._current_recovery_timeout = min(
+                self.max_recovery_timeout, self._current_recovery_timeout * 2.0
+            )
+            self._transition(
+                self.OPEN,
+                reason=(reason or "半开探针失败,重新熔断")
+                + f"(冷却翻倍至 {self._current_recovery_timeout}s)",
+            )
             self._opened_at = self._clock()
             return
         if self._state == self.OPEN:

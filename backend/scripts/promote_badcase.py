@@ -60,6 +60,7 @@ from app.eval.validate_cases import (  # noqa: E402
 )
 from app.models import BadCase, ChatMessage  # noqa: E402
 from app.db import SessionLocal, utc_now  # noqa: E402
+from app.pii import PIIMasker  # noqa: E402
 
 DEFAULT_OUT_DIR = _REPO_ROOT / "data" / "eval" / "drafts"
 CASES_V1 = _REPO_ROOT / "data" / "eval" / "cases_v1.json"
@@ -166,9 +167,19 @@ def _user_input_and_intent(session: Any, row: BadCase) -> tuple[str, str | None]
 
 
 def build_case(session: Any, row: BadCase) -> dict[str, Any]:
-    """把一行 badcase 变成 17 字段的单条 eval case 草稿。"""
+    """把一行 badcase 变成 17 字段的单条 eval case 草稿。
+
+    R14(2026-11-21 企业工程评审核验):**导出前脱敏**。
+    草稿落 `data/eval/drafts/`,而该目录原先未被 gitignore ——
+    买家原话与坐席对客回复里的手机号/身份证/地址会**随草稿提交进 git**,
+    入集后成冻结评测资产,清理成本极高。
+    用**主链路同一个 PIIMasker**(不另写正则,避免口径分叉);
+    草稿是待人工评审的中间产物,占位符形态合适,人工升版时再决定如何改写。
+    """
+    masker = PIIMasker()
     case_id = f"regression_badcase_{row.id[:8]}"
     user_input, intent = _user_input_and_intent(session, row)
+    user_input = masker.mask(user_input)
     tool_chain = _load_json_text(row.tool_chain, [])
     expected_tools: list[str] = []
     if isinstance(tool_chain, list):
@@ -192,7 +203,7 @@ def build_case(session: Any, row: BadCase) -> dict[str, Any]:
         # 只有 seed 订单才写进 context:其它订单号会撞官方校验器。
         context["order_id"] = row.order_id
 
-    answer_fact = (row.agent_final or "").strip() or None
+    answer_fact = masker.mask((row.agent_final or "").strip()) or None
     ground_truth: dict[str, Any] = {
         "handoff": True,
         "handoff_reason": handoff_reason,

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,8 @@ from sqlalchemy.orm import sessionmaker
 # backend/dev.db(相对 backend/ 目录),alembic.ini 里的 url 指向同一位置
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = _BACKEND_DIR / "dev.db"
+
+logger = logging.getLogger("app.db")
 
 
 def utc_now() -> datetime:
@@ -39,6 +42,56 @@ def get_database_url() -> str:
     return f"sqlite:///{DEFAULT_DB_PATH.as_posix()}"
 
 
+def schema_head_revision() -> str:
+    """从**迁移链**读当前 head(R15)。刻意不硬编码 —— 硬编码 head 前面已踩过三次。"""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    # 不用 alembic.ini:避免 fileConfig 在测试进程内改日志配置(与 test_services 同口径)
+    cfg = Config()
+    cfg.set_main_option("script_location", str(_BACKEND_DIR / "alembic"))
+    heads = ScriptDirectory.from_config(cfg).get_heads()
+    if len(heads) != 1:
+        raise RuntimeError(f"迁移链 head 不唯一(分支未合并?): {heads}")
+    return str(heads[0])
+
+
+def assert_schema_at_head(eng: Engine) -> str:
+    """校验库的 schema 版本是否等于迁移链 head(R15,2026-11-21 评审核验新增)。
+
+    为什么需要:`main.lifespan` 用 ``create_all`` 兜底建表,**绕过 Alembic**;
+    ``create_all`` 只建缺失的表、**从不 ALTER 已存在的表** ——
+    这正是 ``dev.db`` 缺 ``order.delivered_at`` 却"看起来能起"的机制原因。
+    生产只靠它,schema 会静默漂移于迁移链。
+
+    三档口径(刻意不一律拒绝):
+    - 无 ``alembic_version`` 表 → create_all 路径(测试/演示),**放行 + 告警**;
+      一律拒绝会打断数百条不带迁移的存量测试。
+    - 有且等于 head → ``"ok"``。
+    - 有但不等于 head(或版本不在链上)→ **抛 RuntimeError**,拒绝启动。
+
+    与存储无关(用 SQLAlchemy 读表),迁 PG 后同样生效。
+    """
+    from sqlalchemy import inspect, text
+
+    head = schema_head_revision()
+    if not inspect(eng).has_table("alembic_version"):
+        logger.warning(
+            "库无 alembic_version 表(create_all 路径,测试/演示)。"
+            "生产必须走 alembic upgrade head —— create_all 不会 ALTER 已存在的表,"
+            "schema 可能静默漂移。期望 head=%s", head,
+        )
+        return "unversioned"
+    with eng.connect() as conn:
+        rows = [str(r[0]) for r in conn.execute(text("SELECT version_num FROM alembic_version"))]
+    if len(rows) == 1 and rows[0] == head:
+        return "ok"
+    raise RuntimeError(
+        f"schema 版本漂移,拒绝启动:库内版本={rows or '(空)'} 期望 head={head}。"
+        f"请执行 alembic upgrade head(迁移只加列不回填数据时,另需按交接说明回填)。"
+    )
+
+
 def _attach_sqlite_pragmas(eng: Engine) -> None:
     """给 engine 绑定 SQLite 连接级 PRAGMA:外键开 + WAL。"""
 
@@ -51,10 +104,17 @@ def _attach_sqlite_pragmas(eng: Engine) -> None:
 
 
 def create_db_engine(url: str | None = None) -> Engine:
-    """创建带 WAL + foreign_keys=ON 的 SQLite engine(测试可传 :memory: 或临时文件)。"""
+    """创建 engine;SQLite 附 WAL + foreign_keys=ON,其他后端不附 SQLite PRAGMA。
+
+    R3 前置(2026-11-21):原先无条件挂 SQLite PRAGMA 监听器,
+    在 PG 上连接即报语法错 —— 这是"换 URL 就能跑 PG"不成立的另一个原因。
+    """
     target_url = url or get_database_url()
-    eng = create_engine(target_url, connect_args={"check_same_thread": False})
-    _attach_sqlite_pragmas(eng)
+    is_sqlite = str(target_url).strip().lower().startswith("sqlite")
+    connect_args = {"check_same_thread": False} if is_sqlite else {}
+    eng = create_engine(target_url, connect_args=connect_args)
+    if is_sqlite:
+        _attach_sqlite_pragmas(eng)
     return eng
 
 

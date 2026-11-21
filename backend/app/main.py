@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
+import logging
 from pathlib import Path
 from typing import Iterator
 
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app import jobs
@@ -44,7 +46,7 @@ from app.api import orders as orders_api
 from app.api import refunds as refunds_api
 from app.api import refunds_ext as refunds_ext_api
 from app.api import tickets as tickets_api
-from app.db import SessionLocal, engine, utc_now
+from app.db import SessionLocal, assert_schema_at_head, engine, utc_now
 from app.errors import register_error_handlers
 from app.memory.decay import router as memory_maintenance_router
 from app.models import Base, ChatSession
@@ -59,6 +61,11 @@ async def lifespan(_app: FastAPI):
     事务里同步执行",P95 直接受业务写锁拖累。
     """
     Base.metadata.create_all(bind=engine)
+    # R15(2026-11-21 评审核验新增):create_all 只建缺失的表、**从不 ALTER 已存在的表**,
+    # 所以它兜不住 schema 漂移(dev.db 缺 order.delivered_at 却"看起来能起"就是这条)。
+    # 这里校验库版本是否等于迁移链 head:无 alembic_version(create_all 路径)放行+告警,
+    # 有但不等于 head 则**拒绝启动**。
+    assert_schema_at_head(engine)
     jobs.start_worker(engine)
     sla_scheduler = sla.start_scheduler(engine)
     # W12-1:/metrics 的后台 5s 刷新线程(daemon,进程退出即止)。请求路径只读
@@ -73,6 +80,8 @@ async def lifespan(_app: FastAPI):
         jobs.stop_worker(engine)
         engine.dispose()
 
+
+logger = logging.getLogger("app.main")
 
 app = FastAPI(title="售后 Copilot 服务", lifespan=lifespan)
 
@@ -150,7 +159,7 @@ class AuthMiddleware:
                 "FORBIDDEN",
                 f"该接口需要 {required} 角色,当前角色为 {identity.role}",
             )
-        retry_after = security.check_rate_limit(identity)
+        retry_after = security.check_rate_limit(identity, path=path)
         if retry_after is not None:
             response = security.error_response(
                 429, "RATE_LIMITED", "请求过于频繁,请稍后重试", retryable=True
@@ -194,8 +203,44 @@ def favicon() -> Response:
 
 @app.get("/health")
 def health() -> dict:
-    """健康检查:返回 200,证明服务无 key 也能起。"""
+    """**liveness**:静态 200,证明进程活着。
+
+    R7(2026-11-21 企业工程评审):**刻意不探下游**。
+    reference 明确「liveness 探 DB/Redis/第三方 = 级联故障放大器」——
+    DB 抖动会导致全量实例被重启,把局部故障放大成全站故障。
+    依赖就绪检查下沉到 ``/healthz/ready``。
+    """
     return {"ok": True, "status": "healthy"}
+
+
+def _db_reachable() -> bool:
+    """readiness 用的最小依赖探针:``SELECT 1``。异常只记日志,不外泄细节。"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:  # noqa: BLE001 - 探针不得因异常自身崩掉
+        logger.warning("readiness 探针:数据库不可达(详情仅日志)", exc_info=True)
+        return False
+
+
+@app.get("/healthz/ready")
+def healthz_ready() -> Response:
+    """**readiness**:探 DB,不健康返 **503**(探针只看状态码,不能返 200 带 flag)。
+
+    ⚠️ **单机形态取舍**:compose 只有一个 backend 实例,**摘流 = 全站下线**。
+    所以本端点在单机下**只用于告警与人工判断,不用于摘流**;
+    nginx 侧刻意不配基于它的主动摘流。多副本部署后才谈摘流,
+    且届时要配最小可用实例数,否则 DB 抖动会从"部分请求失败"变成"全站不可用"。
+    """
+    try:
+        ready = _db_reachable()
+    except Exception:  # noqa: BLE001 - 探针**绝不能自己 500**,那会被误判成进程故障
+        logger.warning("readiness 探针自身异常(详情仅日志)", exc_info=True)
+        ready = False
+    if ready:
+        return JSONResponse(status_code=200, content={"ok": True, "status": "ready"})
+    return JSONResponse(status_code=503, content={"ok": False, "status": "not_ready"})
 
 
 app.include_router(orders_api.router)

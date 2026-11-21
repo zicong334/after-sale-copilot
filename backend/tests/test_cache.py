@@ -170,9 +170,15 @@ def test_pii_is_never_cached(cache: SemanticCache, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 def test_ttl_expiry_misses(cache: SemanticCache) -> None:
-    """TTL 过期后不命中(注入时钟,不做真等待)。"""
+    """TTL 过期后不命中(注入时钟,不做真等待)。
+
+    R10(2026-11-21):默认加了 ±20% **确定性抖动**,单条实际 TTL 不再精确等于 base。
+    本用例测的是**base TTL 语义**,故显式 `ttl_jitter_ratio=0` 固定住;
+    **断言一字未改**(仍是 +1799 命中 / +1801 不命中)。
+    抖动本身的行为由 `test_cache_ttl_jitter.py` 覆盖。
+    """
     clock = {"now": 1_000.0}
-    cache = SemanticCache(ttl_seconds=1800, clock=lambda: clock["now"])
+    cache = SemanticCache(ttl_seconds=1800, ttl_jitter_ratio=0.0, clock=lambda: clock["now"])
 
     assert cache.store("退货期限是几天", _payload()) is True
     clock["now"] = 1_000.0 + 1799.0

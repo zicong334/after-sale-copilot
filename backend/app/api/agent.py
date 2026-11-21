@@ -779,3 +779,32 @@ def get_suggestion(
     ident = security.effective_identity(identity, "agent")
     ticket = _scope_ticket(_get_ticket(db, ticket_id), identity, ident)
     return {"ok": True, "data": _SUGGEST_CACHE.get(ticket.id)}
+
+
+@router.post("/jobs/{job_id}/replay")
+def replay_dead_letter(
+    job_id: str,
+    db: Session = Depends(get_db),
+    identity: security.Identity = Depends(security.current_identity),
+) -> dict[str, Any]:
+    """人工重放一条死信作业(R6,2026-11-21 企业工程评审)。
+
+    背景:``job_queue`` 的 ``status='dead'`` 行原先留在表里就没人管 ——
+    无消费者、无告警、无重放入口,只能靠用户投诉发现。
+
+    安全与幂等:
+    - 路由在 ``/api/b/`` 前缀下,**中间件强制 agent 角色**(买家 403);
+      重放是写操作,第四轮 D 系列刚踩过"读端点没挂授权"的坑,这里不给买家任何入口。
+    - 幂等靠 **CAS**(``dead → pending``):同一条死信重复重放 → **409**,不会排两次执行。
+    - 不存在的 job → 404;非 dead 状态 → 409(不泄露内部状态细节以外的信息)。
+    """
+    security.effective_identity(identity, "agent")
+    from app import jobs as jobs_mod
+
+    if db.get(jobs_mod.Job, job_id) is None:
+        raise NotFoundError(f"作业不存在: {job_id}")
+    if not jobs_mod.replay_dead_job(db.get_bind(), job_id):
+        raise StateConflictError(
+            f"作业不可重放(已被重放或当前不是 dead 状态): {job_id}", "not_dead"
+        )
+    return {"ok": True, "data": {"job_id": job_id, "status": "pending"}}

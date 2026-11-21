@@ -139,11 +139,27 @@ curl -s -X POST http://127.0.0.1:8000/auth/login ^
 ## 5. 测试
 
 ```bat
-:: 全量测试(831 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(958 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
 ```
+
+**增量覆盖率门禁**(R2,2026-11-21 企业工程评审):CI 卡 **diff line ≥ 80%**。
+本项目三次实证「用例数 ≠ 覆盖」(762 全绿时有 critical 越权 / B1 断言测错端点 / C1 路径从未被断言),
+所以门禁卡的是**增量覆盖率**,不是用例条数。
+
+```bat
+:: 覆盖率工具只在 dev 依赖里,不进生产锁文件
+.venv\Scripts\python -m pip install -r requirements.lock.txt -r requirements-dev.txt
+.venv\Scripts\python -m pytest backend/tests -q --cov --cov-report=xml:coverage.xml
+.venv\Scripts\python -m diff_cover.diff_cover_tool coverage.xml --compare-branch=HEAD --fail-under=80
+```
+
+⚠️ `.coveragerc` 必须 `relative_files = True` **且用 `include` 而不是 `source`**:
+否则 XML 里的 `filename` 是裸文件名,diff-cover 匹配不上 git 路径,
+门禁会"零变更行、全部通过"**退化成永远放行的假门禁**。落地时已实测:
+故意加一个未覆盖函数 → 门禁 **rc=1** 并指出缺失行号。
 
 ## 6. 测试与评测数字(脚本生成,勿手改)
 
@@ -157,7 +173,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:831 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:958 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:144/144 = 1.0000(edge 层 30/30 = 1.0000)
 - critical 失败:0
@@ -426,7 +442,7 @@ backend/
 │                   → 0009_fulfillment → 0010_badcase → 0011_order_delivered_at
 │                   (共 11 个迁移,25 张表;0011 只加列不建表)
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          831 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台、
+├── tests/          958 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台、
 │                   test_authz_refunds.py 越权/内部备注/工单归属回归、
 │                   test_eval_numbers.py 评测数字校验边界)
 └── README.md       本文件

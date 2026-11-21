@@ -661,6 +661,11 @@ def session_messages(
                 "role": str(row.role or "user"),
                 "author_type": str(row.role or "user"),
                 "content": row.content,
+                # R13(2026-11-21 契约测试抓出):同一数组里 chat 来源条目原先**缺 is_internal**,
+                # 而 ticket 来源条目有 —— 两种形状。前端 `msg.is_internal === true` 恰好
+                # 对 undefined 为假所以没出事,但契约不齐:一旦前端改成真值判断就会误渲染。
+                # 聊天记录本身永远不是内部备注,显式给 False 让形状统一(纯新增字段,不破存量)。
+                "is_internal": False,
                 "source": "chat",
                 "created_at_utc": _iso_utc(row.created_at),
             }

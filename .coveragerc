@@ -1,0 +1,28 @@
+# 覆盖率配置(R2,2026-11-21 企业工程评审)
+#
+# 关键:必须 relative_files = True。
+# 默认情况下 coverage XML 里的 filename 是**裸文件名**(如 `cache.py`),
+# 目录信息只在 <source> 元素里 —— diff-cover 拿它去匹配 git diff 路径
+# (`backend/app/cache.py`)会**一条都匹配不上**,于是门禁"零变更行、全部通过",
+# **变成永远放行的假门禁**。本项目的主线教训就是「全绿 ≠ 正确」,
+# 所以这里显式开相对路径,并在落地时实测过 XML 的 filename 形态。
+[run]
+relative_files = True
+# 刻意用 include 而不是 source:source=backend/app 会让相对路径以**该目录**为根,
+# filename 又退回裸文件名。用 include 过滤 + 不设 source,相对路径以**仓库根**为根,
+# 才能得到 backend/app/xxx.py 这种可与 git diff 对齐的路径。已实测确认。
+include =
+    backend/app/*
+omit =
+    */__pycache__/*
+    */alembic/*
+branch = False
+
+[report]
+# 只报生产代码;脚本与测试不进覆盖率口径
+omit =
+    */__pycache__/*
+    */alembic/*
+exclude_also =
+    if TYPE_CHECKING:
+    pragma: no cover

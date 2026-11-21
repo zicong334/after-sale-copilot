@@ -7,6 +7,12 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# R6(2026-11-21):死信告警规则。
+# ⚠️ 本编排**没有 Alertmanager**,规则只在 Prometheus UI 可见、不发通知;
+# 真正闭环需另加 Alertmanager 与 receivers(运维决策,不在本轮)。阈值是待签认的起步值。
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: copilot-backend
     metrics_path: /metrics

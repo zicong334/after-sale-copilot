@@ -34,20 +34,88 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from datetime import timezone
+from datetime import timedelta, timezone
 from typing import Any
 
-from sqlalchemy import Engine, func, select, update
+from sqlalchemy import Engine, delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import utc_now
 from app.models.jobs import Job, TurnAudit
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# R9(2026-11-21 企业工程评审):单 worker 假设的代码级护栏
+# ---------------------------------------------------------------------------
+
+#: 声明 worker 数的环境变量(uvicorn 标准变量优先,其次本项目显式变量)。
+_WORKER_COUNT_ENVS = ("WEB_CONCURRENCY", "JOB_WORKER_COUNT")
+#: 只回收超龄 running 的秒数;设了它才允许在多 worker 下启动。
+_RECLAIM_MAX_AGE_ENV = "JOB_RECLAIM_MAX_AGE_SECONDS"
+
+
+def declared_worker_count() -> int:
+    """读**显式声明**的 worker 数,默认 1。
+
+    ⚠️ 能力边界:只识别显式声明。多副本 compose / 外部编排起多进程而不设这两个变量时
+    识别不到 —— 那需要 DB 级 worker 租约(更大改动,不在本轮)。**不假装能覆盖所有部署形态。**
+    """
+    for name in _WORKER_COUNT_ENVS:
+        raw = os.environ.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        try:
+            return max(1, int(str(raw).strip()))
+        except ValueError:
+            raise RuntimeError(
+                f"{name}={raw!r} 不是整数,无法判定 worker 数;"
+                f"请给正整数,或 unset 后按单 worker 启动。"
+            )
+    return 1
+
+
+def resolve_reclaim_max_age() -> float | None:
+    """读 ``JOB_RECLAIM_MAX_AGE_SECONDS``;未设返回 None(= 全量回收,单 worker 口径)。
+
+    **非法取值显式报错,绝不静默退回 None** —— 静默退回等于悄悄恢复全量回收,
+    正是本护栏要防的事。
+    """
+    raw = os.environ.get(_RECLAIM_MAX_AGE_ENV)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        raise RuntimeError(
+            f"{_RECLAIM_MAX_AGE_ENV}={raw!r} 不是数字。"
+            f"多 worker 部署必须给正秒数(只回收超龄 running),或 unset 并按单 worker 启动。"
+        )
+    if value <= 0:
+        raise RuntimeError(f"{_RECLAIM_MAX_AGE_ENV}={value} 必须为正秒数。")
+    return value
+
+
+def assert_reclaim_mode_safe(max_age_seconds: float | None) -> None:
+    """多 worker + 全量回收 → 拒绝启动(R9)。
+
+    B2 的 ``reclaim_stale_running(max_age_seconds=None)`` 会回收**全部** running,
+    多进程下会抢走别进程正在执行的作业。原口径只写在 docstring,这里变成硬护栏。
+    """
+    workers = declared_worker_count()
+    if workers > 1 and max_age_seconds is None:
+        raise RuntimeError(
+            f"拒绝启动:声明 worker 数={workers} 但作业队列仍用**全量回收**"
+            f"(会抢走其他进程正在执行的作业)。两条出路:"
+            f"① 设 {_RECLAIM_MAX_AGE_ENV}=<正秒数> 只回收超龄 running;"
+            f"② 改回单 worker 启动。多 worker 的彻底方案是 DB 级 worker 租约。"
+        )
 
 # ---------------------------------------------------------------------------
 # 作业类型常量(lead 在 nodes.py / chat.py 按这些值注册 handler 与入队)
@@ -260,14 +328,22 @@ class SQLiteJobQueue(JobQueue):
 
     # -- worker 生命周期 ---------------------------------------------------
     def start(self) -> None:
-        """启动 worker 线程(幂等);启动前先回收上次进程留下的残留 running 作业。"""
+        """启动 worker 线程(幂等);启动前先回收上次进程留下的残留 running 作业。
+
+        R9(2026-11-21 企业工程评审):启动前**校验单 worker 假设**。
+        全量回收(``max_age_seconds=None``)只在单机单 worker 下安全;
+        多 worker 下会抢走别进程正在执行的作业。原先这条口径只写在 docstring 里,
+        **没有代码阻止误用**,现在补确定性护栏。
+        """
+        max_age = resolve_reclaim_max_age()
+        assert_reclaim_mode_safe(max_age)
         with self._lock:
             if self._worker_active():
                 return
             # B2:必须先回收再起线程,否则残留 running 永远不会被 _claim_next 看到
             # (它只 select pending)。回收失败不能挡住 worker 启动。
             try:
-                self.reclaim_stale_running()
+                self.reclaim_stale_running(max_age_seconds=max_age)
             except Exception:  # pragma: no cover - 回收失败只影响残留作业
                 logger.exception("启动回收残留 running 作业失败(忽略,继续启动 worker)")
             self._stop_event.clear()
@@ -566,6 +642,89 @@ def stop_worker(engine: Engine, timeout: float = 5.0) -> None:
 # ---------------------------------------------------------------------------
 # turn_audit 便捷写入(供 lead 的 turn_audit handler 调用)
 # ---------------------------------------------------------------------------
+
+
+def replay_dead_job(engine: Engine, job_id: str) -> bool:
+    """人工重放一条死信:``dead → pending``,**CAS 幂等**(R6,2026-11-21)。
+
+    背景:``status='dead'`` 的行原先留在表里就没人管 —— 无消费者、无告警、无重放入口,
+    问题只能靠用户投诉发现(reference 的「无 DLQ 消费者」反模式)。
+
+    幂等靠 **CAS**:`UPDATE ... WHERE id=? AND status='dead'`,影响行数必须为 1。
+    同一条死信重复重放第二次返回 False(调用方转 409),**不会排两次执行**。
+
+    ``attempts`` **刻意保留**:不清零意味着永久坏作业重放后再失败会立刻回 dead,
+    而不是获得一轮全新的重试预算从而反复循环。
+    """
+    with sessionmaker(bind=engine, autocommit=False, autoflush=False)() as sess:
+        result = sess.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status == STATUS_DEAD)
+            .values(
+                status=STATUS_PENDING, started_at=None, finished_at=None,
+                last_error=None, updated_at=utc_now(),
+            )
+        )
+        sess.commit()
+        ok = int(result.rowcount or 0) == 1
+    if ok:
+        logger.warning("死信人工重放:job=%s 已回到 pending(attempts 保留)", job_id)
+    return ok
+
+
+#: R14:审计留存期环境变量。**未设 = 不清理**(默认关闭)。
+_TURN_AUDIT_RETENTION_ENV = "TURN_AUDIT_RETENTION_DAYS"
+
+
+def resolve_turn_audit_retention_days() -> int | None:
+    """读 ``TURN_AUDIT_RETENTION_DAYS``;未设返回 None(**不清理**)。
+
+    R14(2026-11-21 企业工程评审核验):``turn_audit.reply`` 存对客回复全文,
+    无脱敏无 TTL,且该表设计上比业务数据活得久。
+    **不用脱敏解决** —— 审计的定位是"事后可查实际说了什么",涂掉内容会摧毁审计价值;
+    正确的杠杆是**留存期**。
+
+    **默认关闭**:保留期属合规决策(等保/GDPR/行业监管),本项目没有给定合规要求。
+    没拍板前自动删审计行是**破坏性且不可逆**的。真实取值待合规裁定,不编造合规结论。
+
+    非法取值 / 非正数 **显式报错**,绝不静默当作未设 ——
+    那会让人以为配了留存其实没配(0 或负数更会删光审计)。
+    """
+    raw = os.environ.get(_TURN_AUDIT_RETENTION_ENV)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        raise RuntimeError(
+            f"{_TURN_AUDIT_RETENTION_ENV}={raw!r} 不是整数。"
+            f"请给正整数天数,或 unset 表示不清理(默认)。"
+        )
+    if value <= 0:
+        raise RuntimeError(
+            f"{_TURN_AUDIT_RETENTION_ENV}={value} 必须为正整数天数;"
+            f"0 或负数会删光审计留痕,拒绝执行。"
+        )
+    return value
+
+
+def purge_turn_audit(engine: Engine) -> int:
+    """按留存期清理审计行,返回删除条数;**未设留存期则一行不删**。
+
+    删除口径是 ``created_at`` **严格早于** now - retention(刚好等于保留期的行保留)。
+    幂等:重复调用第二次删 0 条。
+    """
+    days = resolve_turn_audit_retention_days()
+    if days is None:
+        return 0
+    cutoff = utc_now() - timedelta(days=days)
+    with sessionmaker(bind=engine, autocommit=False, autoflush=False)() as sess:
+        result = sess.execute(delete(TurnAudit).where(TurnAudit.created_at < cutoff))
+        sess.commit()
+        deleted = int(result.rowcount or 0)
+    if deleted:
+        logger.info("按留存期清理审计留痕 %d 条(留存 %d 天,早于 %s)", deleted, days, cutoff)
+    return deleted
 
 
 def write_turn_audit(

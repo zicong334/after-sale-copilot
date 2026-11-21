@@ -28,4 +28,8 @@ if [ "$SEED_ON_EMPTY" = "1" ]; then
 fi
 
 echo "[entrypoint] 监听 ${SERVE_HOST}:${SERVE_PORT}(/health 健康检查,/metrics 仅本机)"
-exec python -m uvicorn app.main:app --host "$SERVE_HOST" --port "$SERVE_PORT"
+# R11(2026-11-21):优雅停机超时 20s —— **必须小于 compose 的 stop_grace_period(30s)**,
+# 否则 uvicorn 还在等 WS/SSE 长连接就被 SIGKILL 截断,grace 白设。
+# 不设该参数时 uvicorn 会无限等长连接(WS proxy_read_timeout 3600s),停机必被强杀。
+exec python -m uvicorn app.main:app --host "$SERVE_HOST" --port "$SERVE_PORT" \
+  --timeout-graceful-shutdown 20

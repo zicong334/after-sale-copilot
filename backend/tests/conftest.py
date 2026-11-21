@@ -85,8 +85,14 @@ def tmp_dir():
 
 @pytest.fixture()
 def engine(tmp_dir):
-    """每个测试独立 schema 的 SQLite engine(WAL + foreign_keys=ON 已内置)。"""
-    eng = create_db_engine(f"sqlite:///{(tmp_dir / 'test.db').as_posix()}")
+    """每个测试独立 schema 的 engine。
+
+    R3 前置(2026-11-21):默认仍是 tmp_dir 下的 SQLite(WAL + foreign_keys=ON),
+    **行为一字不变**;设 ``TEST_DATABASE_URL`` 可切到 PG(CI service container 用)。
+    """
+    from tests.db_url_helper import resolve_test_database_url
+
+    eng = create_db_engine(resolve_test_database_url(tmp_dir))
     Base.metadata.create_all(eng)
     yield eng
     eng.dispose()
@@ -97,3 +103,26 @@ def session(engine):
     """独立事务的 Session;测试自行 commit/rollback,结束后由 engine dispose 清理。"""
     with Session(engine) as sess:
         yield sess
+
+
+def pytest_collection_modifyitems(config, items):
+    """R3 前置:非 SQLite 后端下**跳过**绑死 SQLite 内部的测试文件。
+
+    `test_delivery.py` / `test_services.py` 直接用 sqlite3 + PRAGMA 断言
+    SQLite 迁移与完整性,在 PG 上**不适用**。跳过而不是失败 ——
+    否则 PG job 会被一堆"本就不适用"的红掩盖真问题。
+    默认 SQLite 路径下本钩子不做任何事(存量行为一字不变)。
+    """
+    from tests.db_url_helper import (
+        SQLITE_ONLY_TEST_FILES,
+        is_sqlite_url,
+        resolve_test_database_url,
+    )
+
+    url = resolve_test_database_url(Path(config.rootpath) / ".tmp")
+    if is_sqlite_url(url):
+        return
+    skip = pytest.mark.skip(reason=f"SQLite 专属断言,当前后端={url.split(':')[0]}")
+    for item in items:
+        if Path(str(item.fspath)).name in SQLITE_ONLY_TEST_FILES:
+            item.add_marker(skip)

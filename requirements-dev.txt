@@ -1,0 +1,26 @@
+# 开发/CI 专用依赖 —— **刻意与 requirements.lock.txt 分开**
+#
+# R2(2026-11-21 企业工程评审):CI 原先只有 compileall/lint/pytest/eval smoke,
+# **没有任何覆盖率门禁**。而本项目已三次实证「用例数 ≠ 覆盖」:
+#   - 762 条全绿时存在 critical 越权(A1);
+#   - B1 的 is_internal 断言测的是**另一个端点**;
+#   - C1 的 citations 路径从未被断言。
+# 用例数是投入指标,覆盖率是覆盖指标,两者不能互替。
+#
+# 为什么单独一个文件:生产镜像只装 requirements.lock.txt,
+# 覆盖率工具**不进生产依赖树**,也不改动已锁定的生产版本。
+#
+# 用法:
+#   python -m pip install -r requirements.lock.txt -r requirements-dev.txt
+#
+# 门禁命令(增量覆盖率,判据来自 enterprise-engineering-design/quality-testing #3):
+#   python -m pytest backend/tests -q --cov=app --cov-report=xml:coverage.xml
+#   python -m diff_cover.diff_cover_tool coverage.xml \
+#       --compare-branch=origin/main --fail-under=80
+#
+# 阈值口径:diff line ≥ 80%。branch 覆盖需 `--cov-branch`,开启后耗时上升,
+# 待 CI 时长实测后再决定是否同时卡 branch ≥ 70%(评审报告 R2 已标注 ≤30min 触顶风险)。
+
+pytest-cov==7.1.0
+coverage==7.17.4
+diff-cover==11.0.4
