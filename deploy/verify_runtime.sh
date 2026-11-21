@@ -19,6 +19,12 @@ STAGE="${1:-all}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 COMPOSE="docker compose -f deploy/docker-compose.yml"
+# nginx 映射的是 8080:80(不是 80);第一版脚本 curl 80 是错的,已修。
+BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
+# compose 的 PG 默认口令是 change-me-in-env;这里显式固定,保证与下面 PG_URL 一致。
+export POSTGRES_USER="${POSTGRES_USER:-copilot}"
+export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-copilot}"
+export POSTGRES_DB="${POSTGRES_DB:-copilot}"
 FAIL=0
 
 say()  { printf '\n=== %s ===\n' "$1"; }
@@ -47,14 +53,14 @@ stage_minimal() {
   $COMPOSE up -d backend nginx
   if wait_healthy backend 40; then ok "backend healthcheck 转 healthy"; else bad "backend 未在 120s 内 healthy"; return; fi
   # 经 nginx 走一遍真实链路:静态页 / liveness / readiness / 登录 / 一轮对话
-  curl -fsS http://127.0.0.1/login.html >/dev/null && ok "nginx 提供 login.html" || bad "login.html 取不到"
-  curl -fsS http://127.0.0.1/health >/dev/null && ok "/health(liveness)200" || bad "/health 非 200"
-  curl -fsS http://127.0.0.1/healthz/ready >/dev/null && ok "/healthz/ready(readiness)200" || bad "/healthz/ready 非 200"
-  TOKEN=$(curl -fsS -X POST http://127.0.0.1/auth/login \
+  curl -fsS $BASE_URL/login.html >/dev/null && ok "nginx 提供 login.html" || bad "login.html 取不到"
+  curl -fsS $BASE_URL/health >/dev/null && ok "/health(liveness)200" || bad "/health 非 200"
+  curl -fsS $BASE_URL/healthz/ready >/dev/null && ok "/healthz/ready(readiness)200" || bad "/healthz/ready 非 200"
+  TOKEN=$(curl -fsS -X POST $BASE_URL/auth/login \
     -H 'Content-Type: application/json' \
     -d '{"username":"buyer_demo","password":"demo1234"}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
   [ -n "$TOKEN" ] && ok "登录拿到 token" || { bad "登录失败"; return; }
-  curl -fsS -X POST http://127.0.0.1/api/c/chat \
+  curl -fsS -X POST $BASE_URL/api/c/chat \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     -d '{"text":"退货运费谁承担"}' >/dev/null && ok "一轮对话 200(容器内 FakeLLM)" || bad "对话失败"
   # R7:readiness 必须**不**被 nginx 用于摘流(单机摘流=全站下线),这里只验它可达

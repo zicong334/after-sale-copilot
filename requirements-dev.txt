@@ -24,11 +24,8 @@
 pytest-cov==7.1.0
 coverage==7.17.4
 diff-cover==11.0.4
-# 真 Redis 断言所需客户端(tests/test_redis_runtime.py,无 REDIS_TEST_URL 时整体跳过)。
-# ⚠️ **待用户确认**:若生产要真启用 Redis 后端(REDIS_URL),按 psycopg 同一逻辑
-# 它也属**运行时依赖**,应提升到 requirements.lock.txt;当前先放 dev 只为 CI 能跑真断言。
-# 未装该包时 build_limiters/build_l2 会降级回进程内实现(不阻断启动)。
-redis==8.1.0
+# redis 客户端已于 2026-11-21 按用户裁定**提升进 requirements.lock.txt**
+# (启用 Redis 后端时它是运行时依赖,同 psycopg 逻辑),此处不再重复定义。
 
 # per-test 超时(2026-11-21):PG 全量在 52% 处卡死 17 分钟无输出。
 # 加它把"未知卡死"变成"具名用例 + 堆栈",而不是靠猜。

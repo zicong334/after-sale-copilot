@@ -221,3 +221,70 @@ jobs:
         # 这三条正是评审里标「未运行时验证」的:集群总放行量≈阈值、
         # EXPIRE 让键有界、Lua 真原子性。**不用假客户端**。
         run: python -m pytest backend/tests/test_redis_runtime.py -v -p no:cacheprovider
+
+  # 2026-11-21:**runner 本身就是 Docker 机器** —— 之前把"容器真起/可观测真通/优雅停机"
+  # 标成"需在有 Docker 的机器上跑",其实 CI 就能做(service container 只是用了 runner 的
+  # Docker 的一个子集)。本 job 真 build 本项目镜像、真 compose up、真起 Prometheus、
+  # 真发 SIGTERM 看是否优雅退出,把这三项也验掉。
+  container:
+    name: container(真 build 镜像 + compose 冒烟 + Prometheus + 优雅停机)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: 真 build 本项目镜像(不是 service container)
+        run: docker compose -f deploy/docker-compose.yml build backend
+      - name: 最小栈真起(backend + nginx)
+        run: |
+          docker compose -f deploy/docker-compose.yml up -d backend nginx
+          for i in $(seq 1 40); do
+            if docker compose -f deploy/docker-compose.yml ps --format '{{.Service}} {{.Health}}' | grep -q '^backend healthy'; then
+              echo "backend healthy"; break
+            fi
+            sleep 3
+          done
+          docker compose -f deploy/docker-compose.yml ps
+      - name: 经 nginx 冒烟(静态页 / liveness / readiness / 登录 / 一轮对话)
+        run: |
+          set -e
+          B=http://127.0.0.1:8080
+          curl -fsS "$B/login.html" > /dev/null && echo "login.html OK"
+          curl -fsS "$B/health" && echo " <- liveness"
+          curl -fsS "$B/healthz/ready" && echo " <- readiness"
+          TOKEN=$(curl -fsS -X POST "$B/auth/login" -H 'Content-Type: application/json' \
+            -d '{"username":"buyer_demo","password":"demo1234"}' | python -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+          test -n "$TOKEN"
+          curl -fsS -X POST "$B/api/c/chat" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' -d '{"text":"退货运费谁承担"}' \
+            | python -c 'import sys,json;d=json.load(sys.stdin);assert d["ok"];print("chat OK, citations:",len(d.get("citations") or []))'
+      - name: 可观测真通(Prometheus 抓取 + R6 新指标 + 告警规则加载)
+        run: |
+          set -e
+          docker compose -f deploy/docker-compose.yml --profile observability up -d prometheus
+          sleep 25
+          curl -fsS http://127.0.0.1:9090/api/v1/targets \
+            | python -c 'import sys,json;d=json.load(sys.stdin)["data"]["activeTargets"];assert any(t["health"]=="up" for t in d),d;print("scrape target up:",[t["scrapeUrl"] for t in d])'
+          curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=copilot_job_dead_oldest_age_seconds' \
+            | python -c 'import sys,json;r=json.load(sys.stdin)["data"]["result"];assert r,"新指标查不到";print("dead_oldest_age =",r[0]["value"])'
+          curl -fsS http://127.0.0.1:9090/api/v1/rules \
+            | python -c 'import sys,json;g=json.load(sys.stdin)["data"]["groups"];names=[r["name"] for x in g for r in x["rules"]];assert "CopilotDeadLetterAging" in names,names;print("alert rules loaded:",names)'
+      - name: 优雅停机真生效(SIGTERM 后应在 grace 内自行退出,退出码非 137)
+        run: |
+          set -e
+          CID=$(docker compose -f deploy/docker-compose.yml ps -q backend)
+          START=$(date +%s)
+          docker stop "$CID" > /dev/null
+          END=$(date +%s)
+          CODE=$(docker inspect --format '{{.State.ExitCode}}' "$CID")
+          echo "停机耗时 $((END-START))s,退出码 $CODE"
+          # 137 = 128+9 = SIGKILL,说明 grace 内没排空完被强杀;0/143 = 收到 SIGTERM 后自行退出
+          if [ "$CODE" = "137" ]; then
+            echo "::error::退出码 137 = 被 SIGKILL 强杀,优雅停机未生效"
+            exit 1
+          fi
+          echo "优雅停机生效(未被 SIGKILL)"
+      - name: 收尾
+        if: always()
+        run: |
+          docker compose -f deploy/docker-compose.yml --profile observability logs --tail=40 backend || true
+          docker compose -f deploy/docker-compose.yml --profile observability down -v || true

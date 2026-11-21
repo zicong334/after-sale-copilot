@@ -4,8 +4,11 @@
 # 2026-11-21 新增 PG 驱动(用户裁定:迁 PG 是既定方向,驱动是**运行时依赖**不是测试工具):
 #   psycopg==3.3.9 / psycopg-binary==3.3.9 / tzdata==2026.6
 #   来源:psycopg[binary]==3.3.9 的解析结果(pip dry-run 确认三者)。
-#   ⚠️ 本机默认 PyPI 直连 files.pythonhosted.org **连接超时**,
-#   经 TUNA 镜像安装成功;版本以本次解析为准,cp313 win_amd64 有 binary wheel。
+#   ⚠️ 本机默认 PyPI 直连 files.pythonhosted.org **连接超时**,经 TUNA 镜像安装成功。
+#
+# 2026-11-21 新增 Redis 客户端(用户裁定,同 psycopg 逻辑):
+#   redis==8.1.0 —— 启用 REDIS_URL 后限流与 L2 缓存走它,属**运行时依赖**。
+#   未设 REDIS_URL 时 build_limiters/build_l2 降级回进程内,不装也能起。
 aiosqlite==0.22.1
 alembic==1.20.1
 annotated-doc==0.0.5
@@ -55,6 +58,7 @@ pytest==9.2.0
 python-dotenv==1.2.4
 PyYAML==6.0.3
 rank-bm25==0.2.2
+redis==8.1.0
 requests-toolbelt==1.0.0
 requests==2.34.2
 scikit-learn==1.9.1
