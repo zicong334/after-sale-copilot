@@ -119,7 +119,27 @@ def engine(tmp_dir):
             conn.execute(text(f'CREATE SCHEMA "{schema}"'))
     finally:
         admin.dispose()
-    eng = create_db_engine(url).execution_options(schema_translate_map={None: schema})
+    # PG 与 SQLite 的**锁语义差异**(2026-11-21 CI 具名堆栈实证):
+    # test_jobs.py 的 test_log_table fixture 在 teardown 里 drop_all,
+    # 注释写着"调用方 session 仍持有读事务时 SQLite 会报 database is locked",并用 except 吞掉。
+    # **但 PG 上 DROP TABLE 不报错,它无限等 ACCESS EXCLUSIVE 锁** → except 永不触发 → 卡死。
+    # 三个超时把"无限等"变成"快速失败",让既有 except 兜底按设计生效:
+    #   lock_timeout          DDL/行锁等不到就报错(而不是挂住)
+    #   idle_in_transaction_session_timeout  **掐掉持事务空转的连接**(正是持锁者)
+    #   statement_timeout     单条语句上限,防任何意外长阻塞
+    from sqlalchemy import create_engine
+
+    pg_engine = create_engine(
+        url,
+        connect_args={
+            "options": (
+                "-c lock_timeout=3000 "
+                "-c idle_in_transaction_session_timeout=10000 "
+                "-c statement_timeout=60000"
+            )
+        },
+    )
+    eng = pg_engine.execution_options(schema_translate_map={None: schema})
     try:
         Base.metadata.create_all(eng)
         yield eng
@@ -128,7 +148,10 @@ def engine(tmp_dir):
         cleanup = create_db_engine(url)
         try:
             with cleanup.begin() as conn:
+                conn.execute(text("SET lock_timeout = '3s'"))
                 conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        except Exception:  # noqa: BLE001 - CI 用一次性 PG,残留 schema 无害;不得因此挂住
+            pass
         finally:
             cleanup.dispose()
 
