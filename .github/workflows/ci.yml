@@ -228,7 +228,11 @@ jobs:
   # 真发 SIGTERM 看是否优雅退出,把这三项也验掉。
   container:
     name: container(真 build 镜像 + compose 冒烟 + 真浏览器点击流 + Prometheus + 优雅停机)
-    runs-on: ubuntu-latest
+    # ⚠️ 2026-11-21 实测:`ubuntu-latest` 已指向 **Ubuntu 26.04**,而 Playwright 1.56
+    # **没有该平台的 chromium 构建**,报 "Playwright does not support chromium on ubuntu26.04-x64"。
+    # 这不是缺系统依赖(去掉 --with-deps 也没用),是**没有对应浏览器构建** ⇒ 必须钉住受支持的 LTS。
+    # 待 Playwright 支持更新的 Ubuntu 后再解钉;其余 job 无浏览器约束,仍用 ubuntu-latest。
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
