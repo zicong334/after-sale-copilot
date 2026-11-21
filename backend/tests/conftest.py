@@ -85,17 +85,52 @@ def tmp_dir():
 
 @pytest.fixture()
 def engine(tmp_dir):
-    """每个测试独立 schema 的 engine。
+    """每个测试**真正独立**的 schema。
 
-    R3 前置(2026-11-21):默认仍是 tmp_dir 下的 SQLite(WAL + foreign_keys=ON),
-    **行为一字不变**;设 ``TEST_DATABASE_URL`` 可切到 PG(CI service container 用)。
+    SQLite:tmp_dir 下的独立文件(天然隔离,行为一字不变)。
+    PG:**必须每用例建独立 schema** —— 2026-11-21 CI 实证:第一版参数化只是把 URL 换成 PG,
+    962 个用例**共用同一个 schema**,seed() 反复 DELETE+INSERT 叠加残留 job worker 持事务
+    → 锁竞争/死锁 → **PG 全量步骤卡死 121 分钟**(SQLite 同套用例只要 104 秒)。
+    docstring 当时写着"独立 schema"但 PG 并没有,是**名不副实**,这里补齐。
+
+    实现用 SQLAlchemy 的 ``schema_translate_map``:把默认 schema(None)映射到本用例专属 schema,
+    create_all 与所有 ORM 查询都落在该 schema 内;teardown DROP SCHEMA CASCADE。
     """
-    from tests.db_url_helper import resolve_test_database_url
+    import uuid
 
-    eng = create_db_engine(resolve_test_database_url(tmp_dir))
-    Base.metadata.create_all(eng)
-    yield eng
-    eng.dispose()
+    from sqlalchemy import text
+
+    from tests.db_url_helper import is_sqlite_url, resolve_test_database_url
+
+    url = resolve_test_database_url(tmp_dir)
+    if is_sqlite_url(url):
+        eng = create_db_engine(url)
+        Base.metadata.create_all(eng)
+        try:
+            yield eng
+        finally:
+            eng.dispose()
+        return
+
+    schema = f"t_{uuid.uuid4().hex[:12]}"
+    admin = create_db_engine(url)
+    try:
+        with admin.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    finally:
+        admin.dispose()
+    eng = create_db_engine(url).execution_options(schema_translate_map={None: schema})
+    try:
+        Base.metadata.create_all(eng)
+        yield eng
+    finally:
+        eng.dispose()
+        cleanup = create_db_engine(url)
+        try:
+            with cleanup.begin() as conn:
+                conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        finally:
+            cleanup.dispose()
 
 
 @pytest.fixture()

@@ -24,6 +24,7 @@ jobs:
   lint:
     name: lint(compileall + 交付物静态自检)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,6 +42,7 @@ jobs:
   pytest:
     name: pytest(密封 FakeLLM + 增量覆盖率门禁)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +92,7 @@ jobs:
   eval:
     name: eval(--smoke,mock 基线)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -120,6 +123,7 @@ jobs:
   deploy:
     name: deploy(交付物规则)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -141,6 +145,7 @@ jobs:
   pg-redis:
     name: pg-redis(真 PG 迁移双向 + 全量测试 + 真 Redis 断言)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
