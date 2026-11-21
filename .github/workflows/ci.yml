@@ -133,3 +133,83 @@ jobs:
         run: python deploy/lint_artifacts.py
       - name: 说明
         run: echo "本 job 只做静态结构校验;真实 docker build 需在具备 Docker 的 runner 上另行开启"
+
+  # R3 + Redis 三项的**运行时验证**(2026-11-21 用户裁定的"总开关")。
+  # 本机无 docker/redis-server/psql,这三项一直标「未运行时验证」;
+  # GitHub Actions 原生 services 起真 PG + 真 Redis,把它们变成可执行验证。
+  # 跑通后按 docs/待验清单_20261121.md §5 清标记并贴本 job 原始输出。
+  pg-redis:
+    name: pg-redis(真 PG 迁移双向 + 全量测试 + 真 Redis 断言)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: copilot
+          POSTGRES_PASSWORD: copilot
+          POSTGRES_DB: copilot
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_URL: postgresql+psycopg://copilot:copilot@127.0.0.1:5432/copilot
+      REDIS_TEST_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock.txt
+            requirements-dev.txt
+      - name: 安装依赖(生产锁含 psycopg + dev)
+        run: python -m pip install -r requirements.lock.txt -r requirements-dev.txt
+      - name: 确认未注入真实模型凭据
+        run: |
+          test -z "${LLM_API_KEY:-}" || { echo "检测到 LLM_API_KEY"; exit 1; }
+          test -z "${MINIMAX_API_KEY:-}" || { echo "检测到 MINIMAX_API_KEY"; exit 1; }
+      - name: PG 迁移 upgrade head(验 11 条迁移的方言)
+        env:
+          DATABASE_URL: ${{ env.PG_URL }}
+        run: python -m alembic -c backend/alembic.ini upgrade head
+      - name: 验关键列真在(0011 只加列不建表)
+        env:
+          DATABASE_URL: ${{ env.PG_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, inspect
+          eng = create_engine(os.environ["DATABASE_URL"])
+          cols = [c["name"] for c in inspect(eng).get_columns("order")]
+          assert "delivered_at" in cols, cols
+          print("order.delivered_at OK")
+          PY
+      - name: PG 迁移 downgrade base → upgrade head(双向)
+        env:
+          DATABASE_URL: ${{ env.PG_URL }}
+        run: |
+          python -m alembic -c backend/alembic.ini downgrade base
+          python -m alembic -c backend/alembic.ini upgrade head
+      - name: 全量测试跑在 PG 上(SQLite 专属两文件自动跳过)
+        env:
+          TEST_DATABASE_URL: ${{ env.PG_URL }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python -m pytest backend/tests -q -p no:cacheprovider \
+            --basetemp="$RUNNER_TEMP/pytest_pg"
+      - name: 真 Redis 断言单独再跑一次(便于在日志里定位)
+        # 这三条正是评审里标「未运行时验证」的:集群总放行量≈阈值、
+        # EXPIRE 让键有界、Lua 真原子性。**不用假客户端**。
+        run: python -m pytest backend/tests/test_redis_runtime.py -v -p no:cacheprovider

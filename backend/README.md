@@ -101,6 +101,10 @@ run_eval.bat
 `/auth/*`、静态页与 `/ws/*`(WS 在端点内鉴权)放行。账号由 `backend/scripts/seed.py` 幂等写入,
 口令只存 pbkdf2 哈希;明文口令仅本表:
 
+> ⚠️ **以下全部是演示账号,不是生产凭据**。它们由 `seed.py` 写入本地演示库,
+> 口令公开在本表中是**有意为之**(便于克隆后直接跑起来)。
+> 真实部署必须换掉这些账号与口令,且不要把本表当凭据清单使用。
+
 | 账号 | 口令 | 角色 | 绑定身份 | 用途 |
 |---|---|---|---|---|
 | `buyer_demo` | `demo1234` | buyer | `seed-cust-001` | 买家聊天(与 30 单 seed 数据同租户) |
@@ -139,7 +143,7 @@ curl -s -X POST http://127.0.0.1:8000/auth/login ^
 ## 5. 测试
 
 ```bat
-:: 全量测试(958 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
+:: 全量测试(962 个用例;--basetemp 每次换一个全新目录,不复用旧 .tmp)
 set TMP=%CD%\.tmp
 set TEMP=%CD%\.tmp
 .venv\Scripts\python -m pytest backend/tests -q -p no:cacheprovider --basetemp=.tmp\pytest_%RANDOM%
@@ -173,7 +177,7 @@ set PYTHONPATH=%CD%\backend
 <!-- gen_readme_numbers:begin -->
 <!-- 本段由 `python backend/scripts/gen_readme_numbers.py` 自动生成,勿手改;
      数字来源:pytest --collect-only 收集数 + data/eval/reports/ 全量 FakeLLM 基线报告。 -->
-- 测试:958 个 pytest 用例(收集数;全量运行命令见「快速开始」)
+- 测试:962 个 pytest 用例(收集数;全量运行命令见「快速开始」)
 - 评测集:48 条 × n=3 = 144 次尝试(adversarial 14 / edge 10 / golden 19 / regression 5)
 - FakeLLM 基线通过率:144/144 = 1.0000(edge 层 30/30 = 1.0000)
 - critical 失败:0
@@ -442,7 +446,7 @@ backend/
 │                   → 0009_fulfillment → 0010_badcase → 0011_order_delivered_at
 │                   (共 11 个迁移,25 张表;0011 只加列不建表)
 ├── scripts/        seed.py / load_eval_cases.py / run_eval.py / gen_readme_numbers.py / rollback.py
-├── tests/          958 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台、
+├── tests/          962 个用例(含 test_delivery.py 交付验收、test_agent_workbench.py 工作台、
 │                   test_authz_refunds.py 越权/内部备注/工单归属回归、
 │                   test_eval_numbers.py 评测数字校验边界)
 └── README.md       本文件
