@@ -29,9 +29,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 IS_WINDOWS = os.name == "nt"
-VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
+# CI 可移植性修正(2026-11-21 首次真 CI 跑出来):原先硬编码项目 .venv 解释器,
+# GitHub runner 上**没有 .venv**(用 setup-python 的系统解释器)→ FileNotFoundError。
+# 改为**优先当前解释器**(sys.executable),本地 venv 里跑时它本身就是 venv python;
+# 仅当当前解释器不可用时才回退去找 .venv。这与 gen_readme_numbers.py 的口径一致。
+VENV_PYTHON = Path(sys.executable) if sys.executable else ROOT / ".venv" / "Scripts" / "python.exe"
 if not VENV_PYTHON.is_file():
-    VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+    for _cand in (ROOT / ".venv" / "Scripts" / "python.exe", ROOT / ".venv" / "bin" / "python"):
+        if _cand.is_file():
+            VENV_PYTHON = _cand
+            break
 
 
 # ---------------------------------------------------------------------------

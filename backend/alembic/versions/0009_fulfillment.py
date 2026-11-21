@@ -213,7 +213,11 @@ def upgrade() -> None:
                 "sla_breached",
                 sa.Boolean(),
                 nullable=False,
-                server_default=sa.text("0"),
+                # PG 方言修正(2026-11-21 CI 首次真 PG 跑出来):
+                # 原 server_default=sa.text("0") 在 SQLite 可以,**PG 报 DatatypeMismatch**
+                # (boolean 列不接受 integer 默认值)。sa.false() 按方言渲染:
+                # PG → false,SQLite → 0,两边都对。
+                server_default=sa.false(),
             ),
         )
 
