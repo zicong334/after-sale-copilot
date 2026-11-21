@@ -39,8 +39,11 @@ def test_head_revision_comes_from_migration_chain_not_hardcoded():
 
 def test_unversioned_create_all_db_is_allowed_with_warning(engine, caplog):
     """create_all 建的库没有 alembic_version → 放行(测试/演示路径),但要告警。"""
-    with Session(engine) as s:
-        assert s.execute(text("SELECT name FROM sqlite_master WHERE name='alembic_version'")).first() is None
+    # 用 SQLAlchemy inspect 而不是 sqlite_master —— 后者是 SQLite 专有 catalog,
+    # PG 上直接报 relation "sqlite_master" does not exist(2026-11-21 CI 抓到,是我写漏了)。
+    from sqlalchemy import inspect as sa_inspect
+
+    assert not sa_inspect(engine).has_table("alembic_version")
     assert assert_schema_at_head(engine) == "unversioned"
 
 

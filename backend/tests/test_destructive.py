@@ -649,7 +649,12 @@ def test_a6_shop_get_order_sql_binds_customer(db, engine):
         "shop__get_order 的 SQL 必须把 customer_id 写进 WHERE(不能只靠 Python 侧比较)",
         [s for s, _ in selects],
     )
-    assert any(CUSTOMER_REFUND in tuple(parameters) for _, parameters in bound)
+    # 参数风格差异(2026-11-21 CI 实证):SQLite qmark 的 parameters 是 tuple,
+    # PG pyformat 是 **dict** —— tuple(dict) 拿到的是键不是值,断言会假失败。
+    def _values(parameters):
+        return tuple(parameters.values()) if isinstance(parameters, dict) else tuple(parameters)
+
+    assert any(CUSTOMER_REFUND in _values(parameters) for _, parameters in bound)
 
 
 # ===========================================================================

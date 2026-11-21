@@ -26,6 +26,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 import app.api.chat as chat_mod
+
+from tests.db_url_helper import sqlite_file_only  # noqa: E402
 from app.api import get_db
 from app.graph import build as graph_build
 from app.llm.base import FakeLLM
@@ -255,6 +257,7 @@ def test_golden_refund_audit_chain_complete(client, engine, golden_refund):
 # ---------------------------------------------------------------------------
 
 
+@sqlite_file_only("audit CLI 的 --db 收文件路径")
 def test_refund_id_lookup_returns_same_case(client, engine, golden_refund, capsys):
     with Session(engine) as db:
         by_trace = build_audit_report(db, trace_id=golden_refund["trace_id"])
@@ -283,6 +286,7 @@ def test_refund_id_lookup_returns_same_case(client, engine, golden_refund, capsy
 # ---------------------------------------------------------------------------
 
 
+@sqlite_file_only("audit CLI 的 --db 收文件路径")
 def test_main_prints_single_json_in_process(client, engine, golden_refund, capsys):
     code = export_main(
         [
@@ -321,6 +325,7 @@ def _run_cli(tmp_dir: Path, argv: list[str]) -> tuple[int, bytes, bytes]:
     return proc.returncode, out_path.read_bytes(), err_path.read_bytes()
 
 
+@sqlite_file_only("audit CLI 的 --db 收文件路径")
 def test_cli_subprocess_prints_single_json(client, engine, golden_refund, tmp_dir):
     code, stdout, stderr = _run_cli(
         tmp_dir,
@@ -333,6 +338,7 @@ def test_cli_subprocess_prints_single_json(client, engine, golden_refund, tmp_di
     assert report["integrity"]["complete"] is True
 
 
+@sqlite_file_only("audit CLI 的 --db 收文件路径")
 def test_cli_unknown_trace_fails_cleanly(client, engine, tmp_dir):
     code, stdout, stderr = _run_cli(
         tmp_dir,

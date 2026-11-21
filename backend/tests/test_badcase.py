@@ -24,6 +24,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+from tests.db_url_helper import sqlite_file_only  # noqa: E402
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -333,6 +335,7 @@ def _run(args: list[str], cwd: Path, env_extra: dict[str, str]) -> _Proc:
     )
 
 
+@sqlite_file_only("promote 脚本按文件型 sqlite 取库")
 def test_promote_draft_then_case_level_validate(client, engine, tmp_dir):
     _seed(engine)
     before = (_sha256(_CASES_V1), _CASES_V1.stat().st_mtime_ns)
@@ -446,6 +449,7 @@ def test_promote_draft_then_case_level_validate(client, engine, tmp_dir):
     assert after == before
 
 
+@sqlite_file_only("promote 脚本按文件型 sqlite 取库")
 def test_promote_refuses_ignored(client, engine, tmp_dir):
     _seed(engine)
     r = _post(client, {"ticket_id": "tk-1"})

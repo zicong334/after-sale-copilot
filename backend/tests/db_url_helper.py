@@ -37,3 +37,20 @@ def resolve_test_database_url(tmp_dir: Path) -> str:
     if override and override.strip():
         return override.strip()
     return f"sqlite:///{(Path(tmp_dir) / 'test.db').as_posix()}"
+
+def sqlite_file_only(reason: str):
+    """标记**按设计只能跑在文件型 SQLite 上**的用例(2026-11-21 CI 实证)。
+
+    有些用例的契约本身就是"拿 engine.url.database 当文件路径传给 CLI 的 --db"
+    (audit CLI / badcase promote)。PG 下 `url.database` 是库名不是路径,
+    这类用例**不适用而非失败** —— 跳过并写明理由,不是掩盖真缺陷。
+
+    ⚠️ 只给**确实以文件路径为契约**的用例用;能用 SQLAlchemy 抽象写的一律改成后端无关。
+    """
+    import pytest
+
+    url = (os.environ.get(TEST_DB_URL_ENV) or "").strip()
+    return pytest.mark.skipif(
+        bool(url) and not is_sqlite_url(url),
+        reason=f"文件型 SQLite 专属契约,当前后端非 SQLite:{reason}",
+    )
