@@ -35,6 +35,10 @@ data/eval/drafts
 docs
 *.md
 !deploy/README.md
+# R19(2026-11-21):政策语料是**运行时资产**,必须进构建上下文。
+# Docker 的 `*` 不跨 `/`,所以上面的 `*.md` 只排根级 md、本不排 data/policies/*.md;
+# 但这条依赖语义细节,显式取反更稳 —— 语料没进上下文会让 COPY 直接失败或装出空知识库。
+!data/policies/*.md
 
 # 开发期脚本(镜像只用 entrypoint.sh)
 backend/tests
@@ -42,6 +46,8 @@ deploy/docker-compose.yml
 deploy/nginx.conf
 deploy/prometheus.yml
 deploy/lint_artifacts.py
+# 真浏览器验收脚本只在 CI runner 上跑(镜像里没装 playwright),不进镜像
+deploy/verify_ui.py
 
 # 其它
 .DS_Store

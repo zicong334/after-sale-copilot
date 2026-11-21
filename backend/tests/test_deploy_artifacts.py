@@ -158,6 +158,7 @@ def test_no_unfinished_markers_in_delivery_artifacts():
         "deploy/nginx.conf",
         "deploy/prometheus.yml",
         "deploy/lint_artifacts.py",
+        "deploy/verify_ui.py",
         "deploy/README.md",
         ".github/workflows/ci.yml",
         ".dockerignore",
@@ -350,3 +351,61 @@ def test_ci_lint_accepts_both_docker_stop_spellings():
         ]
         errs = lint_mod.check_ci(doc, yaml.safe_dump(doc, allow_unicode=True))
         assert errs == [], f"写法 {spelling!r} 被误判:{errs}"
+
+
+# ---------------------------------------------------------------------------
+# R19(2026-11-21 真浏览器验收抓出):镜像不 COPY 政策语料、entrypoint 不装知识库
+# ⇒ 部署出来知识库是空的,**任何政策问题都只回"检索无命中"兜底**。
+# 本机决定性对照:不装语料 58 字兜底;装了同一问题 336 字真答案 + [1] 引用。
+# 与 nginx 那条同族:**部署态坏了而全部测试都绿**,因为测试自己会装语料。
+# ---------------------------------------------------------------------------
+
+
+def _ships_policy_corpus(dockerfile_text: str) -> bool:
+    return bool(re.search(r"^COPY[^\n]*\bdata/policies\b", dockerfile_text, re.MULTILINE))
+
+
+def _loads_policies(entrypoint_text: str) -> bool:
+    return "load_policies.py" in entrypoint_text
+
+
+def test_image_ships_policy_corpus_and_entrypoint_loads_it():
+    """镜像必须带语料,入口必须在空知识库时装载 —— 否则部署出来答不了任何政策问题。"""
+    df = _read("deploy/Dockerfile")
+    ep = _read("deploy/entrypoint.sh")
+    assert _ships_policy_corpus(df), "Dockerfile 没 COPY data/policies,镜像里知识库语料缺失(R19)"
+    assert _loads_policies(ep), "entrypoint 没跑 load_policies.py,部署出来知识库是空的(R19)"
+
+    # 语料**不得**放命名卷挂载点(/app/data)下:已有旧卷会遮蔽镜像内容,
+    # 造成"改了语料重新 build 却不生效"。资产与可变数据必须分开。
+    dest = re.search(r"^COPY[^\n]*\bdata/policies\s+(\S+)", df, re.MULTILINE)
+    assert dest, "取不到语料 COPY 目标路径"
+    assert not dest.group(1).startswith("./data"), (
+        f"语料被 COPY 到 {dest.group(1)}(命名卷挂载点下),会被旧卷遮蔽;应放 ./policies"
+    )
+
+    # 负控:修复前的真实形态必须被判不合格(证明本守卫有判别力,不是恰好通过)
+    pre_fix_df = (
+        "COPY --chown=copilot:copilot backend ./backend\n"
+        "COPY --chown=copilot:copilot frontend ./frontend\n"
+    )
+    assert not _ships_policy_corpus(pre_fix_df), "守卫认不出修复前的缺语料形态,失去判别力"
+    assert not _loads_policies("python /app/backend/scripts/seed.py\n"), (
+        "守卫认不出修复前的不装知识库形态,失去判别力"
+    )
+    # 负控二:放错位置(卷挂载点下)也必须被拦
+    wrong_dest = "COPY --chown=copilot:copilot data/policies ./data/policies\n"
+    m = re.search(r"^COPY[^\n]*\bdata/policies\s+(\S+)", wrong_dest, re.MULTILINE)
+    assert m and m.group(1).startswith("./data"), "放错位置的负控没构造成功"
+
+
+def test_ui_verification_script_is_a_delivery_artifact():
+    """真浏览器验收脚本必须在仓库里(CI 要用),且被交付物标记检查覆盖。"""
+    p = _ROOT / "deploy" / "verify_ui.py"
+    assert p.is_file(), "缺少 deploy/verify_ui.py(CI 的真浏览器验收脚本)"
+    text = p.read_text(encoding="utf-8")
+    # 必须经调用方传入的 base_url 访问,不得写死直连 backend 端口
+    assert "--base-url" in text and "8080" in text
+    # 三条硬断言的标记必须还在(防被悄悄放宽回"占位符也算回复")
+    for needle in ("loading-row", "msg.ai:not(.error)", "citation-ref", "检索无命中"):
+        assert needle in text, f"verify_ui.py 丢了关键断言标记 {needle}(断言被放宽?)"

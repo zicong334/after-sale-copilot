@@ -227,9 +227,9 @@ jobs:
   # Docker 的一个子集)。本 job 真 build 本项目镜像、真 compose up、真起 Prometheus、
   # 真发 SIGTERM 看是否优雅退出,把这三项也验掉。
   container:
-    name: container(真 build 镜像 + compose 冒烟 + Prometheus + 优雅停机)
+    name: container(真 build 镜像 + compose 冒烟 + 真浏览器点击流 + Prometheus + 优雅停机)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: 真 build 本项目镜像(不是 service container)
@@ -256,7 +256,60 @@ jobs:
           test -n "$TOKEN"
           curl -fsS -X POST "$B/api/c/chat" -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' -d '{"text":"退货运费谁承担"}' \
-            | python -c 'import sys,json;d=json.load(sys.stdin);assert d["ok"];print("chat OK, citations:",len(d.get("citations") or []))'
+            | python -c 'import sys,json;d=json.load(sys.stdin);assert d["ok"];c=d.get("citations") or [];assert c, "引用为空 —— 部署栈知识库很可能是空的(R19:镜像未带语料/入口未装载)";print("chat OK, citations:",len(c))'
+      - name: 装真浏览器(playwright + chromium)
+        run: |
+          python -m pip install --quiet "playwright==1.56.0"
+          python -m playwright install --with-deps chromium
+      - name: 真浏览器点击流**负控**(故意抽掉 nginx 的 /auth 反代,必须被拦)
+        # 本项目红线:假门禁比没门禁更糟 —— 落地任何门禁都要故意造一次失败确认它真会拦。
+        # 这里复刻 R17 的真实缺陷形态(nginx 只反代 /api/),断言 UI 验收**恰好挂在登录步**
+        # 且原因含 404,而不是因为浏览器没装/选择器写错等无关原因恰好失败。
+        run: |
+          set -e
+          cp deploy/nginx.conf /tmp/nginx.good.conf
+          python - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("deploy/nginx.conf")
+          t = p.read_text(encoding="utf-8")
+          t2 = re.sub(r"\n    location /auth \{.*?\n    \}\n", "\n", t, count=1, flags=re.S)
+          assert t2 != t, "没能抽掉 /auth location,负控构造失败"
+          p.write_text(t2, encoding="utf-8")
+          print("已抽掉 nginx 的 /auth 反代(复刻 R17 缺陷形态)")
+          PY
+          docker compose -f deploy/docker-compose.yml exec -T nginx nginx -s reload
+          sleep 2
+          set +e
+          python deploy/verify_ui.py --out-dir ui_shots_negctl --result ui_negctl.json
+          RC=$?
+          set -e
+          cp /tmp/nginx.good.conf deploy/nginx.conf
+          docker compose -f deploy/docker-compose.yml exec -T nginx nginx -s reload
+          sleep 2
+          echo "负控退出码 = $RC"
+          test "$RC" -ne 0 || { echo "::error::负控失败:抽掉 /auth 后 UI 验收竟然通过,门禁没有判别力"; exit 1; }
+          python - <<'PY'
+          import json
+          d = json.load(open("ui_negctl.json", encoding="utf-8"))
+          assert d["failed_step"] == "login_buyer", f"挂错步骤:{d['failed_step']} reason={d['reason'][:200]}"
+          assert "404" in d["reason"], f"失败原因不是 404,可能是无关故障:{d['reason'][:300]}"
+          print("负控通过:恰好挂在 login_buyer 且原因含 404 —— 门禁真能拦住 R17 那类缺陷")
+          PY
+      - name: 真浏览器点击流验收(经 nginx,登录/订单/对话引用/坐席工作台)
+        run: |
+          set -e
+          python deploy/verify_ui.py --out-dir ui_shots --result ui_result.json
+      - name: 上传 UI 截图与结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-verification
+          path: |
+            ui_shots
+            ui_result.json
+            ui_shots_negctl
+            ui_negctl.json
+          if-no-files-found: warn
       - name: 可观测真通(Prometheus 抓取 + R6 新指标 + 告警规则加载)
         run: |
           set -e

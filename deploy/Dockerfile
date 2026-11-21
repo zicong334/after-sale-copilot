@@ -47,6 +47,15 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=copilot:copilot backend ./backend
 COPY --chown=copilot:copilot frontend ./frontend
+# R19(2026-11-21 真浏览器验收抓出):原先**只 COPY backend/frontend**,
+# 政策语料 data/policies/*.md 根本没进镜像,entrypoint 也不跑 load_policies.py
+# ⇒ 部署出来知识库是空的,**任何政策问题都只回"检索无命中"兜底**。
+# 本机对照:不装语料 58 字兜底;装了同一问题 336 字真答案 + [1] 引用。
+# 语料是**运行时资产**(不是数据卷里的业务数据),必须随镜像发布。
+# ⚠️ 刻意放 /app/policies 而**不是** /app/data/policies:compose 把命名卷挂在 /app/data,
+# 放里面会被卷遮蔽(首次 Docker 会把镜像内容拷进新卷,但**已存在的旧卷就不会**),
+# 于是"改了语料重新 build 却不生效"。资产与可变数据分开放,没这个坑。
+COPY --chown=copilot:copilot data/policies ./policies
 COPY --chown=copilot:copilot deploy/entrypoint.sh /app/entrypoint.sh
 
 RUN mkdir -p /app/data /app/.tmp \
