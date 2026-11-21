@@ -208,6 +208,21 @@ def check_ci(doc: dict, text: str) -> list[str]:
         job = jobs.get(name) or {}
         return yaml.safe_dump(job, allow_unicode=True, sort_keys=True) if isinstance(job, dict) else ""
 
+    def job_runs(name: str) -> str:
+        """step 的**原始 run 文本**拼接。
+
+        不能用 yaml.safe_dump 的结果做含引号的字面匹配:dump 会把 `"` 转义成 `\\"`,
+        于是 `"docker", "stop"` 变成 `docker\\", \\"stop\\"`,检查静默失效(真踩过)。
+        """
+        job = jobs.get(name) or {}
+        if not isinstance(job, dict):
+            return ""
+        parts = []
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and isinstance(step.get("run"), str):
+                parts.append(step["run"])
+        return "\n".join(parts)
+
     pg_text = job_text("pg-redis")
     if pg_text:
         if "postgres" not in pg_text or "redis" not in pg_text:
@@ -218,7 +233,16 @@ def check_ci(doc: dict, text: str) -> list[str]:
     if ct_text:
         if "build" not in ct_text or "docker compose" not in ct_text:
             errors.append("ci.yml container job 未真 build 本项目镜像(service container 不算)")
-        if "docker stop" not in ct_text:
+        # 认语义不认拼写,且读**原始 run 文本**(见 job_runs 的转义坑):
+        # shell 写 `docker stop`,Python 写 create_subprocess_exec("docker","stop",…)
+        # (优雅停机那步为了挂住 WS 长连接同时停机,改成了后者)。
+        ct_runs = job_runs("container")
+        stops = (
+            "docker stop" in ct_runs
+            or '"docker", "stop"' in ct_runs
+            or "'docker', 'stop'" in ct_runs
+        )
+        if not stops:
             errors.append("ci.yml container job 未验优雅停机(docker stop 后看退出码)")
 
     lint_text = job_text("lint")

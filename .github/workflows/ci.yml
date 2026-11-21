@@ -268,21 +268,70 @@ jobs:
             | python -c 'import sys,json;r=json.load(sys.stdin)["data"]["result"];assert r,"新指标查不到";print("dead_oldest_age =",r[0]["value"])'
           curl -fsS http://127.0.0.1:9090/api/v1/rules \
             | python -c 'import sys,json;g=json.load(sys.stdin)["data"]["groups"];names=[r["name"] for x in g for r in x["rules"]];assert "CopilotDeadLetterAging" in names,names;print("alert rules loaded:",names)'
-      - name: 优雅停机真生效(SIGTERM 后应在 grace 内自行退出,退出码非 137)
+      - name: 优雅停机真生效(挂住一条真 WS 长连接再 SIGTERM,验正常关闭帧)
+        # ⚠️ 第一版只断言"退出码非 137",实测**停机耗时 0s** —— 因为停机时
+        # 根本没有在飞的长连接,0 秒干净退出只证明"没被强杀",
+        # **没证明 grace 真在排空长连接**(R11 声称的正是后者)。
+        # 假验证比没验证更糟,所以这里改成:先建一条真 WS 并挂住,再 docker stop,
+        # 断言客户端**收到带 code 的正常关闭帧**(而不是 TCP 被直接掐断)。
         run: |
           set -e
-          CID=$(docker compose -f deploy/docker-compose.yml ps -q backend)
-          START=$(date +%s)
-          docker stop "$CID" > /dev/null
-          END=$(date +%s)
-          CODE=$(docker inspect --format '{{.State.ExitCode}}' "$CID")
-          echo "停机耗时 $((END-START))s,退出码 $CODE"
-          # 137 = 128+9 = SIGKILL,说明 grace 内没排空完被强杀;0/143 = 收到 SIGTERM 后自行退出
-          if [ "$CODE" = "137" ]; then
-            echo "::error::退出码 137 = 被 SIGKILL 强杀,优雅停机未生效"
-            exit 1
-          fi
-          echo "优雅停机生效(未被 SIGKILL)"
+          python -m pip install --quiet "websockets==17.4"
+          python - <<'PY'
+          import asyncio, json, subprocess, time, urllib.request
+          import websockets
+
+          B = "http://127.0.0.1:8080"
+          COMPOSE = ["docker", "compose", "-f", "deploy/docker-compose.yml"]
+
+          def post(path, payload, token=None):
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = "Bearer " + token
+              req = urllib.request.Request(
+                  B + path, data=json.dumps(payload).encode(), headers=headers)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          tok = post("/auth/login", {"username": "buyer_demo", "password": "demo1234"})["token"]
+          sid = post("/api/c/chat", {"text": "退货运费谁承担"}, tok)["session_id"]
+          cid = subprocess.check_output(COMPOSE + ["ps", "-q", "backend"], text=True).strip()
+          assert cid, "拿不到 backend 容器 id"
+          print("session_id =", sid, "container =", cid[:12], flush=True)
+
+          async def main():
+              url = f"ws://127.0.0.1:8080/ws/buyer/{sid}?token={tok}"
+              async with websockets.connect(url, open_timeout=20) as ws:
+                  print("WS 长连接已建立(经 nginx),开始停机", flush=True)
+                  t0 = time.time()
+                  stop = await asyncio.create_subprocess_exec("docker", "stop", cid)
+                  outcome = {}
+                  try:
+                      while True:
+                          await asyncio.wait_for(ws.recv(), timeout=45)
+                  except asyncio.TimeoutError:
+                      outcome = {"kind": "timeout_no_close"}
+                  except websockets.ConnectionClosed as exc:
+                      outcome = {
+                          "kind": "closed",
+                          "code": exc.rcvd.code if exc.rcvd else None,
+                          "reason": exc.rcvd.reason if exc.rcvd else None,
+                      }
+                  except Exception as exc:  # noqa: BLE001 - 任何异常都要如实报出,不吞
+                      outcome = {"kind": "error", "err": repr(exc)}
+                  await stop.wait()
+                  dur = round(time.time() - t0, 1)
+                  code = subprocess.check_output(
+                      ["docker", "inspect", "--format", "{{.State.ExitCode}}", cid], text=True).strip()
+                  print(json.dumps({"stop_seconds": dur, "exit_code": code, "ws_close": outcome},
+                                   ensure_ascii=False), flush=True)
+                  assert code != "137", f"退出码 137 = 被 SIGKILL 强杀,优雅停机未生效({dur}s)"
+                  assert outcome.get("kind") == "closed" and outcome.get("code") is not None, (
+                      f"长连接没收到正常关闭帧(说明是被掐断而非优雅关闭):{outcome}")
+                  print(f"优雅停机生效:停机 {dur}s,退出码 {code},WS 收到关闭帧 code={outcome['code']}")
+
+          asyncio.run(main())
+          PY
       - name: 收尾
         if: always()
         run: |

@@ -331,3 +331,22 @@ def test_ci_lint_requires_runtime_jobs_and_per_job_timeout():
     doc["jobs"]["container"]["steps"] = [{"run": "echo noop"}]
     errs = lint_mod.check_ci(doc, yaml.safe_dump(doc, allow_unicode=True))
     assert errs, "container job 不 build 镜像也不验停机,竟不报错"
+
+
+def test_ci_lint_accepts_both_docker_stop_spellings():
+    """停机检查认的是**语义**,不是字面拼写。
+
+    真踩:优雅停机那步从 shell `docker stop "$CID"` 改成 Python
+    `create_subprocess_exec("docker", "stop", cid)`(为了挂住 WS 长连接同时停机),
+    字面 `docker stop` 消失,旧检查会误报"未验停机"。两种写法都必须认。
+    """
+    import copy
+
+    for spelling in ('docker stop "$CID"', 'create_subprocess_exec("docker", "stop", cid)'):
+        doc = copy.deepcopy(_ci_doc_minimal())
+        doc["jobs"]["container"]["steps"] = [
+            {"run": "docker compose -f deploy/docker-compose.yml build backend"},
+            {"run": spelling},
+        ]
+        errs = lint_mod.check_ci(doc, yaml.safe_dump(doc, allow_unicode=True))
+        assert errs == [], f"写法 {spelling!r} 被误判:{errs}"
