@@ -212,8 +212,11 @@ jobs:
           TEST_DATABASE_URL: ${{ env.PG_URL }}
           TMPDIR: ${{ runner.temp }}
         run: |
+          # per-test 超时:把"未知卡死"变成**具名用例 + 堆栈**(2026-11-21 诊断手段)。
+          # 上一轮在 52% 处卡 17 分钟无输出,只靠 job 级 20min 超时看不出是谁卡的。
           python -m pytest backend/tests -q -p no:cacheprovider \
-            --basetemp="$RUNNER_TEMP/pytest_pg"
+            --basetemp="$RUNNER_TEMP/pytest_pg" \
+            --timeout=90 --timeout-method=thread
       - name: 真 Redis 断言单独再跑一次(便于在日志里定位)
         # 这三条正是评审里标「未运行时验证」的:集群总放行量≈阈值、
         # EXPIRE 让键有界、Lua 真原子性。**不用假客户端**。

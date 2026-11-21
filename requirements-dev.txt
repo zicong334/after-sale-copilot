@@ -29,3 +29,8 @@ diff-cover==11.0.4
 # 它也属**运行时依赖**,应提升到 requirements.lock.txt;当前先放 dev 只为 CI 能跑真断言。
 # 未装该包时 build_limiters/build_l2 会降级回进程内实现(不阻断启动)。
 redis==8.1.0
+
+# per-test 超时(2026-11-21):PG 全量在 52% 处卡死 17 分钟无输出。
+# 加它把"未知卡死"变成"具名用例 + 堆栈",而不是靠猜。
+# 只在 CI 的 PG job 显式启用 --timeout,本地默认不启用(不改存量行为)。
+pytest-timeout==2.4.0
