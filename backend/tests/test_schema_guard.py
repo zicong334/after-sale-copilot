@@ -24,10 +24,12 @@ from app.db import assert_schema_at_head, schema_head_revision
 
 def _stamp(engine, revision: str) -> None:
     """手工建 alembic_version 并写入指定版本(模拟已迁移过的库)。"""
+    schema = engine.get_execution_options().get("test_schema")
+    tbl = f'"{schema}".alembic_version' if schema else "alembic_version"
     with engine.begin() as conn:
-        conn.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)"))
-        conn.execute(text("DELETE FROM alembic_version"))
-        conn.execute(text("INSERT INTO alembic_version (version_num) VALUES (:r)"), {"r": revision})
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS {tbl} (version_num VARCHAR(32) NOT NULL)"))
+        conn.execute(text(f"DELETE FROM {tbl}"))
+        conn.execute(text(f"INSERT INTO {tbl} (version_num) VALUES (:r)"), {"r": revision})
 
 
 def test_head_revision_comes_from_migration_chain_not_hardcoded():
@@ -43,7 +45,11 @@ def test_unversioned_create_all_db_is_allowed_with_warning(engine, caplog):
     # PG 上直接报 relation "sqlite_master" does not exist(2026-11-21 CI 抓到,是我写漏了)。
     from sqlalchemy import inspect as sa_inspect
 
-    assert not sa_inspect(engine).has_table("alembic_version")
+    # 必须限定到**本用例的 schema**:PG 上 public 里可能有别处建的 alembic_version,
+    # 而 Inspector 不认 schema_translate_map(2026-11-21 CI 实证)。
+    assert not sa_inspect(engine).has_table(
+        "alembic_version", schema=engine.get_execution_options().get("test_schema")
+    )
     assert assert_schema_at_head(engine) == "unversioned"
 
 

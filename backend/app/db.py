@@ -75,15 +75,24 @@ def assert_schema_at_head(eng: Engine) -> str:
     from sqlalchemy import inspect, text
 
     head = schema_head_revision()
-    if not inspect(eng).has_table("alembic_version"):
+    # schema 感知(2026-11-21 CI 实证):schema_translate_map 只作用于 DDL/查询,
+    # **不作用于 Inspector** —— Inspector 默认看 search_path(PG 通常是 public)。
+    # 若 engine 被映射到某个 schema(多租户/测试隔离),必须查**那个 schema**,
+    # 否则会拿 public 的 alembic_version 误判本 schema 的状态。
+    # 生产无映射 → schema=None → 行为一字不变。
+    schema = (eng.get_execution_options().get("schema_translate_map") or {}).get(None)
+    if not inspect(eng).has_table("alembic_version", schema=schema):
         logger.warning(
             "库无 alembic_version 表(create_all 路径,测试/演示)。"
             "生产必须走 alembic upgrade head —— create_all 不会 ALTER 已存在的表,"
             "schema 可能静默漂移。期望 head=%s", head,
         )
         return "unversioned"
+    # 原始 text() SQL **不受 schema_translate_map 影响**(它只翻译带 schema 的 Table 对象),
+    # 所以有映射时必须显式限定 schema,否则这条查询仍会打到 search_path(public)。
+    qualified = f'"{schema}".alembic_version' if schema else "alembic_version"
     with eng.connect() as conn:
-        rows = [str(r[0]) for r in conn.execute(text("SELECT version_num FROM alembic_version"))]
+        rows = [str(r[0]) for r in conn.execute(text(f"SELECT version_num FROM {qualified}"))]
     if len(rows) == 1 and rows[0] == head:
         return "ok"
     raise RuntimeError(

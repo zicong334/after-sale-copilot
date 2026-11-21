@@ -139,7 +139,12 @@ def engine(tmp_dir):
             )
         },
     )
-    eng = pg_engine.execution_options(schema_translate_map={None: schema})
+    # 自定义 execution option 暴露本用例 schema:测试要做**同范围**断言时用得到
+    # (Inspector 与原始 text() SQL 都不受 schema_translate_map 影响)。
+    # 用 execution_options 而不是 eng.info —— Engine 没有 .info 属性(实测)。
+    eng = pg_engine.execution_options(
+        schema_translate_map={None: schema}, test_schema=schema
+    )
     try:
         Base.metadata.create_all(eng)
         yield eng
